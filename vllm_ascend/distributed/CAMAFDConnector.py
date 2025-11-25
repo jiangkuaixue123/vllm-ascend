@@ -231,3 +231,6 @@ class CAMAFDConnector(AFDConnectorBase):
                             aivNum = aiv_num)
         
         return output1, afdmetadata
+
+    def wait_recv_stream(self) -> None:
+        pass

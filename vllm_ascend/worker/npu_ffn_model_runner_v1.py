@@ -212,11 +212,9 @@ class NPUFFNModelRunner(NPUModelRunner,GPUFFNModelRunner):
             acl_graph_info = self._find_cuda_graph(current_layer_idx,
                                                     num_tokens)
 
-            
             print(f'acl_graph_info is {acl_graph_info}')
             print(f'current_layer_idx is {current_layer_idx},num_tokens is {max_num_tokens}')
             print(f'self._forword_cnt is {self._forword_cnt},num_tokens is {max_num_tokens}')
-           
             if acl_graph_info is not None:
                 # Use captured ACL graph for computation
                 with set_ascend_forward_context(
@@ -418,6 +416,7 @@ class NPUFFNModelRunner(NPUModelRunner,GPUFFNModelRunner):
         #     rank_ffn_output = ffn_output[start_idx:end_idx, :]
         # else:
         # Single TP case
+        self.connector.wait_recv_stream()
         if self.connector_name == "m2nconnector":
             rank_ffn_output = self.model.compute_ffn_output(
                 layer_idx=current_layer_idx, 
