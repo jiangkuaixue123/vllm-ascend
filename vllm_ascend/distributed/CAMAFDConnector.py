@@ -22,6 +22,8 @@ from vllm.config import VllmConfig
 from vllm.distributed.afd_transfer.afd_connector.metadata import (CAMAFDConnectorMetadata)
 from vllm.config import VllmConfig,CUDAGraphMode,CompilationLevel
 from vllm.distributed.afd_transfer.afd_connector.p2p_connector import DefaultProcessGroupSwitcher
+
+from vllm_ascend.utils import npu_stream_switch
 logger = init_logger(__name__)
 
 # # TODO(yxj):move to ascend ,use kwargs 
@@ -54,6 +56,11 @@ class CAMAFDConnector(AFDConnectorBase):
         self.ffn_size = 0
         self.use_aclgraph = self._use_aclgraph()
         print(f'self.use_aclgraph in CAMAFDConnector is {self.use_aclgraph}')
+
+        self.attn_use_multistream = False
+        self.ffn_use_multistream = False
+        self.send_stream = torch.npu.Stream(device=torch.npu.current_device())
+        self.recv_stream = torch.npu.Stream(device=torch.npu.current_device())
         
     def _use_aclgraph(self) -> bool:
         return self.config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE and self.config.compilation_config.level == CompilationLevel.PIECEWISE and not self.config.model_config.enforce_eager
@@ -159,19 +166,20 @@ class CAMAFDConnector(AFDConnectorBase):
         aiv_num = metadata.cam_afdconnector_data.aiv_num
         handle = metadata.cam_afdconnector_data.handle
         
-        output2 = torch_npu.cam_e2a(expandXOut = hidden_states, simulateExpertIds = handle[0],
-                            simulateExpertScales = handle[1], expandIdx = handle[2],
-                            epRecvCounts = handle[3],
-                            commArgs = torch.tensor([], dtype=torch.float16, device='npu'),
-                            attenBatchSize = handle[4],
-                            commId = 0,
-                            batchSize = batch_size, hiddenSize = h, topk = k,
-                            expertRankSize = self.ffn_size, attentionRankSize = self.attn_size,
-                            sharedExpertNum = shared_expert_num, totalExpertNum = moe_expert_num + shared_expert_num,
-                            rank = self.rank,
-                            loadBalancingRankNum=1, loadBalancingThreshold=0,
-                            groupEp = self.hccl_comm_name,
-                            aivNum = aiv_num)
+        with npu_stream_switch(self.recv_stream, enabled=False):
+            output2 = torch_npu.cam_e2a(expandXOut = hidden_states, simulateExpertIds = handle[0],
+                                simulateExpertScales = handle[1], expandIdx = handle[2],
+                                epRecvCounts = handle[3],
+                                commArgs = torch.tensor([], dtype=torch.float16, device='npu'),
+                                attenBatchSize = handle[4],
+                                commId = 0,
+                                batchSize = batch_size, hiddenSize = h, topk = k,
+                                expertRankSize = self.ffn_size, attentionRankSize = self.attn_size,
+                                sharedExpertNum = shared_expert_num, totalExpertNum = moe_expert_num + shared_expert_num,
+                                rank = self.rank,
+                                loadBalancingRankNum=1, loadBalancingThreshold=0,
+                                groupEp = self.hccl_comm_name,
+                                aivNum = aiv_num)
 
         return output2
     
@@ -219,18 +227,24 @@ class CAMAFDConnector(AFDConnectorBase):
         quant_mode = metadata.quant_mode
         aiv_num = metadata.aiv_num
         expandXOutDType = torch.tensor([], dtype=torch.bfloat16 if not quant_mode else torch.int8, device='npu')
-
-        output1 = torch_npu.cam_a2e(expandX = torch.tensor([], dtype=torch.bfloat16, device='npu'), expertIds = torch.tensor([], dtype=torch.int32, device='npu'),
-                            scales = torch.tensor([], dtype=torch.float, device='npu'), commArgs = torch.tensor([], dtype=torch.float16, device='npu'),
-                            expandXOutDType = expandXOutDType,
-                            commId = 0, batchSize = batch_size, hiddenSize = h, topk = k,
-                            expertRankSize = self.ffn_size, attentionRankSize = self.attn_size,
-                            sharedExpertNum = shared_expert_num, totalExpertNum = moe_expert_num + shared_expert_num, rank = self.rank,
-                            loadBalancingRankNum=1, loadBalancingThreshold=0, dynamicQuant = quant_mode,
-                            groupEp = self.hccl_comm_name,
-                            aivNum = aiv_num)
+        with npu_stream_switch(self.recv_stream, enabled=False):
+            output1 = torch_npu.cam_a2e(expandX = torch.tensor([], dtype=torch.bfloat16, device='npu'), expertIds = torch.tensor([], dtype=torch.int32, device='npu'),
+                                scales = torch.tensor([], dtype=torch.float, device='npu'), commArgs = torch.tensor([], dtype=torch.float16, device='npu'),
+                                expandXOutDType = expandXOutDType,
+                                commId = 0, batchSize = batch_size, hiddenSize = h, topk = k,
+                                expertRankSize = self.ffn_size, attentionRankSize = self.attn_size,
+                                sharedExpertNum = shared_expert_num, totalExpertNum = moe_expert_num + shared_expert_num, rank = self.rank,
+                                loadBalancingRankNum=1, loadBalancingThreshold=0, dynamicQuant = quant_mode,
+                                groupEp = self.hccl_comm_name,
+                                aivNum = aiv_num)
         
         return output1, afdmetadata
+    
+    def get_send_stream(self) -> torch.npu.Stream:
+        return self.send_stream
+    
+    def get_recv_stream(self) -> torch.npu.Stream:
+        return self.recv_stream
 
     def wait_recv_stream(self) -> None:
-        pass
+        torch.npu.current_stream().wait_stream(self.recv_stream)

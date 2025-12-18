@@ -139,7 +139,6 @@ class NPUFFNModelRunner(NPUModelRunner,GPUFFNModelRunner):
             # skip dense layer
             if current_layer_idx < self.first_k_dense_replace:
                 return
-            torch.npu.synchronize()
             if self.use_aclgraph:
                 # replay
                 if self.connector_name == "camconnector":
