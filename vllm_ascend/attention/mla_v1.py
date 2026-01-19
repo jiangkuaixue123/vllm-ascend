@@ -287,13 +287,14 @@ class AscendMLAMetadataBuilder:
         common_prefix_len: int,
         common_attn_metadata: AscendCommonAttentionMetadata,
         model: nn.Module,
+        is_ubatch_mode: bool = False,
     ) -> AscendMLAMetadata:
         num_reqs = common_attn_metadata.num_reqs
         num_actual_tokens = common_attn_metadata.num_actual_tokens
         query_start_loc = common_attn_metadata.query_start_loc
         query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
         num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = \
-            split_decodes_and_prefills(common_attn_metadata, decode_threshold=self.decode_threshold)
+            split_decodes_and_prefills(common_attn_metadata, decode_threshold=self.decode_threshold,is_ubatch_mode=is_ubatch_mode)
         assert num_decodes + num_prefills == num_reqs
         assert num_decode_tokens + num_prefill_tokens == num_actual_tokens
 
@@ -867,17 +868,18 @@ class AscendMLAImpl(MLAAttentionImpl):
             # Use TND layout for pure SpecDecoding and SpecDecoding in ChunkedPrefill
             input_layout = "TND"
             # [bs * q_seq_len, num_heads_per_rank, dim]
-            q_nope = q_nope.view(num_tokens, self.num_heads, -1)
+            # TODO: If the driver is upgraded later, the contiguous function can be deleted.
+            q_nope = q_nope.view(num_tokens, self.num_heads, -1).contiguous()
             q_pe = q_pe.view(num_tokens, self.num_heads, -1)
             sparse_mode = 3
             spec_attn_mask = attn_metadata.decode.attn_mask  # type:ignore
             actual_seq_lengths = decode_meta.actual_seq_lengths_q
         else:
             if self.enable_kv_nz:
-                q_nope = q_nope.view(num_tokens, 1, self.num_heads, -1)
+                q_nope = q_nope.view(num_tokens, 1, self.num_heads,-1).contiguous()
                 q_pe = q_pe.view(num_tokens, 1, self.num_heads, -1)
             else:
-                q_nope = q_nope.view(num_tokens, self.num_heads, 1, -1)
+                q_nope = q_nope.view(num_tokens, self.num_heads, 1,-1).contiguous()
                 q_pe = q_pe.view(num_tokens, self.num_heads, 1, -1)
             sparse_mode = 0
             spec_attn_mask = None
