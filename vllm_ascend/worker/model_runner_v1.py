@@ -362,6 +362,7 @@ class NPUModelRunner(GPUModelRunner):
         self.num_draft_tokens = self._make_buffer(self.max_num_reqs,
                                                   dtype=torch.int32)
         self.attn_dummy_run_call_cnt = 0
+        self.runner_step = 0
 
         # here we use int32
         self.sampled_token_ids_pinned_cpu = torch.empty(
@@ -1627,6 +1628,8 @@ class NPUModelRunner(GPUModelRunner):
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: Optional[IntermediateTensors] = None,
     ) -> Union[ModelRunnerOutput, IntermediateTensors] | None:
+        self.runner_step += 1
+        logger.info("runner step=%d, path=execute_model", self.runner_step)
         if self.prof is not None:
             self.prof.step()
         if self.execute_model_state is not None:
@@ -2344,6 +2347,15 @@ class NPUModelRunner(GPUModelRunner):
         activate_lora: bool = False,
         is_graph_capturing: bool = False,
     ) -> torch.Tensor:
+        self.runner_step += 1
+        logger.info(
+            "runner step=%d, path=dummy_run, is_profile=%s, "
+            "is_graph_capturing=%s, is_warmup=%s",
+            self.runner_step,
+            is_profile,
+            is_graph_capturing,
+            self._is_warmup,
+        )
         # only support eager mode and piecewise graph now
         assert cudagraph_runtime_mode is None or cudagraph_runtime_mode in {
             CUDAGraphMode.NONE, CUDAGraphMode.PIECEWISE, CUDAGraphMode.FULL
