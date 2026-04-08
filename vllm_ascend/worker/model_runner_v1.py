@@ -799,6 +799,16 @@ class NPUModelRunner(GPUModelRunner):
 
         uniform_decode = (max_num_scheduled_tokens == self.uniform_decode_query_len
                           ) and (total_num_scheduled_tokens == num_reqs * max_num_scheduled_tokens)
+        logger.info(
+            "Batch graph inputs: total_num_scheduled_tokens=%d, num_reqs=%d, "
+            "max_num_scheduled_tokens=%d, uniform_decode_query_len=%d, "
+            "uniform_decode=%s",
+            total_num_scheduled_tokens,
+            num_reqs,
+            max_num_scheduled_tokens,
+            self.uniform_decode_query_len,
+            uniform_decode,
+        )
 
         (
             cudagraph_mode,
@@ -823,6 +833,13 @@ class NPUModelRunner(GPUModelRunner):
             should_ubatch,
             num_tokens_across_dp,
         )
+        if cudagraph_mode == CUDAGraphMode.NONE:
+            logger.info(
+                "Batch graph fallback: num_scheduled_tokens=%s, "
+                "cudagraph_stats=%s",
+                num_scheduled_tokens_np.tolist(),
+                cudagraph_stats,
+            )
 
         num_tokens_padded = batch_descriptor.num_tokens
         num_reqs_padded = (
