@@ -2346,16 +2346,20 @@ class NPUModelRunner(GPUModelRunner):
         remove_lora: bool = True,
         activate_lora: bool = False,
         is_graph_capturing: bool = False,
+        count_prof_step: bool = False,
     ) -> torch.Tensor:
         self.runner_step += 1
         logger.info(
             "runner step=%d, path=dummy_run, is_profile=%s, "
-            "is_graph_capturing=%s, is_warmup=%s",
+            "is_graph_capturing=%s, is_warmup=%s, count_prof_step=%s",
             self.runner_step,
             is_profile,
             is_graph_capturing,
             self._is_warmup,
+            count_prof_step,
         )
+        if count_prof_step and self.prof is not None:
+            self.prof.step()
         # only support eager mode and piecewise graph now
         assert cudagraph_runtime_mode is None or cudagraph_runtime_mode in {
             CUDAGraphMode.NONE, CUDAGraphMode.PIECEWISE, CUDAGraphMode.FULL
