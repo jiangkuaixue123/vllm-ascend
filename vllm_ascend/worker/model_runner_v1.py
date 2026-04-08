@@ -1654,6 +1654,7 @@ class NPUModelRunner(GPUModelRunner):
                     )
                     # Return empty ModelRunnerOuptut if there's no work to do.
                     return EMPTY_MODEL_RUNNER_OUTPUT
+                logger.info("jcz self.kv_connector_no_forward is not None")
                 return self.kv_connector_no_forward(scheduler_output,
                                                     self.vllm_config)
 
