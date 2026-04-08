@@ -548,7 +548,8 @@ class NPUWorker(WorkerBase):
     def execute_dummy_batch(self) -> None:
         self.model_runner._dummy_run(
             num_tokens=self.model_runner.decode_token_per_req,
-            uniform_decode=True)
+            uniform_decode=True,
+            count_prof_step=True)
 
     def _init_worker_distributed_environment(self) -> None:
         """Initialize the distributed environment."""
