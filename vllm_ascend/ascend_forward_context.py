@@ -25,6 +25,30 @@ class MoECommType(Enum):
     FUSED_MC2 = 3
 
 
+def _get_moe_quant_type(vllm_config: VllmConfig) -> Optional[str]:
+    hf_text_config = vllm_config.model_config.hf_text_config
+    quant_type = getattr(hf_text_config, "moe_quantize",
+                         getattr(hf_text_config, "quantize", None))
+    if quant_type is not None:
+        return str(quant_type).lower()
+
+    quant_config = getattr(vllm_config, "quant_config", None)
+    quant_description = getattr(quant_config, "quant_description", None)
+    if not isinstance(quant_description, dict):
+        return None
+
+    for key, value in quant_description.items():
+        if not isinstance(key, str):
+            continue
+        if ".experts." not in key or not key.endswith(".weight"):
+            continue
+        if not isinstance(value, str):
+            continue
+        return value.lower()
+
+    return None
+
+
 @contextmanager
 def set_ascend_forward_context(
         attn_metadata: Any,
@@ -234,9 +258,7 @@ def select_moe_comm_method(num_tokens: int,
         return None
     mc2_tokens_capacity = get_mc2_tokens_capacity()
     soc_version = get_ascend_device_type()
-    quant_type = getattr(
-        vllm_config.model_config.hf_text_config, 'moe_quantize',
-        getattr(vllm_config.model_config.hf_text_config, 'quantize', None))
+    quant_type = _get_moe_quant_type(vllm_config)
 
     if not vllm_config.parallel_config.enable_expert_parallel or get_ep_group(
     ).world_size == 1:
@@ -272,7 +294,7 @@ def select_moe_comm_method(num_tokens: int,
             elif envs_ascend.VLLM_ASCEND_ENABLE_FUSED_MC2 == 2:
                 fused_prefill_enable = False
             moe_comm_type = MoECommType.FUSED_MC2 if fused_prefill_enable else MoECommType.ALLTOALL
-
+    
     else:
         raise ValueError(f"Unsupported soc_version: {soc_version}")
     return moe_comm_type
