@@ -833,10 +833,9 @@ class NPUModelRunner(GPUModelRunner):
                         "decode_bench_connector": is_decode_bench_connector,
                     }
                 )
-            print(
-                "Batch request diagnostics: "
-                f"kv_connector={kv_connector_name}, reqs={batch_req_diagnostics}"
-            )
+            print(f"Batch request diagnostics: kv_connector={kv_connector_name}")
+            for req_diagnostic in batch_req_diagnostics:
+                print(f"  {req_diagnostic}")
 
         (
             cudagraph_mode,
