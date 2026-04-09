@@ -799,16 +799,44 @@ class NPUModelRunner(GPUModelRunner):
 
         uniform_decode = (max_num_scheduled_tokens == self.uniform_decode_query_len
                           ) and (total_num_scheduled_tokens == num_reqs * max_num_scheduled_tokens)
-        logger.info(
-            "Batch graph inputs: total_num_scheduled_tokens=%d, num_reqs=%d, "
-            "max_num_scheduled_tokens=%d, uniform_decode_query_len=%d, "
-            "uniform_decode=%s",
-            total_num_scheduled_tokens,
-            num_reqs,
-            max_num_scheduled_tokens,
-            self.uniform_decode_query_len,
-            uniform_decode,
-        )
+        if not uniform_decode:
+            logger.warning(
+                "Batch graph inputs: total_num_scheduled_tokens=%d, num_reqs=%d, "
+                "max_num_scheduled_tokens=%d, uniform_decode_query_len=%d, "
+                "uniform_decode=%s",
+                total_num_scheduled_tokens,
+                num_reqs,
+                max_num_scheduled_tokens,
+                self.uniform_decode_query_len,
+                uniform_decode,
+            )
+            kv_connector_name = None
+            if self.vllm_config.kv_transfer_config is not None:
+                kv_connector_name = self.vllm_config.kv_transfer_config.kv_connector
+            is_decode_bench_connector = kv_connector_name == "DecodeBenchConnector"
+            batch_req_diagnostics = []
+            for req_idx, req_id in enumerate(req_ids):
+                req_state = self.requests.get(req_id)
+                kv_transfer_params = None
+                if req_state is not None and req_state.sampling_params is not None:
+                    extra_args = req_state.sampling_params.extra_args
+                    if extra_args is not None:
+                        kv_transfer_params = extra_args.get("kv_transfer_params")
+                batch_req_diagnostics.append(
+                    {
+                        "req_id": req_id,
+                        "num_scheduled_tokens": int(num_scheduled_tokens_np[req_idx]),
+                        "num_computed_tokens": int(
+                            self.input_batch.num_computed_tokens_cpu[req_idx]
+                        ),
+                        "kv_transfer_params": kv_transfer_params,
+                        "decode_bench_connector": is_decode_bench_connector,
+                    }
+                )
+            print(
+                "Batch request diagnostics: "
+                f"kv_connector={kv_connector_name}, reqs={batch_req_diagnostics}"
+            )
 
         (
             cudagraph_mode,
