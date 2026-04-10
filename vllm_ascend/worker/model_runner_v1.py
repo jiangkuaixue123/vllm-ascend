@@ -405,6 +405,7 @@ class NPUModelRunner(GPUModelRunner):
                     VLLM_ASCEND_MODEL_RUNNER_PROFILER_REPEAT,
                     skip_first=envs_ascend.
                     VLLM_ASCEND_MODEL_RUNNER_PROFILER_SKIP_FIRST),
+                record_shapes=True,
                 # 初步采集最好不要使用下面两个选项， with_stack 会大幅增加采集时间及采集的数据大小，深入分析CPU测瓶颈时再打开
                 experimental_config=experimental_config,
                 on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(
