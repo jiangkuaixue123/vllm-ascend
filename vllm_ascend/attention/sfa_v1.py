@@ -1,3 +1,4 @@
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional, Tuple, Type, TypeVar
 
@@ -44,6 +45,22 @@ if TYPE_CHECKING:
 
 # token count limits within bmm_transpose operator
 BMM_TRANS_MAX_SUPPORTED_TOKENS = 1024
+SFA_UBATCH_DEBUG_ENV = "VLLM_ASCEND_DEBUG_SFA_UBATCH_GRAPH"
+
+
+def _sfa_debug_enabled() -> bool:
+    return bool(int(os.getenv(SFA_UBATCH_DEBUG_ENV, "0")))
+
+
+def _shape_str(tensor: Optional[torch.Tensor]) -> str:
+    if tensor is None:
+        return "None"
+    return str(tuple(tensor.shape))
+
+
+def _sfa_debug_log(message: str, *args) -> None:
+    if _sfa_debug_enabled():
+        logger.info("[SFA-UBATCH-DEBUG] " + message, *args)
 
 
 class AscendSFABackend(AttentionBackend):
@@ -723,6 +740,19 @@ class AscendSFAImpl(MLAAttentionImpl):
     ) -> torch.Tensor:
         assert output is not None, "Output tensor must be provided."
         forward_context = get_forward_context()
+        _sfa_debug_log(
+            "forward enter layer=%s ubatch_idx=%s num_ubatches=%s runtime=%s "
+            "capturing=%s in_profile=%s attn_none=%s hidden=%s output=%s",
+            layer_name,
+            getattr(forward_context, "ubatch_idx", None),
+            getattr(forward_context, "num_ubatches", None),
+            getattr(forward_context, "cudagraph_runtime_mode", None),
+            getattr(forward_context, "capturing", None),
+            getattr(forward_context, "in_profile_run", None),
+            attn_metadata is None,
+            _shape_str(hidden_states),
+            _shape_str(output),
+        )
         if attn_metadata is None:
             # Profiling run.
             if self.enable_sfa_cp and not forward_context.in_profile_run:
@@ -735,6 +765,21 @@ class AscendSFAImpl(MLAAttentionImpl):
         sin = attn_metadata.sin
         actual_seq_lengths_query = attn_metadata.cum_query_lens
         actual_seq_lengths_key = attn_metadata.seq_lens
+        _sfa_debug_log(
+            "forward metadata layer=%s ubatch_idx=%s num_input_tokens=%s "
+            "num_actual_tokens=%s slot_mapping=%s block_tables=%s cos=%s sin=%s "
+            "query_lens=%s key_lens=%s",
+            layer_name,
+            getattr(forward_context, "ubatch_idx", None),
+            attn_metadata.num_input_tokens,
+            attn_metadata.num_actual_tokens,
+            _shape_str(attn_metadata.slot_mapping),
+            _shape_str(attn_metadata.block_tables),
+            _shape_str(cos),
+            _shape_str(sin),
+            _shape_str(actual_seq_lengths_query),
+            _shape_str(actual_seq_lengths_key),
+        )
         if self.enable_sfa_cp:
             need_gather_q_kv = False
         # Inputs and outputs may be padded for CUDA graphs
@@ -841,6 +886,18 @@ class AscendSFAImpl(MLAAttentionImpl):
             actual_seq_lengths_key=actual_seq_lengths_key,
             need_gather_q_kv=need_gather_q_kv)
 
+        _sfa_debug_log(
+            "before sparse_fa layer=%s ubatch_idx=%s ql_nope=%s q_pe=%s "
+            "kv_cache0=%s kv_cache1=%s topk_indices=%s block_tables=%s",
+            layer_name,
+            getattr(forward_context, "ubatch_idx", None),
+            _shape_str(ql_nope),
+            _shape_str(q_pe),
+            _shape_str(kv_cache[0]),
+            _shape_str(kv_cache[1]),
+            _shape_str(topk_indices),
+            _shape_str(attn_metadata.block_tables),
+        )
         attn_output = torch.ops._C_ascend.npu_sparse_flash_attention(
             query=ql_nope,
             key=kv_cache[0],
@@ -856,6 +913,12 @@ class AscendSFAImpl(MLAAttentionImpl):
             layout_query="TND",
             layout_kv="PA_BSND",
             sparse_mode=3,
+        )
+        _sfa_debug_log(
+            "after sparse_fa layer=%s ubatch_idx=%s attn_output=%s",
+            layer_name,
+            getattr(forward_context, "ubatch_idx", None),
+            _shape_str(attn_output),
         )
 
         attn_output = self._v_up_proj(attn_output)
@@ -959,6 +1022,18 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         block_table = attn_metadata.block_tables
 
+        _sfa_debug_log(
+            "before lightning_indexer ubatch_idx=%s q=%s k=%s kv_cache2=%s "
+            "weights=%s block_table=%s query_lens=%s key_lens=%s",
+            getattr(get_forward_context(), "ubatch_idx", None),
+            _shape_str(q),
+            _shape_str(k),
+            _shape_str(kv_cache[2]),
+            _shape_str(weights),
+            _shape_str(block_table),
+            _shape_str(actual_seq_lengths_query),
+            _shape_str(actual_seq_lengths_key),
+        )
         topk_indices = torch.ops._C_ascend.npu_lightning_indexer(
             query=q,
             key=kv_cache[2],
@@ -970,4 +1045,9 @@ class AscendSFAImpl(MLAAttentionImpl):
             layout_key="PA_BSND",
             sparse_count=2048,
             sparse_mode=3)
+        _sfa_debug_log(
+            "after lightning_indexer ubatch_idx=%s topk_indices=%s",
+            getattr(get_forward_context(), "ubatch_idx", None),
+            _shape_str(topk_indices),
+        )
         return topk_indices
