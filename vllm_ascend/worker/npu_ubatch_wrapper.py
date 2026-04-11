@@ -464,7 +464,7 @@ class UBatchWrapper(GPUUBatchWrapper):
                 "capture path total_tokens=%s token_counts=%s using_runtime=%s",
                 num_tokens,
                 [ubatch_slice.num_tokens for ubatch_slice in ubatch_slices],
-                CUDAGraphMode.NONE,
+                cudagraph_runtime_mode,
             )
             ubatch_metadata = self._make_ubatch_metadata(
                 ubatch_slices=ubatch_slices,
@@ -476,7 +476,7 @@ class UBatchWrapper(GPUUBatchWrapper):
                 compute_stream=compute_stream,
                 dp_metadata=dp_metadata,
                 batch_descriptor=batch_descriptor,
-                aclgraph_runtime_mode=CUDAGraphMode.NONE,
+                aclgraph_runtime_mode=cudagraph_runtime_mode,
                 afd_metadata=afd_metadata)
             return self._capture_ubatches(ubatch_metadata, self.model)
         elif num_tokens in self.aclgraphs \
