@@ -6,6 +6,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 import copy
+import os
 
 import torch
 
@@ -23,6 +24,16 @@ from vllm.v1.worker.gpu_ubatch_wrapper import (
 )
 
 logger = init_logger(__name__)
+SFA_UBATCH_DEBUG_ENV = "VLLM_ASCEND_DEBUG_SFA_UBATCH_GRAPH"
+
+
+def _ubatch_debug_enabled() -> bool:
+    return bool(int(os.getenv(SFA_UBATCH_DEBUG_ENV, "0")))
+
+
+def _ubatch_debug_log(message: str, *args) -> None:
+    if _ubatch_debug_enabled():
+        logger.info("[UBATCH-DEBUG] " + message, *args)
 
 
 @dataclass
@@ -122,12 +133,31 @@ class UBatchWrapper(GPUUBatchWrapper):
         """
         NPU：Capture a ACLGraph for a microbatched run.
         """
+        _ubatch_debug_log(
+            "capture begin num_ubatches=%s token_counts=%s runtime_modes=%s",
+            len(ubatch_metadata),
+            [metadata.num_tokens for metadata in ubatch_metadata],
+            [
+                metadata.context.forward_context.cudagraph_runtime_mode
+                for metadata in ubatch_metadata
+            ],
+        )
 
         @torch.inference_mode()
         def _capture_ubatch_thread(results, ubatch_metadata):
             torch.npu.set_device(self.device)
             ubatch_context = ubatch_metadata.context
             ubatch_context.forward_context.capturing = True
+            _ubatch_debug_log(
+                "capture thread start ubatch_id=%s ubatch_idx=%s num_tokens=%s "
+                "runtime=%s input_ids=%s positions=%s",
+                ubatch_context.id,
+                getattr(ubatch_context.forward_context, "ubatch_idx", None),
+                ubatch_metadata.num_tokens,
+                ubatch_context.forward_context.cudagraph_runtime_mode,
+                tuple(ubatch_metadata.input_ids.shape),
+                tuple(ubatch_metadata.positions.shape),
+            )
             # NPU特殊逻辑：不需要初始化blas_handle
             with ubatch_context:
                 model_output = model(
@@ -138,6 +168,12 @@ class UBatchWrapper(GPUUBatchWrapper):
                 )
 
             results.append((ubatch_metadata.context.id, model_output))
+            _ubatch_debug_log(
+                "capture thread done ubatch_id=%s ubatch_idx=%s output=%s",
+                ubatch_context.id,
+                getattr(ubatch_context.forward_context, "ubatch_idx", None),
+                tuple(model_output.shape),
+            )
             # TODO(jcz):这里需要同步吗？如果不同步，会导致crash
             import time
             time.sleep(2)
@@ -184,6 +220,12 @@ class UBatchWrapper(GPUUBatchWrapper):
                 result = torch.cat(sorted_results, dim=0)
                 aclgraph_metadata.outputs = result
             self.aclgraphs[num_tokens] = aclgraph_metadata
+            _ubatch_debug_log(
+                "capture end total_tokens=%s output=%s cached_shapes=%s",
+                num_tokens,
+                tuple(aclgraph_metadata.outputs.shape),
+                list(self.aclgraphs.keys()),
+            )
         return aclgraph_metadata.outputs
 
     @_torch_cuda_wrapper()
@@ -362,6 +404,13 @@ class UBatchWrapper(GPUUBatchWrapper):
         ubatch_slices = forward_context.ubatch_slices
         cudagraph_runtime_mode = forward_context.cudagraph_runtime_mode
         afd_metadata = forward_context.afd_metadata
+        _ubatch_debug_log(
+            "__call__ runtime=%s ubatch_slices=%s afd_metadata=%s",
+            cudagraph_runtime_mode,
+            None if ubatch_slices is None else
+            [ubatch_slice.num_tokens for ubatch_slice in ubatch_slices],
+            afd_metadata is not None,
+        )
         
         # If there's no ubatching, just run the runnable object
         if ubatch_slices is None:
@@ -411,6 +460,12 @@ class UBatchWrapper(GPUUBatchWrapper):
 
         if num_tokens not in self.aclgraphs \
             and cudagraph_runtime_mode is CUDAGraphMode.FULL:
+            _ubatch_debug_log(
+                "capture path total_tokens=%s token_counts=%s using_runtime=%s",
+                num_tokens,
+                [ubatch_slice.num_tokens for ubatch_slice in ubatch_slices],
+                CUDAGraphMode.NONE,
+            )
             ubatch_metadata = self._make_ubatch_metadata(
                 ubatch_slices=ubatch_slices,
                 attn_metadata=attn_metadata,
@@ -427,10 +482,23 @@ class UBatchWrapper(GPUUBatchWrapper):
         elif num_tokens in self.aclgraphs \
             and cudagraph_runtime_mode is CUDAGraphMode.FULL:
             aclgraph_metadata = self.aclgraphs[num_tokens]
+            _ubatch_debug_log(
+                "replay path total_tokens=%s token_counts=%s cached_output=%s",
+                num_tokens,
+                [ubatch_slice.num_tokens for ubatch_slice in ubatch_slices],
+                None if aclgraph_metadata.outputs is None else
+                tuple(aclgraph_metadata.outputs.shape),
+            )
             aclgraph_metadata.aclgraph.replay()
             print("UBatchWrapper replay")
             return aclgraph_metadata.outputs
         else:
+            _ubatch_debug_log(
+                "eager ubatch path total_tokens=%s token_counts=%s using_runtime=%s",
+                num_tokens,
+                [ubatch_slice.num_tokens for ubatch_slice in ubatch_slices],
+                CUDAGraphMode.NONE,
+            )
             ubatch_metadata = self._make_ubatch_metadata(
                 ubatch_slices=ubatch_slices,
                 attn_metadata=attn_metadata,
