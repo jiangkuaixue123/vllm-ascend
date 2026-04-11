@@ -58,6 +58,13 @@ def _shape_str(tensor: Optional[torch.Tensor]) -> str:
     return str(tuple(tensor.shape))
 
 
+def _tensor_debug_str(tensor: Optional[torch.Tensor]) -> str:
+    if tensor is None:
+        return "None"
+    return (f"shape={tuple(tensor.shape)} dtype={tensor.dtype} "
+            f"device={tensor.device} ptr={tensor.data_ptr()}")
+
+
 def _sfa_debug_log(message: str, *args) -> None:
     if _sfa_debug_enabled():
         logger.info("[SFA-UBATCH-DEBUG] " + message, *args)
@@ -768,7 +775,9 @@ class AscendSFAImpl(MLAAttentionImpl):
         _sfa_debug_log(
             "forward metadata layer=%s ubatch_idx=%s num_input_tokens=%s "
             "num_actual_tokens=%s slot_mapping=%s block_tables=%s cos=%s sin=%s "
-            "query_lens=%s key_lens=%s",
+            "query_lens=%s key_lens=%s "
+            "slot_mapping_detail=%s block_tables_detail=%s cos_detail=%s "
+            "sin_detail=%s query_lens_detail=%s key_lens_detail=%s",
             layer_name,
             getattr(forward_context, "ubatch_idx", None),
             attn_metadata.num_input_tokens,
@@ -779,6 +788,12 @@ class AscendSFAImpl(MLAAttentionImpl):
             _shape_str(sin),
             _shape_str(actual_seq_lengths_query),
             _shape_str(actual_seq_lengths_key),
+            _tensor_debug_str(attn_metadata.slot_mapping),
+            _tensor_debug_str(attn_metadata.block_tables),
+            _tensor_debug_str(cos),
+            _tensor_debug_str(sin),
+            _tensor_debug_str(actual_seq_lengths_query),
+            _tensor_debug_str(actual_seq_lengths_key),
         )
         if self.enable_sfa_cp:
             need_gather_q_kv = False
@@ -888,7 +903,9 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         _sfa_debug_log(
             "before sparse_fa layer=%s ubatch_idx=%s ql_nope=%s q_pe=%s "
-            "kv_cache0=%s kv_cache1=%s topk_indices=%s block_tables=%s",
+            "kv_cache0=%s kv_cache1=%s topk_indices=%s block_tables=%s "
+            "ql_nope_detail=%s q_pe_detail=%s kv_cache0_detail=%s "
+            "kv_cache1_detail=%s topk_indices_detail=%s block_tables_detail=%s",
             layer_name,
             getattr(forward_context, "ubatch_idx", None),
             _shape_str(ql_nope),
@@ -897,6 +914,12 @@ class AscendSFAImpl(MLAAttentionImpl):
             _shape_str(kv_cache[1]),
             _shape_str(topk_indices),
             _shape_str(attn_metadata.block_tables),
+            _tensor_debug_str(ql_nope),
+            _tensor_debug_str(q_pe),
+            _tensor_debug_str(kv_cache[0]),
+            _tensor_debug_str(kv_cache[1]),
+            _tensor_debug_str(topk_indices),
+            _tensor_debug_str(attn_metadata.block_tables),
         )
         attn_output = torch.ops._C_ascend.npu_sparse_flash_attention(
             query=ql_nope,
@@ -1024,7 +1047,9 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         _sfa_debug_log(
             "before lightning_indexer ubatch_idx=%s q=%s k=%s kv_cache2=%s "
-            "weights=%s block_table=%s query_lens=%s key_lens=%s",
+            "weights=%s block_table=%s query_lens=%s key_lens=%s "
+            "q_detail=%s k_detail=%s kv_cache2_detail=%s weights_detail=%s "
+            "block_table_detail=%s query_lens_detail=%s key_lens_detail=%s",
             getattr(get_forward_context(), "ubatch_idx", None),
             _shape_str(q),
             _shape_str(k),
@@ -1033,6 +1058,13 @@ class AscendSFAImpl(MLAAttentionImpl):
             _shape_str(block_table),
             _shape_str(actual_seq_lengths_query),
             _shape_str(actual_seq_lengths_key),
+            _tensor_debug_str(q),
+            _tensor_debug_str(k),
+            _tensor_debug_str(kv_cache[2]),
+            _tensor_debug_str(weights),
+            _tensor_debug_str(block_table),
+            _tensor_debug_str(actual_seq_lengths_query),
+            _tensor_debug_str(actual_seq_lengths_key),
         )
         topk_indices = torch.ops._C_ascend.npu_lightning_indexer(
             query=q,
