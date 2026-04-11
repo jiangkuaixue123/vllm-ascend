@@ -154,6 +154,20 @@ class ACLGraphWrapper:
         batch_descriptor = forward_context.batch_descriptor
         aclgraph_runtime_mode = forward_context.cudagraph_runtime_mode
 
+        _capture_debug_log(
+            "wrapper entry mode=%s runtime=%s key=%s %s %s %s %s %s %s",
+            self.runtime_mode,
+            aclgraph_runtime_mode,
+            batch_descriptor,
+            _forward_context_capture_str(forward_context),
+            _tensor_capture_str("input_ids", kwargs.get("input_ids")),
+            _tensor_capture_str("positions", kwargs.get("positions")),
+            _tensor_capture_str("inputs_embeds", kwargs.get("inputs_embeds")),
+            _tensor_capture_str("intermediate_tensors",
+                                kwargs.get("intermediate_tensors")),
+            _attn_capture_str(getattr(forward_context, "attn_metadata", None)),
+        )
+
         if aclgraph_runtime_mode == CUDAGraphMode.NONE or \
                             aclgraph_runtime_mode != self.runtime_mode:
             # CUDAGraphMode.NONE could mean the profile run, a warmup run, or
@@ -172,6 +186,12 @@ class ACLGraphWrapper:
         entry = self.concrete_aclgraph_entries[batch_descriptor]
 
         if entry.aclgraph is None:
+            _capture_debug_log(
+                "capture path mode=%s key=%s existing_entries=%s",
+                self.runtime_mode,
+                batch_descriptor,
+                len(self.concrete_aclgraph_entries),
+            )
             if self.aclgraph_options.debug_log_enable:
                 # Since we capture aclgraph for many different shapes and
                 # capturing is fast, we don't need to log it for every
@@ -266,6 +286,13 @@ class ACLGraphWrapper:
                 f"got {new_input_addresses}")
 
         logger.info_once("Replaying aclgraph")
+        _capture_debug_log(
+            "replay path mode=%s key=%s output_type=%s input_addresses=%s",
+            self.runtime_mode,
+            batch_descriptor,
+            type(entry.output).__name__ if entry.output is not None else None,
+            entry.input_addresses,
+        )
         # In async scheduling or multi-threaded (MT) scenarios, it is possible that
         # the CPU's record event (from update_attn_params) for the iteration i completes
         # before the grph replay of iteration i-1.
