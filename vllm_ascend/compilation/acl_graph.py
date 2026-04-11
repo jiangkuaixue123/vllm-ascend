@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import dataclasses
+import os
 from contextlib import ExitStack
 from dataclasses import dataclass
 from typing import Any, Callable, Optional, List, Dict, Tuple
@@ -23,6 +24,56 @@ from vllm.platforms import current_platform
 from vllm_ascend.attention.utils import using_paged_attention
 
 from ..utils import weak_ref_tensors
+
+ACLGRAPH_CAPTURE_DEBUG_ENV = "VLLM_ASCEND_DEBUG_SFA_UBATCH_GRAPH"
+
+
+def _aclgraph_capture_debug_enabled() -> bool:
+    return bool(int(os.getenv(ACLGRAPH_CAPTURE_DEBUG_ENV, "0")))
+
+
+def _tensor_capture_str(name: str, tensor: Optional[torch.Tensor]) -> str:
+    if tensor is None:
+        return f"{name}=None"
+    return (f"{name}=shape={tuple(tensor.shape)} dtype={tensor.dtype} "
+            f"device={tensor.device} ptr={tensor.data_ptr()}")
+
+
+def _attn_capture_str(attn_metadata: Any) -> str:
+    if attn_metadata is None:
+        return "attn=None"
+
+    parts = [
+        f"id={id(attn_metadata)}",
+        f"num_input_tokens={getattr(attn_metadata, 'num_input_tokens', None)}",
+        f"num_actual_tokens={getattr(attn_metadata, 'num_actual_tokens', None)}",
+    ]
+    for name in ("slot_mapping", "block_tables", "cum_query_lens", "seq_lens",
+                 "cos", "sin"):
+        parts.append(
+            _tensor_capture_str(name, getattr(attn_metadata, name, None)))
+    return "attn={" + ", ".join(parts) + "}"
+
+
+def _forward_context_capture_str(forward_context: Any) -> str:
+    if forward_context is None:
+        return "forward_context=None"
+    return (
+        "forward_context={"
+        f"id={id(forward_context)}, "
+        f"runtime={getattr(forward_context, 'cudagraph_runtime_mode', None)}, "
+        f"capturing={getattr(forward_context, 'capturing', None)}, "
+        f"ubatch_idx={getattr(forward_context, 'ubatch_idx', None)}, "
+        f"num_ubatches={getattr(forward_context, 'num_ubatches', None)}, "
+        f"num_tokens={getattr(forward_context, 'num_tokens', None)}, "
+        f"batch_descriptor={getattr(forward_context, 'batch_descriptor', None)}"
+        "}"
+    )
+
+
+def _capture_debug_log(message: str, *args) -> None:
+    if _aclgraph_capture_debug_enabled():
+        logger.info("[ACLGRAPH-CAPTURE-DEBUG] " + message, *args)
 
 
 @dataclasses.dataclass
@@ -131,6 +182,20 @@ class ACLGraphWrapper:
             # validate that aclgraph capturing is legal at this point.
             validate_cudagraph_capturing_enabled()
 
+            _capture_debug_log(
+                "capture start mode=%s key=%s %s %s %s %s %s %s",
+                self.runtime_mode,
+                entry.batch_descriptor,
+                _forward_context_capture_str(forward_context),
+                _tensor_capture_str("input_ids", kwargs.get("input_ids")),
+                _tensor_capture_str("positions", kwargs.get("positions")),
+                _tensor_capture_str("inputs_embeds", kwargs.get("inputs_embeds")),
+                _tensor_capture_str("intermediate_tensors",
+                                    kwargs.get("intermediate_tensors")),
+                _attn_capture_str(getattr(forward_context, "attn_metadata",
+                                          None)),
+            )
+
             input_addresses = [
                 x.data_ptr() for x in args if isinstance(x, torch.Tensor)
             ]
@@ -174,6 +239,14 @@ class ACLGraphWrapper:
             # to save memory
             entry.output = weak_ref_tensors(output)
             entry.aclgraph = aclgraph
+
+            _capture_debug_log(
+                "capture end mode=%s key=%s output_type=%s input_addresses=%s",
+                self.runtime_mode,
+                entry.batch_descriptor,
+                type(output).__name__,
+                input_addresses,
+            )
 
             compilation_counter.num_cudagraph_captured += 1
 
