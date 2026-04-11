@@ -36,6 +36,51 @@ def _ubatch_debug_log(message: str, *args) -> None:
         logger.info("[UBATCH-DEBUG] " + message, *args)
 
 
+def _tensor_capture_str(name: str, tensor: Optional[torch.Tensor]) -> str:
+    if tensor is None:
+        return f"{name}=None"
+    return (f"{name}=shape={tuple(tensor.shape)} dtype={tensor.dtype} "
+            f"device={tensor.device} ptr={tensor.data_ptr()}")
+
+
+def _attn_capture_str(attn_metadata: Any) -> str:
+    if attn_metadata is None:
+        return "attn=None"
+
+    parts = [
+        f"id={id(attn_metadata)}",
+        f"num_input_tokens={getattr(attn_metadata, 'num_input_tokens', None)}",
+        f"num_actual_tokens={getattr(attn_metadata, 'num_actual_tokens', None)}",
+    ]
+    for name in ("slot_mapping", "block_tables", "cum_query_lens", "seq_lens",
+                 "cos", "sin"):
+        parts.append(
+            _tensor_capture_str(name, getattr(attn_metadata, name, None)))
+    return "attn={" + ", ".join(parts) + "}"
+
+
+def _forward_context_capture_str(forward_context: Any) -> str:
+    if forward_context is None:
+        return "forward_context=None"
+    return (
+        "forward_context={"
+        f"id={id(forward_context)}, "
+        f"runtime={getattr(forward_context, 'cudagraph_runtime_mode', None)}, "
+        f"capturing={getattr(forward_context, 'capturing', None)}, "
+        f"ubatch_idx={getattr(forward_context, 'ubatch_idx', None)}, "
+        f"num_ubatches={getattr(forward_context, 'num_ubatches', None)}, "
+        f"num_tokens={getattr(forward_context, 'num_tokens', None)}, "
+        f"batch_descriptor={getattr(forward_context, 'batch_descriptor', None)}"
+        "}"
+    )
+
+
+def _first_attn_metadata(attn_metadata: Any) -> Any:
+    if isinstance(attn_metadata, list):
+        return attn_metadata[0] if attn_metadata else None
+    return attn_metadata
+
+
 @dataclass
 class ACLGraphMetaData:
     aclgraph: torch.npu.NPUGraph
@@ -134,13 +179,18 @@ class UBatchWrapper(GPUUBatchWrapper):
         NPU：Capture a ACLGraph for a microbatched run.
         """
         _ubatch_debug_log(
-            "capture begin num_ubatches=%s token_counts=%s runtime_modes=%s",
+            "capture begin num_ubatches=%s token_counts=%s runtime_modes=%s first=%s %s %s",
             len(ubatch_metadata),
             [metadata.num_tokens for metadata in ubatch_metadata],
             [
                 metadata.context.forward_context.cudagraph_runtime_mode
                 for metadata in ubatch_metadata
             ],
+            _forward_context_capture_str(ubatch_metadata[0].context.forward_context),
+            _tensor_capture_str("input_ids", ubatch_metadata[0].input_ids),
+            _attn_capture_str(
+                getattr(ubatch_metadata[0].context.forward_context,
+                        "attn_metadata", None)),
         )
 
         @torch.inference_mode()
@@ -346,6 +396,17 @@ class UBatchWrapper(GPUUBatchWrapper):
                               compute_stream, dp_metadata, batch_descriptor,
                               aclgraph_runtime_mode, afd_metadata) -> list[UbatchMetadata]:
         # Create one forward context per ubatch
+        _ubatch_debug_log(
+            "make_ubatch_metadata start ubatch_sizes=%s runtime=%s %s %s %s %s %s %s",
+            [ubatch_slice.num_tokens for ubatch_slice in ubatch_slices],
+            aclgraph_runtime_mode,
+            _forward_context_capture_str(get_forward_context()),
+            _tensor_capture_str("input_ids", input_ids),
+            _tensor_capture_str("positions", positions),
+            _tensor_capture_str("inputs_embeds", inputs_embeds),
+            _tensor_capture_str("intermediate_tensors", intermediate_tensors),
+            _attn_capture_str(_first_attn_metadata(attn_metadata)),
+        )
         forward_contexts = []
         for i, ubatch_slice in enumerate(ubatch_slices):
             forward_context = copy.copy(get_forward_context())
@@ -385,6 +446,18 @@ class UBatchWrapper(GPUUBatchWrapper):
                 self._slice_model_inputs(
                     ubatch_slice.token_slice, input_ids, positions,
                     inputs_embeds, intermediate_tensors)
+            _ubatch_debug_log(
+                "make_ubatch_metadata item idx=%s slice=%s %s %s %s %s %s",
+                i,
+                ubatch_slice.token_slice,
+                _forward_context_capture_str(forward_contexts[i]),
+                _tensor_capture_str("input_ids", sliced_input_ids),
+                _tensor_capture_str("positions", sliced_positions),
+                _tensor_capture_str("inputs_embeds", sliced_inputs_embeds),
+                _attn_capture_str(
+                    attn_metadata[i] if isinstance(attn_metadata, list)
+                    and attn_metadata else _first_attn_metadata(attn_metadata)),
+            )
             ubatch_metadata.append(
                 UbatchMetadata(
                     context=ubatch_ctxs[i],
@@ -442,6 +515,17 @@ class UBatchWrapper(GPUUBatchWrapper):
         intermediate_tensors = kwargs['intermediate_tensors']
         inputs_embeds = kwargs['inputs_embeds']
         compute_stream = torch.npu.current_stream()
+
+        _ubatch_debug_log(
+            "wrapper entry total_tokens=%s %s %s %s %s %s %s",
+            num_tokens,
+            _forward_context_capture_str(forward_context),
+            _tensor_capture_str("input_ids", input_ids),
+            _tensor_capture_str("positions", positions),
+            _tensor_capture_str("inputs_embeds", inputs_embeds),
+            _tensor_capture_str("intermediate_tensors", intermediate_tensors),
+            _attn_capture_str(_first_attn_metadata(attn_metadata)),
+        )
 
         dp_metadata = forward_context.dp_metadata
 
