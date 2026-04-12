@@ -80,6 +80,29 @@ torch._dynamo.trace_rules.torch_name_rule_map.append(
     torch_non_c_binding_in_graph_functions_npu)  # noqa: E402
 
 
+def _maybe_log_sfa_debug_lens_after_step() -> None:
+    from vllm_ascend.attention.sfa_v1 import (get_sfa_debug_lens_snapshot,
+                                              sfa_debug_lens_enabled)
+
+    if not sfa_debug_lens_enabled():
+        return
+
+    torch.npu.synchronize()
+    snapshot = get_sfa_debug_lens_snapshot()
+    if snapshot is None:
+        logger.info("[SFA-LENS-BUFFER] snapshot is None after step sync")
+        return
+
+    logger.info(
+        "[SFA-LENS-BUFFER] device=%s step=%s layer=%s query=%s key=%s",
+        snapshot["device"],
+        snapshot["step"],
+        snapshot["layer_name"],
+        snapshot["query"].tolist(),
+        snapshot["key"].tolist(),
+    )
+
+
 class NPUWorker(WorkerBase):
 
     def __init__(
@@ -403,6 +426,7 @@ class NPUWorker(WorkerBase):
 
         output = self.model_runner.execute_model(scheduler_output,
                                                  intermediate_tensors)
+        _maybe_log_sfa_debug_lens_after_step()
         if isinstance(output,
                       (ModelRunnerOutput, AsyncModelRunnerOutput, NoneType)):
             return output
