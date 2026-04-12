@@ -1,4 +1,6 @@
 import os
+import re
+import weakref
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional, Tuple, Type, TypeVar
 
@@ -46,10 +48,20 @@ if TYPE_CHECKING:
 # token count limits within bmm_transpose operator
 BMM_TRANS_MAX_SUPPORTED_TOKENS = 1024
 SFA_UBATCH_DEBUG_ENV = "VLLM_ASCEND_DEBUG_SFA_UBATCH_GRAPH"
+SFA_LENS_BUFFER_DEBUG_ENV = "VLLM_ASCEND_DEBUG_SFA_LENS_BUFFER"
+_SFA_LENS_BUFFER_OWNER: Optional[weakref.ReferenceType] = None
 
 
 def _sfa_debug_enabled() -> bool:
     return bool(int(os.getenv(SFA_UBATCH_DEBUG_ENV, "0")))
+
+
+def _sfa_lens_buffer_enabled() -> bool:
+    return bool(int(os.getenv(SFA_LENS_BUFFER_DEBUG_ENV, "0")))
+
+
+def sfa_debug_lens_enabled() -> bool:
+    return _sfa_lens_buffer_enabled()
 
 
 def _shape_str(tensor: Optional[torch.Tensor]) -> str:
@@ -68,6 +80,119 @@ def _tensor_debug_str(tensor: Optional[torch.Tensor]) -> str:
 def _sfa_debug_log(message: str, *args) -> None:
     if _sfa_debug_enabled():
         logger.info("[SFA-UBATCH-DEBUG] " + message, *args)
+
+
+def _sfa_lens_buffer_log(message: str, *args) -> None:
+    if _sfa_lens_buffer_enabled():
+        logger.info("[SFA-LENS-BUFFER-DEBUG] " + message, *args)
+
+
+def _is_first_sfa_layer(layer_name: str) -> bool:
+    return re.search(r"(^|\.)layers\.0(\.|$)", layer_name) is not None
+
+
+def _maybe_register_sfa_lens_owner(layer_name: str,
+                                   impl: "AscendSFAImpl") -> None:
+    global _SFA_LENS_BUFFER_OWNER
+    if (not _sfa_lens_buffer_enabled() or not _is_first_sfa_layer(layer_name)):
+        _sfa_lens_buffer_log(
+            "skip owner register layer=%s enabled=%s first_layer=%s",
+            layer_name,
+            _sfa_lens_buffer_enabled(),
+            _is_first_sfa_layer(layer_name),
+        )
+        return
+
+    owner = None if _SFA_LENS_BUFFER_OWNER is None else _SFA_LENS_BUFFER_OWNER()
+    if owner is None:
+        _SFA_LENS_BUFFER_OWNER = weakref.ref(impl)
+        _sfa_lens_buffer_log("register owner layer=%s impl_id=%s", layer_name,
+                             id(impl))
+
+
+def _capture_sfa_debug_lens(impl: "AscendSFAImpl", layer_name: str,
+                            actual_seq_lengths_query: torch.Tensor,
+                            actual_seq_lengths_key: torch.Tensor) -> None:
+    if (not _sfa_lens_buffer_enabled() or not _is_first_sfa_layer(layer_name)):
+        _sfa_lens_buffer_log(
+            "skip capture layer=%s enabled=%s first_layer=%s",
+            layer_name,
+            _sfa_lens_buffer_enabled(),
+            _is_first_sfa_layer(layer_name),
+        )
+        return
+
+    _maybe_register_sfa_lens_owner(layer_name, impl)
+
+    if (impl._debug_query_lens_buf is None or
+            impl._debug_query_lens_buf.shape != actual_seq_lengths_query.shape or
+            impl._debug_query_lens_buf.dtype != actual_seq_lengths_query.dtype):
+        impl._debug_query_lens_buf = torch.empty_like(actual_seq_lengths_query)
+
+    if (impl._debug_key_lens_buf is None or
+            impl._debug_key_lens_buf.shape != actual_seq_lengths_key.shape or
+            impl._debug_key_lens_buf.dtype != actual_seq_lengths_key.dtype):
+        impl._debug_key_lens_buf = torch.empty_like(actual_seq_lengths_key)
+
+    impl._debug_query_lens_buf.copy_(actual_seq_lengths_query)
+    impl._debug_key_lens_buf.copy_(actual_seq_lengths_key)
+    impl._debug_lens_layer_name = layer_name
+    impl._debug_lens_step += 1
+    _sfa_lens_buffer_log(
+        "captured lens layer=%s step=%s query_shape=%s key_shape=%s",
+        layer_name,
+        impl._debug_lens_step,
+        tuple(actual_seq_lengths_query.shape),
+        tuple(actual_seq_lengths_key.shape),
+    )
+
+
+def get_sfa_debug_lens_snapshot(
+        device: Optional[torch.device | str | int] = None
+) -> Optional[dict[str, object]]:
+    if not _sfa_lens_buffer_enabled():
+        _sfa_lens_buffer_log("snapshot skipped because env is disabled")
+        return None
+    owner = None if _SFA_LENS_BUFFER_OWNER is None else _SFA_LENS_BUFFER_OWNER()
+    if owner is None:
+        _sfa_lens_buffer_log("snapshot is None because no owner is registered")
+        return None
+
+    if owner._debug_query_lens_buf is None or owner._debug_key_lens_buf is None:
+        _sfa_lens_buffer_log(
+            "snapshot is None because buffers are missing query_buf=%s key_buf=%s owner_id=%s",
+            owner._debug_query_lens_buf is not None,
+            owner._debug_key_lens_buf is not None,
+            id(owner),
+        )
+        return None
+
+    owner_device = owner._debug_query_lens_buf.device
+    if device is not None:
+        if isinstance(device, torch.device):
+            device_key = str(device)
+        elif isinstance(device, int):
+            device_key = f"npu:{device}"
+        else:
+            device_key = str(device)
+        if device_key != str(owner_device):
+            _sfa_lens_buffer_log(
+                "snapshot is None because device mismatch requested=%s owner=%s",
+                device_key,
+                owner_device,
+            )
+            return None
+
+    _sfa_lens_buffer_log("snapshot ready device=%s step=%s layer=%s",
+                         owner_device, owner._debug_lens_step,
+                         owner._debug_lens_layer_name)
+    return {
+        "device": str(owner_device),
+        "layer_name": owner._debug_lens_layer_name,
+        "step": owner._debug_lens_step,
+        "query": owner._debug_query_lens_buf.detach().cpu(),
+        "key": owner._debug_key_lens_buf.detach().cpu(),
+    }
 
 
 class AscendSFABackend(AttentionBackend):
@@ -418,6 +543,10 @@ class AscendSFAImpl(MLAAttentionImpl):
         self.k_norm = self.indexer.k_norm
 
         self.cp_size = 1
+        self._debug_query_lens_buf: Optional[torch.Tensor] = None
+        self._debug_key_lens_buf: Optional[torch.Tensor] = None
+        self._debug_lens_layer_name: Optional[str] = None
+        self._debug_lens_step = 0
 
     def process_weights_after_loading(self, act_dtype: torch.dtype):
         # NOTE: We currently do not support quant kv_b_proj.
@@ -889,6 +1018,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                         k_pe)
 
         topk_indices = self.indexer_select_post_process(
+            layer_name=layer_name,
             x=hidden_states,
             qr=q_c,
             q=q,
@@ -998,6 +1128,7 @@ class AscendSFAImpl(MLAAttentionImpl):
 
     def indexer_select_post_process(
         self,
+        layer_name: str,
         x: torch.Tensor,
         qr: torch.Tensor,
         q: Optional[torch.Tensor],
@@ -1066,6 +1197,8 @@ class AscendSFAImpl(MLAAttentionImpl):
             _tensor_debug_str(actual_seq_lengths_query),
             _tensor_debug_str(actual_seq_lengths_key),
         )
+        _capture_sfa_debug_lens(self, layer_name, actual_seq_lengths_query,
+                                actual_seq_lengths_key)
         topk_indices = torch.ops._C_ascend.npu_lightning_indexer(
             query=q,
             key=kv_cache[2],
