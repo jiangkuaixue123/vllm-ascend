@@ -89,7 +89,8 @@ class NPUFFNModelRunner(NPUModelRunner,GPUFFNModelRunner):
         num_ubatches_cfg = self.parallel_config.num_ubatches if self.parallel_config.num_ubatches else 1
         self.ffn_comm_stream = torch.npu.Stream() if self.ffn_multistream_capable else None
         self.ffn_comm_events = [torch.npu.Event() for _ in range(num_ubatches_cfg)] if self.ffn_multistream_capable else []
-        print(f'attn_size = {self.attn_size},ffn_size = {self.ffn_size}')
+        logger.debug("attn_size = %s,ffn_size = %s", self.attn_size,
+                     self.ffn_size)
         if getattr(self.model_config.hf_config, "text_config",
                    None) is not None:
             self.num_layers = (
@@ -101,7 +102,7 @@ class NPUFFNModelRunner(NPUModelRunner,GPUFFNModelRunner):
         self.topk = self.model_config.hf_config.num_experts_per_tok
         self.n_routed_experts = self.model_config.hf_config.n_routed_experts
         self.hidden_size = self.model_config.hf_config.hidden_size
-        print(f'self.topk is {self.topk}')
+        logger.debug("self.topk is %s", self.topk)
         self.decode_max_num_token = self.scheduler_config.max_num_seqs * \
                         self.uniform_decode_query_len
 
@@ -340,7 +341,7 @@ class NPUFFNModelRunner(NPUModelRunner,GPUFFNModelRunner):
             dp_metadata_key: dp_metadata的key，用于存储graph（替代num_tokens作为key）
         """
         is_ubatch = dp_metadata_list is not None and len(dp_metadata_list) > 1
-        print(f'is_ubatch in _dummy_run is {is_ubatch}')
+        logger.debug("is_ubatch in _dummy_run is %s", is_ubatch)
 
         # only support eager mode and piecewise graph now
         assert aclgraph_runtime_mode is None or aclgraph_runtime_mode in {
@@ -362,12 +363,12 @@ class NPUFFNModelRunner(NPUModelRunner,GPUFFNModelRunner):
                 'input_hidden_states': output,
                 'output': output
             }
-            print(f'self._acl_graphs key={dp_metadata_key}', flush=True)
+            logger.debug("self._acl_graphs key=%s", dp_metadata_key)
         else:
             self._ffn_forward(aclgraph_runtime_mode=aclgraph_runtime_mode,
                               dp_metadata_list=dp_metadata_list)
-            print("finsh capture warm_up or prefile run",flush=True)
-        print(f'self.dummy_run_call_cnt is {self.dummy_run_call_cnt}')
+            logger.debug("finsh capture warm_up or prefile run")
+        logger.debug("self.dummy_run_call_cnt is %s", self.dummy_run_call_cnt)
         self.dummy_run_call_cnt += 1
 
     # TODO: to adapt m2nAFDConnector for deepseek w9a8量化适配
@@ -441,7 +442,8 @@ class NPUFFNModelRunner(NPUModelRunner,GPUFFNModelRunner):
         is_ubatch = dp_metadata_list is not None and len(dp_metadata_list) > 1
         num_ubatches = self.parallel_config.num_ubatches if is_ubatch else 1
         rank_ffn_output = None
-        print(f"jcz _ffn_forward max_num_tokens:{self.max_num_tokens}")
+        logger.debug("jcz _ffn_forward max_num_tokens:%s",
+                     self.max_num_tokens)
 
         ffn_multistream_enable = self.ffn_multistream_capable and num_ubatches > 1
 
@@ -478,8 +480,11 @@ class NPUFFNModelRunner(NPUModelRunner,GPUFFNModelRunner):
                     recv_output = self.connector.recv_attn_output(metadata=afd_connector_data, ubatch_idx=ubatch_idx)
                     if hasattr(self.connector, "update_metadata") and afd_connector_data is not None:
                         self.connector.update_metadata(afd_connector_data, recv_output)
-                    print(f'{self.connector_name} recv_attn_output success ,layer id is {layer_idx}, '
-                        f'ubatch_idx is {ubatch_idx} recv_output:{recv_output.hidden_states.shape}', flush=True)
+                    logger.debug(
+                        "%s recv_attn_output success ,layer id is %s, "
+                        "ubatch_idx is %s recv_output:%s",
+                        self.connector_name, layer_idx, ubatch_idx,
+                        recv_output.hidden_states.shape)
 
                     hidden_states = recv_output.hidden_states
                     dynamic_scales = recv_output.dynamic_scales
@@ -512,7 +517,9 @@ class NPUFFNModelRunner(NPUModelRunner,GPUFFNModelRunner):
                         comm_event=self.ffn_comm_events[ubatch_idx] if layer_multistream else None)
                     if layer_multistream:
                         ffn_event_recorded[ubatch_idx] = True
-                    print(f'cam send_ffn_output success ,layer id is {layer_idx},ubatch_idx is {ubatch_idx}', flush=True)
+                    logger.debug(
+                        "cam send_ffn_output success ,layer id is %s,"
+                        "ubatch_idx is %s", layer_idx, ubatch_idx)
 
             if ffn_multistream_enable:
                 curr_stream = torch.npu.current_stream()
