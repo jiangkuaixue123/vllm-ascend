@@ -481,26 +481,20 @@ class CAMP2PAFDConnector(AFDConnectorBase):
             is_warmup: 是否处于warmup阶段
         """
         send_data = (data, is_graph_capturing, is_warmup)
+        object_bytes = pickle.dumps(send_data, protocol=pickle.HIGHEST_PROTOCOL)
+        object_tensor = torch.frombuffer(bytearray(object_bytes),
+                                         dtype=torch.uint8)
+        size_tensor = torch.tensor([object_tensor.numel()],
+                                   dtype=torch.long,
+                                   device="cpu")
 
         for dst in self.dst_list:
-            object_bytes = pickle.dumps(send_data)
-            object_tensor_cpu = torch.frombuffer(bytearray(object_bytes), dtype=torch.uint8)
-
-            object_tensor_npu = torch.empty(object_tensor_cpu.shape,
-                                            dtype=torch.uint8,
-                                            device="cpu")
-            object_tensor_npu.copy_(object_tensor_cpu)
-
-            size_tensor = torch.tensor([object_tensor_cpu.numel()],
-                                       dtype=torch.long,
-                                       device="cpu")
-
             logger.debug(
                 "send_dp_metadata_list dst:%s is_graph_capturing:%s is_warmup:%s",
                 dst, is_graph_capturing, is_warmup)
 
             torch.distributed.send(size_tensor, dst=dst, group=self.p2p_pg)
-            torch.distributed.send(object_tensor_npu, dst=dst, group=self.p2p_pg)
+            torch.distributed.send(object_tensor, dst=dst, group=self.p2p_pg)
 
     def recv_dp_metadata_list(self):
         """接收dp_metadata_list
