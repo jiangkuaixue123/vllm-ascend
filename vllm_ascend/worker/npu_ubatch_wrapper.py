@@ -14,7 +14,8 @@ from vllm_ascend.compilation.acl_graph import ACLGraphWrapper
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id)
-from vllm.forward_context import get_forward_context, override_forward_context, DPMetadata
+from vllm.forward_context import (AFDMetadata, get_forward_context,
+                                  override_forward_context)
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.v1.worker.ubatching import make_ubatch_contexts
@@ -22,6 +23,8 @@ from vllm.v1.worker.gpu_ubatch_wrapper import (
     UBatchWrapper as GPUUBatchWrapper,
     UbatchMetadata
 )
+
+from vllm_ascend.worker.afd_metadata_utils import make_uniform_dp_metadata
 
 logger = init_logger(__name__)
 SFA_UBATCH_DEBUG_ENV = "VLLM_ASCEND_DEBUG_SFA_UBATCH_GRAPH"
@@ -344,7 +347,7 @@ class UBatchWrapper(GPUUBatchWrapper):
         intermediate_tensors,
         dp_metadata,
         afd_metadata,
-    ) -> DPMetadata:
+    ) -> AFDMetadata:
         if ubatch_slices is None:
             afd_metadata.input_ids_list.append(input_ids)
             afd_metadata.positions_list.append(positions)
@@ -353,6 +356,7 @@ class UBatchWrapper(GPUUBatchWrapper):
             afd_metadata.attn_metadata_list.append(attn_metadata)
             afd_metadata.dp_metadata_list.append(dp_metadata)
         else:
+            parallel_config = self.vllm_config.parallel_config
             for i, ubatch_slice in enumerate(ubatch_slices):
                 (
                     sliced_input_ids,
@@ -367,15 +371,8 @@ class UBatchWrapper(GPUUBatchWrapper):
                     intermediate_tensors,
                 )
 
-                dp_size = self.vllm_config.parallel_config.data_parallel_size
-                ubatch_num_tokens_across_dp = torch.tensor(
-                    [ubatch_slice.num_tokens] * dp_size, device="cpu", dtype=torch.int32
-                )
-                ubatch_dp_metadata = DPMetadata.make(
-                    self.vllm_config.parallel_config,
-                    ubatch_slice.num_tokens,
-                    ubatch_num_tokens_across_dp,
-                )
+                ubatch_dp_metadata = make_uniform_dp_metadata(
+                    parallel_config, ubatch_slice.num_tokens)
 
                 afd_metadata.input_ids_list.append(sliced_input_ids)
                 afd_metadata.positions_list.append(sliced_positions)
@@ -394,7 +391,8 @@ class UBatchWrapper(GPUUBatchWrapper):
     def _make_ubatch_metadata(self, ubatch_slices, attn_metadata, input_ids,
                               positions, inputs_embeds, intermediate_tensors,
                               compute_stream, dp_metadata, batch_descriptor,
-                              aclgraph_runtime_mode, afd_metadata) -> list[UbatchMetadata]:
+                              aclgraph_runtime_mode,
+                              afd_metadata) -> list[UbatchMetadata]:
         # Create one forward context per ubatch
         _ubatch_debug_log(
             "make_ubatch_metadata start ubatch_sizes=%s runtime=%s %s %s %s %s %s %s",
@@ -407,23 +405,28 @@ class UBatchWrapper(GPUUBatchWrapper):
             _tensor_capture_str("intermediate_tensors", intermediate_tensors),
             _attn_capture_str(_first_attn_metadata(attn_metadata)),
         )
+        ubatch_dp_metadata_list = (
+            afd_metadata.dp_metadata_list
+            if afd_metadata is not None
+            and len(afd_metadata.dp_metadata_list) == len(ubatch_slices)
+            else None
+        )
         forward_contexts = []
+        parallel_config = self.vllm_config.parallel_config
         for i, ubatch_slice in enumerate(ubatch_slices):
             forward_context = copy.copy(get_forward_context())
 
-            dp_size = self.vllm_config.parallel_config.data_parallel_size
-            ubatch_num_tokens_across_dp = torch.tensor(
-                [ubatch_slice.num_tokens] * dp_size, device="cpu", dtype=torch.int32
-            )
-            ubatch_dp_metadata = DPMetadata.make(
-                self.vllm_config.parallel_config,
-                ubatch_slice.num_tokens,
-                ubatch_num_tokens_across_dp,
-            )
+            if ubatch_dp_metadata_list is not None:
+                ubatch_dp_metadata = ubatch_dp_metadata_list[i]
+            else:
+                ubatch_dp_metadata = make_uniform_dp_metadata(
+                    parallel_config, ubatch_slice.num_tokens)
             forward_context.dp_metadata = ubatch_dp_metadata
             forward_context.ubatch_idx = i
-            forward_context.attn_metadata = attn_metadata[i] if attn_metadata is not None else None
-            forward_context.no_compile_layers = self.vllm_config.compilation_config.static_forward_context
+            forward_context.attn_metadata = (
+                attn_metadata[i] if attn_metadata is not None else None)
+            forward_context.no_compile_layers = (
+                self.vllm_config.compilation_config.static_forward_context)
             forward_context.cudagraph_runtime_mode = aclgraph_runtime_mode
             forward_context.batch_descriptor = batch_descriptor
             forward_context.afd_metadata = afd_metadata
@@ -440,12 +443,33 @@ class UBatchWrapper(GPUUBatchWrapper):
             ready_barrier=self.ready_barrier)
 
         ubatch_metadata: list[UbatchMetadata] = []
+        has_afd_sliced_inputs = (
+            afd_metadata is not None
+            and len(afd_metadata.input_ids_list) == len(ubatch_slices)
+            and len(afd_metadata.positions_list) == len(ubatch_slices)
+            and len(afd_metadata.inputs_embeds_list) == len(ubatch_slices)
+            and len(afd_metadata.intermediate_tensors_list) == len(ubatch_slices)
+        )
         for i, ubatch_slice in enumerate(ubatch_slices):
-            sliced_input_ids, sliced_positions, sliced_inputs_embeds, \
-            sliced_intermediate_tensors = \
-                self._slice_model_inputs(
-                    ubatch_slice.token_slice, input_ids, positions,
-                    inputs_embeds, intermediate_tensors)
+            if has_afd_sliced_inputs:
+                sliced_input_ids = afd_metadata.input_ids_list[i]
+                sliced_positions = afd_metadata.positions_list[i]
+                sliced_inputs_embeds = afd_metadata.inputs_embeds_list[i]
+                sliced_intermediate_tensors = (
+                    afd_metadata.intermediate_tensors_list[i])
+            else:
+                (
+                    sliced_input_ids,
+                    sliced_positions,
+                    sliced_inputs_embeds,
+                    sliced_intermediate_tensors,
+                ) = self._slice_model_inputs(
+                    ubatch_slice.token_slice,
+                    input_ids,
+                    positions,
+                    inputs_embeds,
+                    intermediate_tensors,
+                )
             _ubatch_debug_log(
                 "make_ubatch_metadata item idx=%s slice=%s %s %s %s %s %s",
                 i,

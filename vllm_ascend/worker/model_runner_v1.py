@@ -45,7 +45,8 @@ from vllm.distributed.kv_transfer import (get_kv_transfer_group,
 from vllm.distributed.parallel_state import (get_dcp_group, get_dp_group, get_world_group,
                                              get_pcp_group, get_pp_group,
                                              get_tp_group)
-from vllm.forward_context import AFDMetadata, get_forward_context, DPMetadata, set_forward_context, BatchDescriptor
+from vllm.forward_context import (AFDMetadata, BatchDescriptor,
+                                  get_forward_context, set_forward_context)
 from vllm.logger import logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.mamba.abstract import MambaBase
@@ -114,6 +115,7 @@ from vllm_ascend.utils import (AscendDeviceType, ProfileExecuteDuration,
                                enable_sp, get_ascend_device_type, is_moe_model,
                                lmhead_tp_enable, maybe_trans_nz,
                                set_weight_prefetch_method, vllm_version_is)
+from vllm_ascend.worker.afd_metadata_utils import make_uniform_dp_metadata
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
 from vllm_ascend.worker.pcp_utils import PCPManager
 
@@ -452,16 +454,10 @@ class NPUModelRunner(GPUModelRunner):
         """
         dp_metadata_list = {}
         if ubatch_slices_padded is not None:
+            parallel_config = self.vllm_config.parallel_config
             for idx, ubatch_slice in enumerate(ubatch_slices_padded):
-                dp_size = self.vllm_config.parallel_config.data_parallel_size
-                ubatch_num_tokens_across_dp = torch.tensor(
-                    [ubatch_slice.num_tokens] * dp_size, device="cpu", dtype=torch.int32
-                )
-                dp_metadata_list[idx] = DPMetadata.make(
-                    self.vllm_config.parallel_config,
-                    ubatch_slice.num_tokens,
-                    ubatch_num_tokens_across_dp,
-                )
+                dp_metadata_list[idx] = make_uniform_dp_metadata(
+                    parallel_config, ubatch_slice.num_tokens)
         else:
             # 单个stage，使用当前的dp_metadata
             dp_metadata_list[0] = get_forward_context().dp_metadata
