@@ -24,6 +24,7 @@ from contextlib import contextmanager, nullcontext
 from copy import copy, deepcopy
 from dataclasses import dataclass
 from multiprocessing import Manager
+from time import perf_counter
 from typing import TYPE_CHECKING, Any, Dict, NamedTuple, Optional, Union
 from typing_extensions import TypeAlias
 
@@ -202,6 +203,27 @@ class ExecuteModelState(NamedTuple):
     positions: torch.Tensor
 
 
+class InstrumentedAsyncGPUModelRunnerOutput(AsyncGPUModelRunnerOutput):
+    """Adds step-level timing logs for async output finalization."""
+
+    def __init__(self, *args, step_id: int, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._step_id = step_id
+
+    def get_output(self) -> ModelRunnerOutput:
+        start = perf_counter()
+        output = super().get_output()
+        if envs_ascend.VLLM_ASCEND_MODEL_EXECUTE_TIME_OBSERVE:
+            logger.info(
+                "Step timing [async-output] step=%d async_output_wait=%.2fms "
+                "reqs=%d",
+                self._step_id,
+                (perf_counter() - start) * 1000,
+                len(output.req_ids),
+            )
+        return output
+
+
 class NPUModelRunner(GPUModelRunner):
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
@@ -365,6 +387,7 @@ class NPUModelRunner(GPUModelRunner):
                                                   dtype=torch.int32)
         self.attn_dummy_run_call_cnt = 0
         self.runner_step = 0
+        self._step_timing_state: dict[str, Any] | None = None
 
         # here we use int32
         self.sampled_token_ids_pinned_cpu = torch.empty(
@@ -412,6 +435,90 @@ class NPUModelRunner(GPUModelRunner):
                 experimental_config=experimental_config,
                 on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(
                     envs_ascend.VLLM_ASCEND_MODEL_RUNNER_PROFILER_DIR))
+
+    def _step_timing_enabled(self) -> bool:
+        return envs_ascend.VLLM_ASCEND_MODEL_EXECUTE_TIME_OBSERVE
+
+    def _new_step_timing_state(
+        self,
+        step_id: int,
+        scheduler_output: "SchedulerOutput",
+    ) -> dict[str, Any] | None:
+        if not self._step_timing_enabled():
+            return None
+        return {
+            "step_id": step_id,
+            "start_time": perf_counter(),
+            "host_ms": {},
+            "scheduled_tokens": scheduler_output.total_num_scheduled_tokens,
+            "num_reqs": len(scheduler_output.num_scheduled_tokens),
+            "async_scheduling": self.use_async_scheduling,
+            "afd_enabled": bool(self.afd_config and self.afd_connector),
+        }
+
+    @staticmethod
+    def _record_host_timing(
+        timing_state: dict[str, Any] | None,
+        tag: str,
+        start_time: float,
+    ) -> None:
+        if timing_state is None:
+            return
+        timing_state["host_ms"][tag] = (perf_counter() - start_time) * 1000
+
+    def _emit_step_timing(
+        self,
+        timing_state: dict[str, Any] | None,
+        phase: str,
+        *,
+        status: str = "ok",
+        durations: dict[str, float] | None = None,
+        extra: dict[str, Any] | None = None,
+    ) -> None:
+        if timing_state is None:
+            return
+
+        host_ms = dict(timing_state["host_ms"])
+        host_ms["step_total_ms"] = (
+            perf_counter() - timing_state["start_time"]) * 1000
+        if extra:
+            host_ms.update(extra)
+
+        host_str = " ".join(
+            f"{tag}={duration:.2f}ms" for tag, duration in sorted(host_ms.items()))
+        device_str = ""
+        if durations:
+            device_str = " ".join(
+                f"{tag}={duration:.2f}ms"
+                for tag, duration in sorted(durations.items()))
+
+        if device_str:
+            logger.info(
+                "Step timing [%s] step=%d status=%s async=%s afd=%s reqs=%d "
+                "scheduled_tokens=%d host:{%s} device:{%s}",
+                phase,
+                timing_state["step_id"],
+                status,
+                timing_state["async_scheduling"],
+                timing_state["afd_enabled"],
+                timing_state["num_reqs"],
+                timing_state["scheduled_tokens"],
+                host_str,
+                device_str,
+            )
+        else:
+            logger.info(
+                "Step timing [%s] step=%d status=%s async=%s afd=%s reqs=%d "
+                "scheduled_tokens=%d host:{%s}",
+                phase,
+                timing_state["step_id"],
+                status,
+                timing_state["async_scheduling"],
+                timing_state["afd_enabled"],
+                timing_state["num_reqs"],
+                timing_state["scheduled_tokens"],
+                host_str,
+            )
 
     def _init_device_properties(self) -> None:
         self.num_sms = None
@@ -1671,12 +1778,15 @@ class NPUModelRunner(GPUModelRunner):
     ) -> Union[ModelRunnerOutput, IntermediateTensors] | None:
         self.runner_step += 1
         logger.info("runner step=%d, path=execute_model", self.runner_step)
+        timing_state = self._new_step_timing_state(self.runner_step,
+                                                   scheduler_output)
         if self.prof is not None:
             self.prof.step()
         if self.execute_model_state is not None:
             raise RuntimeError("State error: sample_tokens() must be called "
                                "after execute_model() returns None.")
 
+        prepare_input_started = perf_counter()
         with ProfileExecuteDuration().capture_async("prepare input"):
             self._update_states(scheduler_output)
             if has_ec_transfer() and get_ec_transfer().is_producer:
@@ -1685,6 +1795,14 @@ class NPUModelRunner(GPUModelRunner):
                         encoder_cache=self.encoder_cache,
                 ):
                     self._execute_mm_encoder(scheduler_output)
+                    self._record_host_timing(timing_state,
+                                             "prepare_input_host_ms",
+                                             prepare_input_started)
+                    durations = ProfileExecuteDuration().pop_captured_sync()
+                    self._emit_step_timing(timing_state,
+                                           "execute_model",
+                                           status="ec_producer_early_return",
+                                           durations=durations)
                     return make_empty_encoder_model_runner_output(
                         scheduler_output)
 
@@ -1694,8 +1812,23 @@ class NPUModelRunner(GPUModelRunner):
                         "skip this step for we receive the data from remote disaggregate prefill node"
                     )
                     # Return empty ModelRunnerOuptut if there's no work to do.
+                    self._record_host_timing(timing_state,
+                                             "prepare_input_host_ms",
+                                             prepare_input_started)
+                    durations = ProfileExecuteDuration().pop_captured_sync()
+                    self._emit_step_timing(timing_state,
+                                           "execute_model",
+                                           status="empty_step",
+                                           durations=durations)
                     return EMPTY_MODEL_RUNNER_OUTPUT
                 logger.info("jcz self.kv_connector_no_forward is not None")
+                self._record_host_timing(timing_state, "prepare_input_host_ms",
+                                         prepare_input_started)
+                durations = ProfileExecuteDuration().pop_captured_sync()
+                self._emit_step_timing(timing_state,
+                                       "execute_model",
+                                       status="kv_connector_no_forward",
+                                       durations=durations)
                 return self.kv_connector_no_forward(scheduler_output,
                                                     self.vllm_config)
 
@@ -1709,6 +1842,8 @@ class NPUModelRunner(GPUModelRunner):
              model_kwargs, afd_metadata,
              ubatch_slices) = (self._prepare_inputs(scheduler_output,
                                                     intermediate_tensors))
+        self._record_host_timing(timing_state, "prepare_input_host_ms",
+                                 prepare_input_started)
         dp_rank = self.parallel_config.data_parallel_rank
         if ubatch_slices:
             assert num_tokens_across_dp is not None
@@ -1735,16 +1870,23 @@ class NPUModelRunner(GPUModelRunner):
             scheduler_output.total_num_scheduled_tokens
             == self.input_batch.num_reqs * max_query_len)
         has_lora = len(self.input_batch.lora_id_to_lora_request) > 0
+        dispatch_started = perf_counter()
         aclgraph_runtime_mode, batch_descriptor = \
             self.cudagraph_dispatcher.dispatch(num_tokens=num_input_tokens, uniform_decode=uniform_decode, has_lora=has_lora,
                                                disable_full=synced_cudagraph_mode <= CUDAGraphMode.PIECEWISE.value)
+        self._record_host_timing(timing_state, "dispatch_host_ms",
+                                 dispatch_started)
         num_input_tokens = batch_descriptor.num_tokens
 
         if self.ascend_config.enable_async_exponential:
+            async_exp_started = perf_counter()
             self.sampler.do_async_exponential(
                 b_s=logits_indices.shape[0],
                 head_dim=self.model_config.get_vocab_size(),
                 generators=self.input_batch.sampling_metadata.generators)
+            self._record_host_timing(timing_state,
+                                     "async_exponential_host_ms",
+                                     async_exp_started)
 
         # Run forward pass
         with ProfileExecuteDuration().capture_async("forward"):
@@ -1767,25 +1909,44 @@ class NPUModelRunner(GPUModelRunner):
                 # support inequal AF,[ffn_size,ffn_size + min_size) send
                 if self.afd_config and self.afd_connector:
                     # 构建dp_metadata_list
+                    afd_build_started = perf_counter()
                     dp_metadata_list = self._build_afd_dp_metadata_list(ubatch_slices)
+                    self._record_host_timing(timing_state,
+                                             "afd_build_metadata_host_ms",
+                                             afd_build_started)
                     # 更新connector状态
+                    afd_update_started = perf_counter()
                     self.afd_connector.update_state_from_dp_metadata(dp_metadata_list, False)
+                    self._record_host_timing(timing_state,
+                                             "afd_update_state_host_ms",
+                                             afd_update_started)
 
                     if self.afd_connector.is_attn_top_min_size_rank(self.afd_connector.rank):
+                        afd_send_started = perf_counter()
                         self.afd_connector.send_dp_metadata_list(
                             dp_metadata_list,
                             is_warmup=self._is_warmup,
                         )
+                        self._record_host_timing(timing_state,
+                                                 "afd_send_dp_metadata_host_ms",
+                                                 afd_send_started)
                         logger.info(f'afd_connector.rank send_dp_metadata_list is {dp_metadata_list}, '
                                     f'is_warmup: {self._is_warmup}, ubatch_slices: {ubatch_slices}')
+                    afd_barrier_started = perf_counter()
                     dist.barrier(group=get_dp_group().cpu_group)
+                    self._record_host_timing(timing_state,
+                                             "afd_barrier_host_ms",
+                                             afd_barrier_started)
                 hidden_states = self._generate_process_reqs_hidden_states(
                     maybe_padded_num_tokens, input_ids, positions,
                     intermediate_tensors, inputs_embeds, model_kwargs)
 
+            kv_wait_started = perf_counter()
             self.maybe_wait_for_kv_save()
             finished_sending, finished_recving = self.get_finished_kv_transfer(
                 scheduler_output)
+            self._record_host_timing(timing_state, "kv_wait_host_ms",
+                                     kv_wait_started)
 
             aux_hidden_states = None
             if self.use_aux_hidden_state_outputs:
@@ -1796,6 +1957,7 @@ class NPUModelRunner(GPUModelRunner):
             finished_recving=finished_recving)
         finished_sending = None
         finished_recving = None
+        post_process_started = perf_counter()
         with ProfileExecuteDuration().capture_async("post process"):
             # Broadcast PP output for external_launcher (torchrun)
             # to make sure we are synced across pp ranks
@@ -1812,6 +1974,14 @@ class NPUModelRunner(GPUModelRunner):
                     if self.debugger is not None:
                         self.debugger.stop()
                         self.debugger.step()
+                    self._record_host_timing(timing_state,
+                                             "post_process_host_ms",
+                                             post_process_started)
+                    durations = ProfileExecuteDuration().pop_captured_sync()
+                    self._emit_step_timing(timing_state,
+                                           "execute_model",
+                                           status="mid_pp_return",
+                                           durations=durations)
                     return hidden_states
                 assert isinstance(hidden_states, IntermediateTensors)
                 get_pp_group().send_tensor_dict(
@@ -1832,6 +2002,14 @@ class NPUModelRunner(GPUModelRunner):
                     if self.debugger is not None:
                         self.debugger.stop()
                         self.debugger.step()
+                    self._record_host_timing(timing_state,
+                                             "post_process_host_ms",
+                                             post_process_started)
+                    durations = ProfileExecuteDuration().pop_captured_sync()
+                    self._emit_step_timing(timing_state,
+                                           "execute_model",
+                                           status="pooling_return",
+                                           durations=durations)
                     return pool_output
                 # Sometimes, after the model is compiled through the AOT backend,
                 # the model output may become a list containing only one Tensor object.
@@ -1863,12 +2041,17 @@ class NPUModelRunner(GPUModelRunner):
                 positions,
             )
             self.kv_connector_output = kv_connector_output
+        self._record_host_timing(timing_state, "post_process_host_ms",
+                                 post_process_started)
+        self._step_timing_state = timing_state
         return None
 
     @torch.inference_mode
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
+        timing_state = self._step_timing_state
+        self._step_timing_state = None
         kv_connector_output = self.kv_connector_output
         self.kv_connector_output = None
 
@@ -1903,11 +2086,15 @@ class NPUModelRunner(GPUModelRunner):
         if grammar_output is not None:
             # here we are different from gpu_model_runner,
             # the apply_grammar_bitmask uses torch.compile to optimize this,ascend does not support it now
+            grammar_started = perf_counter()
             logits_dtype = logits.dtype
             logits = logits.to("cpu").float()
             apply_grammar_bitmask(scheduler_output, grammar_output,
                                   self.input_batch, logits)
             logits = logits.to(self.device).to(logits_dtype)
+            self._record_host_timing(timing_state,
+                                     "structured_output_host_ms",
+                                     grammar_started)
 
         with ProfileExecuteDuration().capture_async("Sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
@@ -1926,6 +2113,7 @@ class NPUModelRunner(GPUModelRunner):
                 aux_hidden_states,
             )
 
+        bookkeeping_started = perf_counter()
         (
             logprobs_lists,
             valid_sampled_token_ids,
@@ -1941,6 +2129,8 @@ class NPUModelRunner(GPUModelRunner):
             scheduler_output.total_num_scheduled_tokens,
             spec_decode_metadata,
         )
+        self._record_host_timing(timing_state, "bookkeeping_host_ms",
+                                 bookkeeping_started)
 
         with ProfileExecuteDuration().capture_async("Draft"):
             if self.speculative_config:
@@ -1961,6 +2151,7 @@ class NPUModelRunner(GPUModelRunner):
 
         extra_args = ({"kv_connector_output": kv_connector_output})
 
+        output_build_started = perf_counter()
         model_runner_output = ModelRunnerOutput(
             req_ids=req_ids_output_copy,
             req_id_to_index=req_id_to_index_output_copy,
@@ -1970,14 +2161,13 @@ class NPUModelRunner(GPUModelRunner):
             pooler_output=[],
             **extra_args,
         )
+        self._record_host_timing(timing_state, "output_build_host_ms",
+                                 output_build_started)
 
         durations = ProfileExecuteDuration().pop_captured_sync()
+        captured_name = "Decode" if self.attn_state == AscendAttentionState.DecodeOnly else "Prefill"
         if durations:
-            dr_str = [
-                f"[{tag}]:{duration:.2f}ms"
-                for tag, duration in durations.items()
-            ]
-            captured_name = "Decode" if self.attn_state == AscendAttentionState.DecodeOnly else "Prefill"
+            dr_str = [f"[{tag}]:{duration:.2f}ms" for tag, duration in durations.items()]
             logger.info("Profile execute duration [%s]:%s", captured_name,
                         " ".join(dr_str))
         if self.dynamic_eplb:
@@ -1987,20 +2177,29 @@ class NPUModelRunner(GPUModelRunner):
                 assert self.debugger is not None
                 self.debugger.stop()
                 self.debugger.step()
+            self._emit_step_timing(timing_state,
+                                   captured_name,
+                                   durations=durations)
             return model_runner_output
 
         if self.debugger is not None:
             assert self.debugger is not None
             self.debugger.stop()
             self.debugger.step()
-        return AsyncGPUModelRunnerOutput(
+        async_output_wrap_started = perf_counter()
+        async_output = InstrumentedAsyncGPUModelRunnerOutput(
             model_runner_output=model_runner_output,
             sampled_token_ids=sampler_output.sampled_token_ids,
             logprobs_tensors=sampler_output.logprobs_tensors,
             invalid_req_indices=invalid_req_indices,
             async_output_copy_stream=self.async_output_copy_stream,
             vocab_size=self.input_batch.vocab_size,
+            step_id=self.runner_step,
         )
+        self._record_host_timing(timing_state, "async_output_wrap_host_ms",
+                                 async_output_wrap_started)
+        self._emit_step_timing(timing_state, captured_name, durations=durations)
+        return async_output
 
     # overwrite _sample for lmhead_tp_enable and need_accepted_tokens
     def _sample(self, logits, spec_decode_metadata):
