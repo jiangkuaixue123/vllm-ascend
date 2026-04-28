@@ -466,6 +466,18 @@ class NPUModelRunner(GPUModelRunner):
             return
         timing_state["host_ms"][tag] = (perf_counter() - start_time) * 1000
 
+    @contextmanager
+    def _capture_step_timing_stage(
+        self,
+        timing_state: dict[str, Any] | None,
+        host_tag: str,
+        device_tag: str,
+    ):
+        stage_started = perf_counter()
+        with ProfileExecuteDuration().capture_async(device_tag):
+            yield
+        self._record_host_timing(timing_state, host_tag, stage_started)
+
     def _emit_step_timing(
         self,
         timing_state: dict[str, Any] | None,
@@ -686,6 +698,7 @@ class NPUModelRunner(GPUModelRunner):
         self,
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: Optional[IntermediateTensors] = None,
+        timing_state: dict[str, Any] | None = None,
     ) -> tuple[dict[str, Any], torch.Tensor, np.ndarray, int, torch.Tensor,
                int, torch.Tensor, SpecDecodeMetadata, Optional[torch.Tensor],
                Optional[torch.Tensor], Optional[torch.Tensor], int, int, dict[str,
@@ -694,6 +707,7 @@ class NPUModelRunner(GPUModelRunner):
         assert total_num_scheduled_tokens > 0
         num_reqs = self.input_batch.num_reqs
         assert num_reqs > 0
+        prepare_stage_started = perf_counter()
 
         # OPTIMIZATION: Start copying the block table first.
         # This way, we can overlap the copy with the following CPU operations.
@@ -774,6 +788,9 @@ class NPUModelRunner(GPUModelRunner):
                 position_pcp[:total_num_scheduled_tokens],
                 out=positions_np,
             )
+        self._record_host_timing(timing_state, "prepare_schedule_host_ms",
+                                 prepare_stage_started)
+        prepare_stage_started = perf_counter()
         max_num_scheduled_tokens = max(tokens)
         uniform_decode = (max_num_scheduled_tokens == self.uniform_decode_query_len) \
             and (total_num_scheduled_tokens == max_num_scheduled_tokens * num_reqs)
@@ -793,13 +810,18 @@ class NPUModelRunner(GPUModelRunner):
         )
         num_input_tokens = batch_descriptor.num_tokens
         self.query_lens = torch.from_numpy(num_scheduled_tokens)
+        self._record_host_timing(timing_state, "prepare_dispatch_host_ms",
+                                 prepare_stage_started)
 
         # Get info across DP ranks.
         # NOTE: maybe_padded_num_tokens is only used when using TorchAir with DP,
         # Otherwise, it's just max_tokens_across_dp_cpu
-        (maybe_padded_num_tokens, num_tokens_across_dp, with_prefill,
-         synced_cudagraph_mode) = self._sync_metadata_across_dp(
-             num_input_tokens, with_prefill, cudagraph_mode.value)
+        with self._capture_step_timing_stage(timing_state,
+                                             "prepare_dp_sync_host_ms",
+                                             "prepare_dp_sync"):
+            (maybe_padded_num_tokens, num_tokens_across_dp, with_prefill,
+             synced_cudagraph_mode) = self._sync_metadata_across_dp(
+                 num_input_tokens, with_prefill, cudagraph_mode.value)
         self.with_prefill = with_prefill
         # TODO: Now that num_input_tokens is basically identical with maybe_padded_num_tokens
         # We should consider removing maybe_padded_num_tokens later
@@ -809,30 +831,34 @@ class NPUModelRunner(GPUModelRunner):
         if self.lora_config:
             self.set_active_loras(self.input_batch, num_scheduled_tokens)
 
-        # Calculate M-RoPE positions.
-        # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
-        if self.uses_mrope:
+        with self._capture_step_timing_stage(timing_state,
+                                             "prepare_positions_host_ms",
+                                             "prepare_positions"):
+            # Calculate M-RoPE positions.
             # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
-            self._calc_mrope_positions(scheduler_output)
-            self.mrope_positions.gpu[:, :total_num_scheduled_tokens].copy_(
-                self.mrope_positions.cpu[:, :total_num_scheduled_tokens],
-                non_blocking=True,
-            )
-        elif self.uses_xdrope_dim > 0:
-            self._calc_xdrope_positions(scheduler_output)
-            # Only relevant for models using XD-RoPE (e.g, HunYuan-VL)
-            self.xdrope_positions.gpu[:, :total_num_scheduled_tokens].copy_(
-                self.xdrope_positions.cpu[:, :total_num_scheduled_tokens],
-                non_blocking=True,
-            )
-        else:
-            # Common case (1D positions)
-            self.positions.copy_to_gpu(total_num_scheduled_tokens)
+            if self.uses_mrope:
+                # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
+                self._calc_mrope_positions(scheduler_output)
+                self.mrope_positions.gpu[:, :total_num_scheduled_tokens].copy_(
+                    self.mrope_positions.cpu[:, :total_num_scheduled_tokens],
+                    non_blocking=True,
+                )
+            elif self.uses_xdrope_dim > 0:
+                self._calc_xdrope_positions(scheduler_output)
+                # Only relevant for models using XD-RoPE (e.g, HunYuan-VL)
+                self.xdrope_positions.gpu[:, :total_num_scheduled_tokens].copy_(
+                    self.xdrope_positions.cpu[:, :total_num_scheduled_tokens],
+                    non_blocking=True,
+                )
+            else:
+                # Common case (1D positions)
+                self.positions.copy_to_gpu(total_num_scheduled_tokens)
 
         # Get token indices.
         # E.g., [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
         # -> [0, 1, M, M + 1, M + 2, M + 3, M + 4, 2 * M, 2 * M + 1, 2 * M + 2]
         # where M is the max_model_len.
+        prepare_stage_started = perf_counter()
         token_indices = (positions_np +
                          req_indices * self.input_batch.token_ids_cpu.shape[1])
         token_indices_tensor = torch.from_numpy(token_indices)
@@ -892,15 +918,21 @@ class NPUModelRunner(GPUModelRunner):
 
                 output_idx += num_sched
 
-        self.query_start_loc.np[0] = 0
-        self.query_start_loc.np[1:num_reqs + 1] = cu_num_tokens
-        self.query_start_loc.np[num_reqs + 1:].fill(cu_num_tokens[-1])
-        self.query_start_loc.copy_to_gpu()
+        self._record_host_timing(timing_state, "prepare_token_select_host_ms",
+                                 prepare_stage_started)
+        with self._capture_step_timing_stage(timing_state,
+                                             "prepare_query_loc_host_ms",
+                                             "prepare_query_loc"):
+            self.query_start_loc.np[0] = 0
+            self.query_start_loc.np[1:num_reqs + 1] = cu_num_tokens
+            self.query_start_loc.np[num_reqs + 1:].fill(cu_num_tokens[-1])
+            self.query_start_loc.copy_to_gpu()
 
         num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
         # Disable cascade attention when using microbatching (DBO)
         cascade_attn_prefix_lens = None
 
+        prepare_stage_started = perf_counter()
         uniform_decode = (max_num_scheduled_tokens == self.uniform_decode_query_len
                           ) and (total_num_scheduled_tokens == num_reqs * max_num_scheduled_tokens)
         if not uniform_decode:
@@ -989,22 +1021,28 @@ class NPUModelRunner(GPUModelRunner):
         ubatch_slices_attn = ubatch_slices_padded if pad_attn else ubatch_slices
 
         self.is_ubatch = should_ubatch
+        self._record_host_timing(timing_state, "prepare_batch_plan_host_ms",
+                                 prepare_stage_started)
 
-        self.seq_lens.np[:num_reqs] = (
-            self.input_batch.num_computed_tokens_cpu[:num_reqs] +
-            num_scheduled_tokens)
-        self.seq_lens.copy_to_gpu()
+        with self._capture_step_timing_stage(timing_state,
+                                             "prepare_tensor_copy_host_ms",
+                                             "prepare_tensor_copy"):
+            self.seq_lens.np[:num_reqs] = (
+                self.input_batch.num_computed_tokens_cpu[:num_reqs] +
+                num_scheduled_tokens)
+            self.seq_lens.copy_to_gpu()
 
-        self.seq_lens.gpu[num_reqs:].fill_(0)
+            self.seq_lens.gpu[num_reqs:].fill_(0)
 
-        # Copy the tensors to the NPU.
-        self._prepare_input_ids(scheduler_output, total_num_scheduled_tokens,
-                                cu_num_tokens)
-        self.positions.cpu[total_num_scheduled_tokens:num_input_tokens].zero_()
-        self.positions.copy_to_gpu()
+            # Copy the tensors to the NPU.
+            self._prepare_input_ids(scheduler_output, total_num_scheduled_tokens,
+                                    cu_num_tokens)
+            self.positions.cpu[total_num_scheduled_tokens:num_input_tokens].zero_()
+            self.positions.copy_to_gpu()
 
         # Record the index of requests that should not be sampled,
         # so that we could clear the sampled tokens before returning
+        prepare_stage_started = perf_counter()
         num_tokens = [
             self.requests[r].num_tokens for r in self.input_batch.req_ids
         ]
@@ -1029,9 +1067,12 @@ class NPUModelRunner(GPUModelRunner):
         self.discard_request_indices.np[:self.num_discarded_requests] = (
             discard_request_indices)
         self.discard_request_indices.copy_to_gpu(self.num_discarded_requests)
+        self._record_host_timing(timing_state, "prepare_discard_mask_host_ms",
+                                 prepare_stage_started)
 
         # _prepare_inputs may reorder the batch, so we must gather
         # multi-modal outputs after that to ensure the correct order
+        prepare_stage_started = perf_counter()
         if vllm_version_is('0.13.0'):
             model_kwargs = self._init_model_kwargs(num_input_tokens)
         else:
@@ -1135,6 +1176,9 @@ class NPUModelRunner(GPUModelRunner):
                 for k, v in self.intermediate_tensors.items()
             })
 
+        self._record_host_timing(timing_state, "prepare_model_input_host_ms",
+                                 prepare_stage_started)
+        prepare_stage_started = perf_counter()
         use_spec_decode = len(
             scheduler_output.scheduled_spec_decode_tokens) > 0
         if not use_spec_decode:
@@ -1199,9 +1243,12 @@ class NPUModelRunner(GPUModelRunner):
                 self.input_batch.num_accepted_tokens_cpu[:num_reqs])
             self.num_accepted_tokens.np[num_reqs:].fill(1)
             self.num_accepted_tokens.copy_to_gpu()
+        self._record_host_timing(timing_state, "prepare_logits_meta_host_ms",
+                                 prepare_stage_started)
 
         # Prepare the attention metadata for each KV cache group and make layers
         # in the same group share the same metadata.
+        prepare_stage_started = perf_counter()
         for kv_cache_group_id, kv_cache_group_spec in enumerate(
                 self.kv_cache_config.kv_cache_groups):
             encoder_seq_lens, encoder_seq_lens_cpu = self._get_encoder_seq_lens(
@@ -1392,6 +1439,9 @@ class NPUModelRunner(GPUModelRunner):
                     for layer_name in attn_group.layer_names:
                         attn_metadata[layer_name] = attn_metadata_i
 
+        self._record_host_timing(timing_state, "prepare_attn_metadata_host_ms",
+                                 prepare_stage_started)
+        prepare_stage_started = perf_counter()
         # update global cos, sin
         update_cos_sin(positions)
 
@@ -1402,6 +1452,8 @@ class NPUModelRunner(GPUModelRunner):
                 (0, max_num_reqs_across_dp - logits_indices.shape[0]))
 
         afd_metadata = self._build_afd_metadata(ubatch_slices_padded, maybe_padded_num_tokens)
+        self._record_host_timing(timing_state, "prepare_finalize_host_ms",
+                                 prepare_stage_started)
 
         return (attn_metadata, positions, num_scheduled_tokens,
                 num_input_tokens, num_tokens_across_dp,
@@ -1788,7 +1840,10 @@ class NPUModelRunner(GPUModelRunner):
 
         prepare_input_started = perf_counter()
         with ProfileExecuteDuration().capture_async("prepare input"):
-            self._update_states(scheduler_output)
+            with self._capture_step_timing_stage(timing_state,
+                                                 "prepare_update_states_host_ms",
+                                                 "prepare_update_states"):
+                self._update_states(scheduler_output)
             if has_ec_transfer() and get_ec_transfer().is_producer:
                 with self.maybe_get_ec_connector_output(
                         scheduler_output,
@@ -1841,7 +1896,8 @@ class NPUModelRunner(GPUModelRunner):
              intermediate_tensors, max_query_len, synced_cudagraph_mode,
              model_kwargs, afd_metadata,
              ubatch_slices) = (self._prepare_inputs(scheduler_output,
-                                                    intermediate_tensors))
+                                                     intermediate_tensors,
+                                                     timing_state))
         self._record_host_timing(timing_state, "prepare_input_host_ms",
                                  prepare_input_started)
         dp_rank = self.parallel_config.data_parallel_rank
