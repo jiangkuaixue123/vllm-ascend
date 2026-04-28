@@ -17,6 +17,7 @@
 # Adapted from vllm-project/vllm/vllm/worker/gpu_model_runner.py
 #
 
+import logging
 import math
 import sys
 from collections import defaultdict
@@ -932,11 +933,12 @@ class NPUModelRunner(GPUModelRunner):
         # Disable cascade attention when using microbatching (DBO)
         cascade_attn_prefix_lens = None
 
+        prepare_batch_plan_started = perf_counter()
         prepare_stage_started = perf_counter()
         uniform_decode = (max_num_scheduled_tokens == self.uniform_decode_query_len
                           ) and (total_num_scheduled_tokens == num_reqs * max_num_scheduled_tokens)
-        if not uniform_decode:
-            logger.warning(
+        if not uniform_decode and logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
                 "Batch graph inputs: total_num_scheduled_tokens=%d, num_reqs=%d, "
                 "max_num_scheduled_tokens=%d, uniform_decode_query_len=%d, "
                 "uniform_decode=%s",
@@ -969,41 +971,61 @@ class NPUModelRunner(GPUModelRunner):
                         "decode_bench_connector": is_decode_bench_connector,
                     }
                 )
-            print(f"Batch request diagnostics: kv_connector={kv_connector_name}")
+            logger.debug("Batch request diagnostics: kv_connector=%s",
+                         kv_connector_name)
             for req_diagnostic in batch_req_diagnostics:
-                print(f"  {req_diagnostic}")
+                logger.debug("Batch request diagnostic: %s", req_diagnostic)
+        self._record_host_timing(timing_state,
+                                 "prepare_batch_uniform_check_host_ms",
+                                 prepare_stage_started)
 
-        (
-            cudagraph_mode,
-            batch_descriptor,
-            should_ubatch,
-            num_tokens_across_dp,
-            cudagraph_stats,
-        ) = self._determine_batch_execution_and_padding(
-            num_tokens=num_tokens_unpadded,
-            num_reqs=num_reqs,
-            num_scheduled_tokens_np=num_scheduled_tokens_np,
-            max_num_scheduled_tokens=max_num_scheduled_tokens,
-            use_cascade_attn=cascade_attn_prefix_lens is not None,
-            num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
-        )
+        with self._capture_step_timing_stage(
+                timing_state, "prepare_batch_determine_host_ms",
+                "prepare_batch_determine"):
+            (
+                cudagraph_mode,
+                batch_descriptor,
+                should_ubatch,
+                num_tokens_across_dp,
+                cudagraph_stats,
+            ) = self._determine_batch_execution_and_padding(
+                num_tokens=num_tokens_unpadded,
+                num_reqs=num_reqs,
+                num_scheduled_tokens_np=num_scheduled_tokens_np,
+                max_num_scheduled_tokens=max_num_scheduled_tokens,
+                use_cascade_attn=cascade_attn_prefix_lens is not None,
+                num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
+            )
 
-        logger.info(
-            "Running batch with cudagraph_mode: %s, batch_descriptor: %s, "
-            "should_ubatch: %s, num_tokens_across_dp: %s",
-            cudagraph_mode,
-            batch_descriptor,
-            should_ubatch,
-            num_tokens_across_dp,
-        )
-        if cudagraph_mode == CUDAGraphMode.NONE:
-            logger.info(
+        prepare_stage_started = perf_counter()
+        if logger.isEnabledFor(logging.DEBUG):
+            num_tokens_across_dp_summary = None
+            if num_tokens_across_dp is not None:
+                num_tokens_across_dp_summary = {
+                    "min": int(num_tokens_across_dp.min().item()),
+                    "max": int(num_tokens_across_dp.max().item()),
+                    "shape": tuple(num_tokens_across_dp.shape),
+                }
+            logger.debug(
+                "Running batch with cudagraph_mode=%s batch_descriptor=%s "
+                "should_ubatch=%s num_tokens_across_dp=%s",
+                cudagraph_mode,
+                batch_descriptor,
+                should_ubatch,
+                num_tokens_across_dp_summary,
+            )
+        if cudagraph_mode == CUDAGraphMode.NONE and logger.isEnabledFor(
+                logging.DEBUG):
+            logger.debug(
                 "Batch graph fallback: num_scheduled_tokens=%s, "
                 "cudagraph_stats=%s",
                 num_scheduled_tokens_np.tolist(),
                 cudagraph_stats,
             )
+        self._record_host_timing(timing_state, "prepare_batch_log_host_ms",
+                                 prepare_stage_started)
 
+        prepare_stage_started = perf_counter()
         num_tokens_padded = batch_descriptor.num_tokens
         num_reqs_padded = (
             batch_descriptor.num_reqs if batch_descriptor.num_reqs is not None else num_reqs
@@ -1021,8 +1043,11 @@ class NPUModelRunner(GPUModelRunner):
         ubatch_slices_attn = ubatch_slices_padded if pad_attn else ubatch_slices
 
         self.is_ubatch = should_ubatch
-        self._record_host_timing(timing_state, "prepare_batch_plan_host_ms",
+        self._record_host_timing(timing_state,
+                                 "prepare_batch_ubatch_slices_host_ms",
                                  prepare_stage_started)
+        self._record_host_timing(timing_state, "prepare_batch_plan_host_ms",
+                                 prepare_batch_plan_started)
 
         with self._capture_step_timing_stage(timing_state,
                                              "prepare_tensor_copy_host_ms",
