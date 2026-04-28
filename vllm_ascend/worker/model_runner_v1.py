@@ -995,6 +995,8 @@ class NPUModelRunner(GPUModelRunner):
                 max_num_scheduled_tokens=max_num_scheduled_tokens,
                 use_cascade_attn=cascade_attn_prefix_lens is not None,
                 num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
+                timing_state=timing_state,
+                timing_recorder=self._record_host_timing,
             )
 
         prepare_stage_started = perf_counter()
