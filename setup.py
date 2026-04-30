@@ -22,7 +22,7 @@ import logging
 import os
 import subprocess
 import sys
-from sysconfig import get_paths
+from sysconfig import get_config_var, get_paths
 from typing import Dict, List
 
 from setuptools import Command, Extension, find_packages, setup
@@ -170,6 +170,37 @@ def gen_build_info():
         f.write('# Auto-generated file\n')
         f.write(f"__device_type__ = '{device_type}'\n")
     logging.info(f"Generated _build_info.py with SOC version: {soc_version}")
+
+
+def find_precompiled_artifacts() -> List[str]:
+    package_dir = os.path.join(ROOT_DIR, "vllm_ascend")
+    if not os.path.isdir(package_dir):
+        return []
+    return [
+        os.path.join(package_dir, filename)
+        for filename in os.listdir(package_dir)
+        if filename.endswith(".so")
+    ]
+
+
+def check_precompiled_artifacts() -> List[str]:
+    artifacts = find_precompiled_artifacts()
+    artifact_names = [os.path.basename(artifact) for artifact in artifacts]
+    python_ext_suffix = get_config_var("EXT_SUFFIX")
+    missing_targets = []
+    if (not python_ext_suffix
+            or f"vllm_ascend_C{python_ext_suffix}" not in artifact_names):
+        missing_targets.append(f"vllm_ascend_C{python_ext_suffix or '.so'}")
+    if not any("vllm_ascend_kernels" in name for name in artifact_names):
+        missing_targets.append("vllm_ascend_kernels")
+    if missing_targets:
+        missing = ", ".join(missing_targets)
+        raise RuntimeError(
+            "VLLM_ASCEND_USE_PRECOMPILED=1 was set, but precompiled "
+            f"artifacts are missing from vllm_ascend/: {missing}. "
+            "Run `pip install -e . -v` once in a container that shares this "
+            "source tree, then retry.")
+    return artifacts
 
 
 class CMakeExtension(Extension):
@@ -351,6 +382,32 @@ class cmake_build_ext(build_ext):
         )
 
     def build_extensions(self) -> None:
+        if envs.VLLM_ASCEND_USE_PRECOMPILED:
+            import shutil
+
+            artifacts = check_precompiled_artifacts()
+            os.makedirs(os.path.join(self.build_lib, "vllm_ascend"),
+                        exist_ok=True)
+            for src_path in artifacts:
+                dst_path = os.path.join(self.build_lib, "vllm_ascend",
+                                        os.path.basename(src_path))
+                if os.path.abspath(src_path) != os.path.abspath(dst_path):
+                    shutil.copy2(src_path, dst_path)
+                    print(f"Copy: {src_path} -> {dst_path}")
+
+            src_cann_ops_custom = os.path.join(ROOT_DIR, "vllm_ascend",
+                                               "_cann_ops_custom")
+            dst_cann_ops_custom = os.path.join(self.build_lib, "vllm_ascend",
+                                               "_cann_ops_custom")
+            if os.path.exists(src_cann_ops_custom):
+                if os.path.exists(dst_cann_ops_custom):
+                    shutil.rmtree(dst_cann_ops_custom)
+                shutil.copytree(src_cann_ops_custom, dst_cann_ops_custom)
+                print(f"Copy: {src_cann_ops_custom} -> "
+                      f"{dst_cann_ops_custom}")
+            print("Reuse precompiled vllm-ascend artifacts.")
+            return
+
         # Ensure that CMake is present and working
         try:
             subprocess.check_output(["cmake", "--version"])
@@ -421,8 +478,9 @@ class cmake_build_ext(build_ext):
             print(f"Copy: {src_cann_ops_custom} -> {dst_cann_ops_custom}")
 
     def run(self):
-        # First, ensure ACLNN custom-ops is built and installed.
-        self.run_command("build_aclnn")
+        if not envs.VLLM_ASCEND_USE_PRECOMPILED:
+            # First, ensure ACLNN custom-ops is built and installed.
+            self.run_command("build_aclnn")
         # Then, run the standard build_ext command to compile the extensions
         super().run()
 
