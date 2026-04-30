@@ -56,6 +56,10 @@ env_variables: Dict[str, Callable[[], Any]] = {
     # /usr/local/Ascend/ascend-toolkit/latest
     "ASCEND_HOME_PATH":
     lambda: os.getenv("ASCEND_HOME_PATH", None),
+    # Whether to reuse existing compiled artifacts in the source tree during
+    # package installation.
+    "VLLM_ASCEND_USE_PRECOMPILED":
+    lambda: bool(int(os.getenv("VLLM_ASCEND_USE_PRECOMPILED", '0'))),
     # The path for HCCL library, it's used by pyhccl communicator backend. If
     # not set, the default value is libhccl.so.
     "HCCL_SO_PATH":
