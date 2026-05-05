@@ -22,6 +22,60 @@ def execute_command(cmd_list):
     return res
 
 
+def _parse_device_list(devices_str: Optional[str]) -> Optional[List[int]]:
+    if devices_str is None or not devices_str.strip():
+        return None
+    return [int(x.strip()) for x in devices_str.split(",") if x.strip()]
+
+
+def _get_visible_devices() -> List[int]:
+    visible_devices = _parse_device_list(os.getenv("ASCEND_RT_VISIBLE_DEVICES"))
+    if visible_devices is not None:
+        return visible_devices
+    return sorted(list(_get_device_map_info().keys()))
+
+
+def _parse_cpu_ranges(cpu_ranges: str) -> List[int]:
+    cpus: List[int] = []
+    for range_str in cpu_ranges.split(","):
+        range_str = range_str.strip()
+        if not range_str:
+            continue
+        endpoints = range_str.split("-")
+        if len(endpoints) == 1:
+            cpus.append(int(endpoints[0]))
+        elif len(endpoints) == 2:
+            cpus.extend(range(int(endpoints[0]), int(endpoints[1]) + 1))
+        else:
+            raise Exception("lscpu command output error, please check !")
+    return cpus
+
+
+def _get_numa_node_count() -> int:
+    numa_info = execute_command(["lscpu"]).split("\n")
+    for line in numa_info:
+        line = ''.join(line.split())
+        if line.startswith("NUMAnode(s):"):
+            return int(line.split(":", 1)[1])
+    return 1
+
+
+def _get_global_device_ids(visible_devices: List[int]) -> List[int]:
+    binding_devices = _parse_device_list(os.getenv("CPU_BINDING_DEVICES"))
+    if binding_devices is not None:
+        return sorted(binding_devices)
+
+    try:
+        device_ids = sorted(list(_get_device_map_info().keys()))
+    except Exception:
+        logger.info("Failed to query global NPU device IDs, fallback to "
+                    "CPU_BINDING_DEVICES or ASCEND_RT_VISIBLE_DEVICES.")
+        device_ids = []
+    if not device_ids:
+        device_ids = sorted(visible_devices)
+    return device_ids
+
+
 @dataclass
 class DeviceInfo:
     """
@@ -207,14 +261,7 @@ def _get_numa_info_v2(
     Evenly distribute the given device list across all NUMA nodes and return
     both device-to-numa and numa-to-devices mappings.
     """
-    numa_nodes = 1
-    numa_info = execute_command(["lscpu"]).split("\n")
-    for _ in numa_info:
-        line = ''.join(_.split())
-        if keyword not in line:
-            continue
-        numa_nodes = int(line[-1])
-        break
+    numa_nodes = _get_numa_node_count()
 
     device_per_numa, tail_device = divmod(len(devices), numa_nodes)
     device_count_per_numa_list = [
@@ -250,46 +297,34 @@ def _get_cpu_info(numa_ids, keyword1="NUMAnode", keyword2="CPU(s)"):
         line = ''.join(_.split())
         if any(line.startswith(word) for word in numa_keywords):
             split_info = line.split(":")
-            cpu_id_ranges = split_info[-1].split(",")
-
-            ranges = list()
-            for range_str in cpu_id_ranges:
-                endpoints = range_str.split("-")
-                if len(endpoints) != 2:
-                    raise Exception(
-                        "lscpu command output error, please check !")
-
-                ranges += [
-                    cid for cid in range(int(endpoints[0]),
-                                         int(endpoints[1]) + 1)
-                ]
 
             numa_id = int(split_info[0].replace(keyword1,
                                                 '').replace(keyword2, ''))
-            cpu_idx_tbl[numa_id] = ranges
+            cpu_idx_tbl[numa_id] = _parse_cpu_ranges(split_info[-1])
     return cpu_idx_tbl
 
 
 def bind_cpus(rank_id, ratio=0.5):
-    # get all visible devices
-    visible_devices = ASCEND_RT_VISIBLE_DEVICES
+    # Get the device assigned to this process from the visible device list, but
+    # build the CPU layout from global device IDs. This keeps binding stable
+    # when each DP worker process is launched with only one visible NPU.
+    visible_devices = _get_visible_devices()
+    if rank_id >= len(visible_devices):
+        raise RuntimeError(
+            f"rank_id {rank_id} exceeds visible device list {visible_devices}")
+    cur_device = visible_devices[rank_id]
 
-    if visible_devices is None:
-        devices = sorted(list(_get_device_map_info().keys()))
-    else:
-        devices = [int(x) for x in visible_devices.split(",")]
+    global_devices = _get_global_device_ids(visible_devices)
+    if cur_device not in global_devices:
+        global_devices = sorted(set(global_devices + [cur_device]))
 
-    # Query the NUMA affinity of each NPU via its PCIe address; if this fails,
-    # fall back to evenly distributing the devices across NUMA nodes.
-    device_pcie_tbl = _get_pcie_info(devices)
-    device_numa_tbl, numa_devices_tbl = _get_numa_info(device_pcie_tbl)
-    if not device_numa_tbl or not numa_devices_tbl:
-        device_numa_tbl, numa_devices_tbl = _get_numa_info_v2(devices)
+    # Fixed mapping: sort global device IDs and distribute them evenly across
+    # NUMA nodes reported by lscpu, independent of per-process visibility.
+    device_numa_tbl, numa_devices_tbl = _get_numa_info_v2(global_devices)
 
     # Obtain the complete list of CPU cores for each NUMA node.
     cpu_idx_tbl = _get_cpu_info(list(numa_devices_tbl.keys()))
 
-    cur_device = devices[rank_id]
     numa_id = device_numa_tbl.get(cur_device)
 
     # Within the NUMA node, evenly partition the CPU cores
@@ -304,10 +339,11 @@ def bind_cpus(rank_id, ratio=0.5):
     )
 
     cpu_nums = len(all_cpus)
-    if CPU_BINDING_NUM is None:
+    cpu_binding_num = os.getenv("CPU_BINDING_NUM")
+    if cpu_binding_num is None:
         cpu_num_per_device = int(cpu_nums * ratio // len(shard_devices))
     else:
-        cpu_num_per_device = int(CPU_BINDING_NUM)
+        cpu_num_per_device = int(cpu_binding_num)
         if len(shard_devices) * cpu_num_per_device > cpu_nums:
             raise RuntimeError(
                 f"Cpu num in numa {numa_id} to assign {cpu_num_per_device} for every device is not enough, "
