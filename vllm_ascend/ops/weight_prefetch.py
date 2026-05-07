@@ -77,19 +77,30 @@ class WeightPrefetchMethod:
         torch.ops.vllm.prefetch_postprocess(stop_flag)
 
     def maybe_prefetch_moe_weight_preprocess(self, hidden_states, prefix):
-        self.moe.is_active_this_forward = hidden_states.shape[
-            0] >= MOE_PREFETCH_TOKEN_THRESHOLD if self.moe.enable else False
+        # self.moe.is_active_this_forward = hidden_states.shape[
+        #     0] >= MOE_PREFETCH_TOKEN_THRESHOLD if self.moe.enable else False
+        self.moe.is_active_this_forward = self.moe.enable
         if not self.moe.is_active_this_forward:
             return
         forward_context = get_forward_context()
         # layer_idx is subtracted by 1 because layer_idx was incremented by 1 at layernorm.
+        if forward_context.layer_idx == 0:
+            forward_context.layer_idx = 3
         weight = forward_context.model_instance.model.layers[
-            forward_context.layer_idx - 1].mlp.experts.w13_weight
+            forward_context.layer_idx].mlp.experts.w13_weight
         weight_size = weight.data.element_size() * weight.data.numel(
         ) * self.moe.prefetch_ratio.get(prefix, 0)
         torch.ops.vllm.prefetch_preprocess(weight=weight,
                                            start_flag=None,
                                            max_weight_size=int(weight_size))
+        weight = forward_context.model_instance.model.layers[
+            forward_context.layer_idx].mlp.experts.w2_weight
+        weight_size = weight.data.element_size() * weight.data.numel(
+        ) * self.moe.prefetch_ratio.get(prefix, 0)
+        torch.ops.vllm.prefetch_preprocess(weight=weight,
+                                           start_flag=None,
+                                           max_weight_size=int(weight_size))
+        forward_context.layer_idx += 1
 
     def maybe_prefetch_moe_weight_postprocess(self, stop_flag: torch.Tensor):
         if not self.moe.is_active_this_forward:
