@@ -36,7 +36,8 @@ from vllm_ascend.ops.layer_shard_linear import (
     register_all_layers_to_shard_weight_series)
 from vllm_ascend.ops.rotary_embedding import get_cos_and_sin_mla
 from vllm_ascend.ops.triton.rope import rope_forward_triton
-from vllm_ascend.ops.weight_prefetch import maybe_npu_prefetch
+from vllm_ascend.ops.weight_prefetch import (maybe_npu_prefetch,
+                                             maybe_wait_mla_preprocess_prefetch_done)
 from vllm_ascend.quantization.w8a8 import AscendW8A8LinearMethod
 from vllm_ascend.utils import (ACL_FORMAT_FRACTAL_ND, _round_up, dispose_layer,
                                enable_dsa_cp, maybe_trans_nz)
@@ -831,6 +832,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             dtype=hidden_states.dtype,
             device=hidden_states.device,
         )
+        maybe_wait_mla_preprocess_prefetch_done()
         torch.ops._C_ascend.mla_preprocess(
             hidden_states,
             self.wd_qkv,
@@ -945,6 +947,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 sin=sin,
                 need_gather_q_kv=need_gather_q_kv)
         else:
+            maybe_wait_mla_preprocess_prefetch_done()
             assert self.fused_qkv_a_proj is not None, "q lora is required for DSA."
             maybe_npu_prefetch(inputs=self.fused_qkv_a_proj.weight,
                                dependency=hidden_states,

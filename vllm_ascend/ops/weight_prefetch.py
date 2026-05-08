@@ -7,6 +7,7 @@ from vllm.forward_context import get_forward_context
 from vllm_ascend.ascend_config import WeightPrefetchConfig
 from vllm_ascend.ops.linear import (AscendQKVParallelLinear,
                                     AscendRowParallelLinear)
+from vllm_ascend.utils import prefetch_stream
 
 SUPPORTED_MODULES = ["attn", "mlp", "moe"]
 MOE_PREFETCH_TOKEN_THRESHOLD = 96
@@ -121,3 +122,63 @@ def maybe_npu_prefetch(inputs: torch.Tensor,
     if max_size <= 0 or max_size > input_size:
         max_size = input_size
     torch_npu.npu_prefetch(inputs, dependency, max_size, offset)
+
+
+def _get_forward_context_for_mla_prefetch():
+    try:
+        return get_forward_context()
+    except AssertionError:
+        return None
+
+
+def _resolve_sfa_impl(attn):
+    impl = attn
+    for attr in ("mla_attn", "mla_attn", "impl"):
+        next_impl = getattr(impl, attr, None)
+        if next_impl is not None:
+            impl = next_impl
+    if (impl.__class__.__name__ != "AscendSFAImpl"
+            or impl.__class__.__module__ != "vllm_ascend.attention.sfa_v1"):
+        return None
+    return impl
+
+
+def maybe_prefetch_mla_preprocess_weights(attn, dependency: torch.Tensor) -> None:
+    forward_context = _get_forward_context_for_mla_prefetch()
+    if forward_context is None:
+        return
+    if getattr(forward_context, "afd_metadata", None) is None:
+        return
+    if getattr(forward_context, "num_ubatches", 1) != 1:
+        return
+    sfa_impl = _resolve_sfa_impl(attn)
+    if sfa_impl is None:
+        return
+    if not getattr(sfa_impl, "enable_prefetch", False):
+        return
+    if not getattr(sfa_impl, "enable_mlapo", False):
+        return
+
+    weight_names = ("wd_qkv", "wu_q", "W_UK_T")
+    if not all(isinstance(getattr(sfa_impl, name, None), torch.Tensor)
+               for name in weight_names):
+        return
+
+    for name in weight_names:
+        weight = getattr(sfa_impl, name)
+        weight_size = weight.element_size() * weight.numel()
+        torch.ops.vllm.prefetch_preprocess(weight=weight,
+                                           start_flag=dependency,
+                                           max_weight_size=int(weight_size))
+    forward_context.mla_preprocess_prefetch_pending = True
+
+
+def maybe_wait_mla_preprocess_prefetch_done() -> None:
+    forward_context = _get_forward_context_for_mla_prefetch()
+    if forward_context is None:
+        return
+    if not getattr(forward_context, "mla_preprocess_prefetch_pending", False):
+        return
+
+    torch.npu.current_stream().wait_stream(prefetch_stream())
+    forward_context.mla_preprocess_prefetch_pending = False
