@@ -8,7 +8,8 @@ import torch
 import vllm.envs as envs_vllm
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.distributed import get_dp_group, get_ep_group, get_tensor_model_parallel_world_size
-from vllm.forward_context import BatchDescriptor, get_forward_context, set_forward_context
+from vllm.forward_context import BatchDescriptor, DPMetadata, ForwardContext, get_forward_context, set_forward_context
+from vllm.v1.worker.ubatch_utils import UBatchSlices
 
 import vllm_ascend.envs as envs_ascend
 from vllm_ascend.utils import (
@@ -69,6 +70,7 @@ def set_ascend_forward_context(
     skip_compiled: bool = False,
     max_tokens_across_pcp: int = 0,
     draft_attn_metadatas=None,
+    ubatch_slices: UBatchSlices | None = None,
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
@@ -82,6 +84,7 @@ def set_ascend_forward_context(
         "cudagraph_runtime_mode": aclgraph_runtime_mode,
         "batch_descriptor": batch_descriptor,
         "skip_compiled": skip_compiled,
+        "ubatch_slices": ubatch_slices,
     }
     with set_forward_context(**forward_context_kwargs):
         forward_context = get_forward_context()
@@ -137,6 +140,7 @@ def set_ascend_forward_context(
 
         # set this for rope forward_oot using
         forward_context.is_first_layer = True
+        forward_context.dbo_enabled = False
 
         # set layer_idx to enable optimization features that depend on this information.
         # This is only applicable to models that contain these necessary attributes.
@@ -186,6 +190,85 @@ def set_ascend_forward_context(
             yield
         finally:
             pass
+
+
+def create_ascend_forward_context(
+    cur_forward_context: Any,
+    attn_metadata: Any,
+    vllm_config: VllmConfig,
+    ubatch_slices: UBatchSlices,
+    ubatch_num: int = 0,
+    dp_metadata: DPMetadata | None = None,
+    cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
+    batch_descriptor: BatchDescriptor | None = None,
+    skip_compiled: bool = False,
+) -> ForwardContext:
+    new_forward_context = ForwardContext(
+        no_compile_layers=vllm_config.compilation_config.static_forward_context,
+        all_moe_layers=getattr(cur_forward_context, "all_moe_layers", None),
+        attn_metadata=attn_metadata,
+        slot_mapping={},
+        dp_metadata=dp_metadata,
+        cudagraph_runtime_mode=cudagraph_runtime_mode,
+        batch_descriptor=batch_descriptor,
+        ubatch_slices=ubatch_slices,
+        skip_compiled=skip_compiled,
+        additional_kwargs=getattr(cur_forward_context, "additional_kwargs", {}).copy(),
+    )
+
+    ubatch_slice = ubatch_slices[ubatch_num]
+    num_tokens = ubatch_slice.num_tokens
+    tp_world_size = get_tensor_model_parallel_world_size()
+    dp_world_size = get_dp_group().world_size
+
+    new_forward_context.moe_comm_type = cur_forward_context.moe_comm_type
+    from vllm_ascend.ops.fused_moe.moe_comm_method import get_moe_comm_method
+
+    new_forward_context.moe_comm_method = get_moe_comm_method(new_forward_context.moe_comm_type)
+    new_forward_context.in_profile_run = cur_forward_context.in_profile_run
+    new_forward_context.capturing = cur_forward_context.capturing
+    new_forward_context.mmrs_fusion = cur_forward_context.mmrs_fusion
+    new_forward_context.num_tokens = num_tokens
+    new_forward_context.flash_comm_v1_enabled = cur_forward_context.flash_comm_v1_enabled
+    new_forward_context.flashcomm_v2_enabled = cur_forward_context.flashcomm_v2_enabled
+    new_forward_context.pad_size = 0
+    new_forward_context.is_first_layer = cur_forward_context.is_first_layer
+    new_forward_context.layer_idx = cur_forward_context.layer_idx
+    new_forward_context.prefetch_mlp_gate_up_proj = cur_forward_context.prefetch_mlp_gate_up_proj
+    new_forward_context.prefetch_mlp_down_proj = cur_forward_context.prefetch_mlp_down_proj
+    new_forward_context.model_instance = cur_forward_context.model_instance
+    new_forward_context.is_draft_model = cur_forward_context.is_draft_model
+    new_forward_context.is_draft_model_prefill = getattr(cur_forward_context, "is_draft_model_prefill", False)
+    new_forward_context.draft_attn_metadatas = getattr(cur_forward_context, "draft_attn_metadatas", None)
+    new_forward_context.max_tokens_across_pcp = getattr(cur_forward_context, "max_tokens_across_pcp", 0)
+
+    if new_forward_context.flash_comm_v1_enabled or new_forward_context.flashcomm_v2_enabled:
+        new_forward_context.pad_size = (tp_world_size - (num_tokens % tp_world_size)) % tp_world_size
+
+    if dp_world_size > 1 and dp_metadata is not None:
+        if vllm_version_is("0.19.1"):
+            max_tokens_across_dp = dp_metadata.max_tokens_across_dp_cpu.item()
+        else:
+            max_tokens_across_dp = dp_metadata.num_tokens_across_dp_cpu.max().item()
+        if new_forward_context.flash_comm_v1_enabled or new_forward_context.flashcomm_v2_enabled:
+            padded_length = (max_tokens_across_dp + tp_world_size - 1) // tp_world_size * tp_world_size
+            new_forward_context.padded_length = padded_length
+            new_forward_context.pad_size = padded_length - num_tokens
+    else:
+        max_tokens_across_dp = num_tokens
+    new_forward_context.max_tokens_across_dp = max_tokens_across_dp
+
+    if num_tokens is not None:
+        new_forward_context.padded_num_tokens = math.ceil(max_tokens_across_dp / tp_world_size) * tp_world_size
+        if getattr(cur_forward_context, "mc2_mask", None) is not None:
+            mc2_mask = torch.zeros_like(cur_forward_context.mc2_mask)
+            mc2_mask = mc2_mask[: new_forward_context.padded_num_tokens]
+            mc2_mask[:num_tokens] = True
+            mc2_mask[num_tokens:] = False
+            new_forward_context.mc2_mask = mc2_mask
+
+    new_forward_context.dbo_enabled = True
+    return new_forward_context
 
 
 _mc2_tokens_capacity: int | None = None
