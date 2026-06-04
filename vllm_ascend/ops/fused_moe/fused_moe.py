@@ -409,6 +409,9 @@ class AscendFusedMoE(FusedMoE):
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if async_dp_enabled(self.vllm_config):
+            return torch.zeros_like(hidden_states)
+
         self.ensure_moe_quant_config_init()
         return self.runner.forward(
             hidden_states,
@@ -678,6 +681,9 @@ class AscendSharedFusedMoE(SharedFusedMoE, AscendFusedMoE):
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if async_dp_enabled(self.vllm_config):
+            return None, torch.zeros_like(hidden_states)
+
         result = AscendFusedMoE.forward(
             self,
             hidden_states=hidden_states,
