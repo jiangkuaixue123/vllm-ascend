@@ -682,7 +682,12 @@ class AscendSharedFusedMoE(SharedFusedMoE, AscendFusedMoE):
         router_logits: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if async_dp_enabled(self.vllm_config):
-            return None, torch.zeros_like(hidden_states)
+            shared_out = (
+                torch.zeros_like(hidden_states)
+                if self._shared_experts is not None
+                else None
+            )
+            return shared_out, torch.zeros_like(hidden_states)
 
         result = AscendFusedMoE.forward(
             self,
@@ -734,7 +739,12 @@ class AscendSharedFusedMoE(SharedFusedMoE, AscendFusedMoE):
         self, hidden_states: torch.Tensor, router_logits: torch.Tensor
     ):
         if async_dp_enabled(self.vllm_config):
-            return None, torch.zeros_like(hidden_states)
+            shared_out = (
+                torch.zeros_like(hidden_states)
+                if self._shared_experts is not None
+                else None
+            )
+            return shared_out, torch.zeros_like(hidden_states)
 
         if self.multistream_overlap_gate:
             set_flash_common3_context(shared_experts=self._shared_experts)
