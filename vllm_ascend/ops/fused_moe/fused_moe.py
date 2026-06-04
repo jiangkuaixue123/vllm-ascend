@@ -75,6 +75,10 @@ def mock_true():
     return True
 
 
+def async_dp_enabled(vllm_config) -> bool:
+    return bool(getattr(vllm_config.parallel_config, "async_dp", False))
+
+
 class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
     def __init__(self, moe: FusedMoEConfig = None):
         super().__init__(moe=moe)
@@ -415,6 +419,11 @@ class AscendFusedMoE(FusedMoE):
         self, hidden_states: torch.Tensor, router_logits: torch.Tensor, return_with_event: bool = False
     ) -> torch.Tensor | FusedMoEResult:
         assert self.quant_method is not None
+        if async_dp_enabled(self.vllm_config):
+            routed_out = torch.zeros_like(hidden_states)
+            if return_with_event:
+                return FusedMoEResult(routed_out=routed_out)
+            return routed_out
 
         forward_context = get_forward_context()
         # When static kernels are enabled, the forward pass runs twice (compilation + capture),
@@ -718,6 +727,9 @@ class AscendSharedFusedMoE(SharedFusedMoE, AscendFusedMoE):
     def forward_impl(  # type: ignore[override]
         self, hidden_states: torch.Tensor, router_logits: torch.Tensor
     ):
+        if async_dp_enabled(self.vllm_config):
+            return None, torch.zeros_like(hidden_states)
+
         if self.multistream_overlap_gate:
             set_flash_common3_context(shared_experts=self._shared_experts)
 
