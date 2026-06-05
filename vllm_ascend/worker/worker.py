@@ -129,6 +129,7 @@ class NPUWorker(WorkerBase):
         # Profiler is lazily initialized on first profile(is_start=True) call (RFC #6954)
         self.profiler_config = vllm_config.profiler_config
         self.profiler = None
+        self._profiler_uses_schedule = False
         if vllm_config.model_config and vllm_config.model_config.enable_sleep_mode:
             # Buffers saved before sleep
             self._sleep_saved_buffers: dict[str, torch.Tensor] = {}
@@ -402,6 +403,9 @@ class NPUWorker(WorkerBase):
         # enable msMonitor to monitor the performance of vllm-ascend
         if envs_ascend.MSMONITOR_USE_DAEMON:
             dp.step()
+
+        if getattr(self, "_profiler_uses_schedule", False) and getattr(self, "profiler", None):
+            self.profiler.step()
 
         if self._pp_send_work:
             for handle in self._pp_send_work:
@@ -762,7 +766,27 @@ class NPUWorker(WorkerBase):
             gc_detect_threshold=None,
         )
 
-        return torch_npu.profiler.profile(
+        schedule = None
+        delay_iterations = getattr(profiler_config, "delay_iterations", 0)
+        max_iterations = getattr(profiler_config, "max_iterations", 0)
+        wait_iterations = getattr(profiler_config, "wait_iterations", 0)
+        warmup_iterations = getattr(profiler_config, "warmup_iterations", 0)
+        if delay_iterations > 0 or wait_iterations > 0 or warmup_iterations > 0 or max_iterations > 0:
+            if max_iterations > 0:
+                active_iterations = max_iterations
+            elif wait_iterations > 0 or warmup_iterations > 0:
+                active_iterations = getattr(profiler_config, "active_iterations", 5)
+            else:
+                active_iterations = 2**63 - 1
+            schedule = torch_npu.profiler.schedule(
+                skip_first=delay_iterations,
+                wait=wait_iterations,
+                warmup=warmup_iterations,
+                active=active_iterations,
+                repeat=1,
+            )
+
+        profiler_kwargs = dict(
             activities=[
                 torch_npu.profiler.ProfilerActivity.CPU,
                 torch_npu.profiler.ProfilerActivity.NPU,
@@ -778,6 +802,11 @@ class NPUWorker(WorkerBase):
                 worker_name=trace_name,
             ),
         )
+        if schedule is not None:
+            profiler_kwargs["schedule"] = schedule
+
+        self._profiler_uses_schedule = schedule is not None
+        return torch_npu.profiler.profile(**profiler_kwargs)
 
     def get_supported_pooling_tasks(self):
         return self.model_runner.get_supported_pooling_tasks()
