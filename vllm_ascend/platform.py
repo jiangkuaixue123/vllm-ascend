@@ -261,14 +261,9 @@ class NPUPlatform(Platform):
 
     @classmethod
     def _validate_layer_sharding_config(cls, vllm_config: VllmConfig) -> None:
-        additional_config = vllm_config.additional_config or {}
-        layer_sharding = additional_config.get("layer_sharding") or []
-        if not layer_sharding:
-            return
-
-        kv_transfer_config = vllm_config.kv_transfer_config
-        if kv_transfer_config is None or kv_transfer_config.kv_role != "kv_producer":
-            raise ValueError("additional_config.layer_sharding can only be enabled in PD-disaggregated's P node.")
+        # Keep this hook for future layer-sharding checks. Layer sharding is no
+        # longer restricted to PD-disaggregated P nodes.
+        return
 
     @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:

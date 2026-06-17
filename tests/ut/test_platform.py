@@ -610,13 +610,12 @@ class TestNPUPlatform(TestBase):
 
         self.assertEqual(vllm_config.cache_config.block_size, 512)
 
-    def test_validate_layer_sharding_config_rejects_missing_kv_transfer_config(self):
+    def test_validate_layer_sharding_config_accepts_missing_kv_transfer_config(self):
         vllm_config = TestNPUPlatform.mock_vllm_config()
         vllm_config.additional_config = {"layer_sharding": ["q_b_proj", "o_proj"]}
         vllm_config.kv_transfer_config = None
 
-        with pytest.raises(ValueError, match="layer_sharding can only be enabled in PD-disaggregated's P node"):
-            self.platform._validate_layer_sharding_config(vllm_config)
+        self.platform._validate_layer_sharding_config(vllm_config)
 
     def test_validate_layer_sharding_config_accepts_kv_producer(self):
         vllm_config = TestNPUPlatform.mock_vllm_config()
@@ -625,21 +624,19 @@ class TestNPUPlatform(TestBase):
 
         self.platform._validate_layer_sharding_config(vllm_config)
 
-    def test_validate_layer_sharding_config_rejects_non_kv_producer(self):
+    def test_validate_layer_sharding_config_accepts_non_kv_producer(self):
         vllm_config = TestNPUPlatform.mock_vllm_config()
         vllm_config.additional_config = {"layer_sharding": ["q_b_proj", "o_proj"]}
         vllm_config.kv_transfer_config = MagicMock(is_kv_producer=False, kv_role="kv_consumer")
 
-        with pytest.raises(ValueError, match="layer_sharding can only be enabled in PD-disaggregated's P node"):
-            self.platform._validate_layer_sharding_config(vllm_config)
+        self.platform._validate_layer_sharding_config(vllm_config)
 
-    def test_validate_layer_sharding_config_rejects_kv_both(self):
+    def test_validate_layer_sharding_config_accepts_kv_both(self):
         vllm_config = TestNPUPlatform.mock_vllm_config()
         vllm_config.additional_config = {"layer_sharding": ["q_b_proj", "o_proj"]}
         vllm_config.kv_transfer_config = MagicMock(is_kv_producer=True, kv_role="kv_both")
 
-        with pytest.raises(ValueError, match="layer_sharding can only be enabled in PD-disaggregated's P node"):
-            self.platform._validate_layer_sharding_config(vllm_config)
+        self.platform._validate_layer_sharding_config(vllm_config)
 
     @patch("vllm_ascend.quantization.utils.maybe_auto_detect_quantization")
     @patch("vllm_ascend.utils.get_ascend_device_type", return_value=AscendDeviceType.A3)

@@ -135,9 +135,9 @@ msgstr ""
 
 #: ../../source/user_guide/feature_guide/layer_sharding.md:40
 msgid ""
-"**Restriction** Layer Sharding can only be enabled in PD-disaggregated's "
-"**P node**."
-msgstr "**限制** 层间分片只能在 PD 解耦架构的 **P 节点** 中启用。"
+"**Note** Layer Sharding reduces memory only when the shard-weight "
+"communication group contains multiple ranks."
+msgstr "**说明** 只有当 shard-weight 通信组包含多个 rank 时，层间分片才会降低显存占用。"
 
 #: ../../source/user_guide/feature_guide/layer_sharding.md:45
 msgid "Supported Scenarios"
@@ -182,5 +182,5 @@ msgstr ""
 "61 层架构）加载到有限的设备显存中。"
 
 #: ../../source/user_guide/feature_guide/layer_sharding.md:68
-msgid "Layer Sharding can only be enabled in PD-disaggregated's **P node**."
-msgstr "层间分片只能在 PD 解耦架构的 **P 节点** 中启用。"
+msgid "Layer Sharding reduces memory only when the shard-weight communication group contains multiple ranks."
+msgstr "只有当 shard-weight 通信组包含多个 rank 时，层间分片才会降低显存占用。"

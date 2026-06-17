@@ -285,10 +285,8 @@ msgid "`layer_sharding`"
 msgstr "`layer_sharding`"
 
 #: ../../source/user_guide/configuration/additional_config.md
-msgid ""
-"Configuration options for Layer Sharding Linear. Layer Sharding can only "
-"be enabled in PD-disaggregated's P node."
-msgstr "层分片线性的配置选项。层分片只能在 PD 解耦的 P 节点中启用。"
+msgid "Configuration options for Layer Sharding Linear."
+msgstr "层分片线性的配置选项。"
 
 #: ../../source/user_guide/configuration/additional_config.md
 msgid "`enable_sparse_c8`"
