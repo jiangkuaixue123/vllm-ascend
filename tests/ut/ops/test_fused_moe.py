@@ -139,6 +139,21 @@ def test_force_load_balance_buffer_uses_max_num_batched_tokens():
     assert layer.force_lb_fake_topk_buffer.shape == (6, 2)
 
 
+def test_force_load_balance_buffer_uses_routed_expert_count():
+    layer = AscendFusedMoE.__new__(AscendFusedMoE)
+    layer.ep_size = 2
+    layer.ep_rank = 0
+    layer.n_routed_experts = 4
+    layer.global_num_experts = 6
+    layer.top_k = 2
+    layer.force_load_balance_topn_per_rank = 2
+
+    layer._validate_force_lb_config()
+    layer._init_force_lb_buffer(max_tokens=2, device=torch.device("cpu"))
+
+    assert int(layer.force_lb_fake_topk_buffer.max()) < layer.n_routed_experts
+
+
 @pytest.fixture(autouse=True)
 def setup_vllm_config_mock(mocker: MockerFixture):
     mock_hf_config = MagicMock()

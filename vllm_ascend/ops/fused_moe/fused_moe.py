@@ -277,6 +277,7 @@ class AscendFusedMoE(FusedMoE):
         num_experts = kwargs["num_experts"]
         intermediate_size = kwargs["intermediate_size"]
         num_shared_experts = kwargs.get("n_shared_experts", 0)
+        self.n_routed_experts = num_experts
 
         AscendFusedMoE.moe_counter += 1
         self.moe_instance_id = AscendFusedMoE.moe_counter
