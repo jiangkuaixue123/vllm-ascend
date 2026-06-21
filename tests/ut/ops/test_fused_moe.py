@@ -24,7 +24,7 @@ from pytest_mock import MockerFixture
 from tests.ut.base import TestBase
 from vllm_ascend.ascend_forward_context import MoECommType
 from vllm_ascend.ops.fused_moe.experts_selector import select_experts
-from vllm_ascend.ops.fused_moe.fused_moe import AscendUnquantizedFusedMoEMethod
+from vllm_ascend.ops.fused_moe.fused_moe import AscendFusedMoE, AscendUnquantizedFusedMoEMethod
 from vllm_ascend.ops.fused_moe.moe_mlp import cumsum_group_list, unified_apply_mlp
 from vllm_ascend.ops.fused_moe.moe_runtime_args import (
     MoEMlpComputeInput,
@@ -104,6 +104,21 @@ def build_mlp_compute_input_fixture(
         need_trans=need_trans,
         dynamic_eplb=dynamic_eplb,
     )
+
+
+def test_force_load_balance_buffer_topn_per_rank():
+    layer = AscendFusedMoE.__new__(AscendFusedMoE)
+    layer.ep_size = 4
+    layer.ep_rank = 1
+    layer.n_routed_experts = 8
+    layer.top_k = 2
+    layer.force_load_balance_topn_per_rank = 1
+
+    layer._validate_force_lb_config()
+    layer._init_force_lb_buffer(max_tokens=4, device=torch.device("cpu"))
+
+    expected = torch.tensor([[0, 2], [4, 6], [0, 2], [4, 6]], dtype=torch.int32)
+    assert torch.equal(layer.force_lb_fake_topk_buffer, expected)
 
 
 @pytest.fixture(autouse=True)

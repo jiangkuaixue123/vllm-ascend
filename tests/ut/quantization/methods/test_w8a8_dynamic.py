@@ -182,6 +182,57 @@ class TestAscendW8A8FusedMoEMethod(TestBase):
         self.assertIs(fused_experts_input.topk_weights, topk_weights)
         self.assertIs(fused_experts_input.topk_ids, topk_ids)
 
+    @patch("vllm_ascend.quantization.methods.w8a8_dynamic._EXTRA_CTX")
+    @patch("vllm_ascend.quantization.methods.w8a8_dynamic.select_experts")
+    def test_apply_uses_force_load_balance_buffer(self, mock_select_experts, mock_extra_ctx):
+        tokens = 4
+        hidden_size = self.hidden_size
+        layer = torch.nn.Module()
+        layer.w13_weight = torch.randint(
+            -8,
+            8,
+            (self.num_experts, 2 * self.intermediate_size, hidden_size),
+            dtype=torch.int8,
+        )
+        layer.w2_weight = torch.randint(
+            -8,
+            8,
+            (self.num_experts, hidden_size, self.intermediate_size),
+            dtype=torch.int8,
+        )
+        layer.w13_weight_scale_fp32 = torch.ones(self.num_experts, 2 * self.intermediate_size, dtype=torch.float32)
+        layer.w2_weight_scale = torch.ones(self.num_experts, hidden_size, dtype=torch.float32)
+        layer.enable_force_load_balance = True
+        layer.mix_placement = False
+        fake_topk_ids = torch.tensor([[0, 4], [1, 5], [2, 6], [3, 7]], dtype=torch.int32)
+        layer._get_force_lb_topk_ids = Mock(return_value=fake_topk_ids)
+
+        x = torch.randn(tokens, hidden_size, dtype=torch.float32)
+        router_logits = torch.randn(tokens, self.num_experts, dtype=torch.float32)
+        topk_weights = torch.randn(tokens, 2, dtype=torch.float32)
+        topk_ids = torch.zeros(tokens, 2, dtype=torch.int64)
+
+        mock_select_experts.return_value = (topk_weights, topk_ids)
+        mock_comm = Mock()
+        mock_comm.fused_experts.return_value = torch.randn(tokens, hidden_size, dtype=torch.float32)
+        mock_extra_ctx.moe_comm_method = mock_comm
+        mock_extra_ctx.moe_comm_type = MoECommType.ALLGATHER
+        self.quant_method.multistream_overlap_gate = False
+        self.quant_method.in_dtype = torch.float32
+
+        self.quant_method.apply(
+            layer=layer,
+            x=x,
+            router_logits=router_logits,
+            top_k=2,
+            renormalize=True,
+            num_experts=self.num_experts,
+        )
+
+        layer._get_force_lb_topk_ids.assert_called_once_with(batch_tokens=tokens, device=topk_ids.device)
+        fused_experts_input = mock_comm.fused_experts.call_args.kwargs["fused_experts_input"]
+        self.assertTrue(torch.equal(fused_experts_input.topk_ids, fake_topk_ids.to(topk_ids.dtype)))
+
     @patch("torch_npu.npu_format_cast")
     @patch("vllm_ascend.quantization.methods.w8a8_dynamic.envs_ascend")
     def test_process_weights_after_loading(self, mock_envs, mock_format_cast):
