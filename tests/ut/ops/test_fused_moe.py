@@ -12,6 +12,7 @@
 # limitations under the License.
 # This file is a part of the vllm-ascend project.
 #
+from types import SimpleNamespace
 from typing import TypedDict
 from unittest.mock import MagicMock, patch
 
@@ -119,6 +120,23 @@ def test_force_load_balance_buffer_topn_per_rank():
 
     expected = torch.tensor([[0, 2], [4, 6], [0, 2], [4, 6]], dtype=torch.int32)
     assert torch.equal(layer.force_lb_fake_topk_buffer, expected)
+
+
+def test_force_load_balance_buffer_uses_max_num_batched_tokens():
+    max_tokens = AscendFusedMoE._get_force_lb_max_tokens(
+        SimpleNamespace(scheduler_config=SimpleNamespace(max_num_batched_tokens=6))
+    )
+    layer = AscendFusedMoE.__new__(AscendFusedMoE)
+    layer.ep_size = 2
+    layer.ep_rank = 0
+    layer.n_routed_experts = 4
+    layer.top_k = 2
+    layer.force_load_balance_topn_per_rank = 0
+    layer._build_force_lb_expert_cycle = lambda device: torch.tensor([0, 1, 2, 3], dtype=torch.int32, device=device)
+
+    layer._init_force_lb_buffer(max_tokens=max_tokens, device=torch.device("cpu"))
+
+    assert layer.force_lb_fake_topk_buffer.shape == (6, 2)
 
 
 @pytest.fixture(autouse=True)

@@ -310,7 +310,7 @@ class AscendFusedMoE(FusedMoE):
             )
         self.enable_force_load_balance = bool(additional_config.get("enable_force_load_balance", False))
         self.force_load_balance_topn_per_rank = int(additional_config.get("force_load_balance_topn_per_rank", 0))
-        self.max_force_lb_tokens = max(getattr(vllm_config.scheduler_config, "max_num_batched_tokens", 128), 1)
+        self.max_force_lb_tokens = self._get_force_lb_max_tokens(vllm_config)
         self.force_lb_fake_topk_buffer: torch.Tensor | None = None
 
         # init moe
@@ -382,6 +382,13 @@ class AscendFusedMoE(FusedMoE):
             self.reduce_results,
             self.vllm_config.parallel_config.enable_dbo,
         )
+
+    @staticmethod
+    def _get_force_lb_max_tokens(vllm_config) -> int:
+        max_tokens = getattr(vllm_config.scheduler_config, "max_num_batched_tokens", None)
+        if not isinstance(max_tokens, int):
+            max_tokens = 128
+        return max(max_tokens, 1)
 
     def _validate_force_lb_config(self) -> None:
         if self.force_load_balance_topn_per_rank == 0:
