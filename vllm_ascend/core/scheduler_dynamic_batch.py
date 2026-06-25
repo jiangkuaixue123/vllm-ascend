@@ -31,6 +31,7 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.structured_output import StructuredOutputManager
 
+from vllm_ascend import envs
 from vllm_ascend.core.fake_prefix_cache import maybe_apply_fake_prefix_cache
 from vllm_ascend.utils import vllm_version_is
 
@@ -380,12 +381,35 @@ class SchedulerDynamicBatch(Scheduler):
 
                     # Total computed tokens (local + external).
                     real_num_external_computed_tokens = num_external_computed_tokens
+                    logger.info(
+                        "Fake prefix cache callsite before: scheduler=%s request_id=%s ratio=%s "
+                        "load_kv_async=%s block_size=%s prompt_tokens=%s total_tokens=%s "
+                        "local_computed=%s external_before=%s",
+                        type(self).__name__,
+                        getattr(request, "request_id", None),
+                        envs.VLLM_ASCEND_FAKE_PREFIX_CACHE_HIT_RATIO,
+                        load_kv_async,
+                        self.block_size,
+                        request.num_prompt_tokens,
+                        request.num_tokens,
+                        num_new_local_computed_tokens,
+                        real_num_external_computed_tokens,
+                    )
                     num_external_computed_tokens = maybe_apply_fake_prefix_cache(
                         request,
                         self.block_size,
                         num_new_local_computed_tokens,
                         num_external_computed_tokens,
                         load_kv_async,
+                    )
+                    logger.info(
+                        "Fake prefix cache callsite after: scheduler=%s request_id=%s ratio=%s "
+                        "external_before=%s external_after=%s",
+                        type(self).__name__,
+                        getattr(request, "request_id", None),
+                        envs.VLLM_ASCEND_FAKE_PREFIX_CACHE_HIT_RATIO,
+                        real_num_external_computed_tokens,
+                        num_external_computed_tokens,
                     )
                     fake_prefix_cache_applied = num_external_computed_tokens != real_num_external_computed_tokens
                     num_computed_tokens = num_new_local_computed_tokens + num_external_computed_tokens
