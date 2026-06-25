@@ -17,6 +17,8 @@
 
 from typing import Any
 
+from vllm.logger import logger
+
 from vllm_ascend import envs
 
 
@@ -38,7 +40,24 @@ def maybe_apply_fake_prefix_cache(
         return num_external_computed_tokens
     if not 0 <= ratio <= 1:
         raise ValueError("VLLM_ASCEND_FAKE_PREFIX_CACHE_HIT_RATIO must be in [0, 1]")
+
+    external_before = num_external_computed_tokens
     if ratio == 0 or load_kv_async:
+        logger.info(
+            "Fake prefix cache debug: request_id=%s ratio=%s "
+            "load_kv_async=%s block_size=%s prompt_tokens=%s total_tokens=%s "
+            "local_computed=%s external_before=%s external_after=%s "
+            "applied=False",
+            getattr(request, "request_id", None),
+            ratio,
+            load_kv_async,
+            block_size,
+            request.num_prompt_tokens,
+            request.num_tokens,
+            num_local_computed_tokens,
+            external_before,
+            num_external_computed_tokens,
+        )
         return num_external_computed_tokens
 
     max_hit_tokens = max(request.num_tokens - 1, 0)
@@ -46,5 +65,40 @@ def maybe_apply_fake_prefix_cache(
     target_hit_tokens = target_hit_tokens // block_size * block_size
     current_hit_tokens = num_local_computed_tokens + num_external_computed_tokens
     if target_hit_tokens <= current_hit_tokens:
+        logger.info(
+            "Fake prefix cache debug: request_id=%s ratio=%s "
+            "load_kv_async=%s block_size=%s prompt_tokens=%s total_tokens=%s "
+            "target_hit_tokens=%s current_hit_tokens=%s local_computed=%s "
+            "external_before=%s external_after=%s applied=False",
+            getattr(request, "request_id", None),
+            ratio,
+            load_kv_async,
+            block_size,
+            request.num_prompt_tokens,
+            request.num_tokens,
+            target_hit_tokens,
+            current_hit_tokens,
+            num_local_computed_tokens,
+            external_before,
+            num_external_computed_tokens,
+        )
         return num_external_computed_tokens
-    return num_external_computed_tokens + target_hit_tokens - current_hit_tokens
+    num_external_computed_tokens += target_hit_tokens - current_hit_tokens
+    logger.info(
+        "Fake prefix cache debug: request_id=%s ratio=%s "
+        "load_kv_async=%s block_size=%s prompt_tokens=%s total_tokens=%s "
+        "target_hit_tokens=%s current_hit_tokens=%s local_computed=%s "
+        "external_before=%s external_after=%s applied=True",
+        getattr(request, "request_id", None),
+        ratio,
+        load_kv_async,
+        block_size,
+        request.num_prompt_tokens,
+        request.num_tokens,
+        target_hit_tokens,
+        current_hit_tokens,
+        num_local_computed_tokens,
+        external_before,
+        num_external_computed_tokens,
+    )
+    return num_external_computed_tokens
