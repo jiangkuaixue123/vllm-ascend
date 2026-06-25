@@ -112,6 +112,15 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
+    # Debug-only knob for performance profiling. When set to a float in [0, 1],
+    # schedulers fake enough externally-computed prefix cache tokens to reach
+    # this hit ratio for prefill requests. This makes output accuracy invalid.
+    # Default None disables the fake path. Not sensitive.
+    "VLLM_ASCEND_FAKE_PREFIX_CACHE_HIT_RATIO": lambda: (
+        None
+        if os.getenv("VLLM_ASCEND_FAKE_PREFIX_CACHE_HIT_RATIO", None) is None
+        else float(os.getenv("VLLM_ASCEND_FAKE_PREFIX_CACHE_HIT_RATIO", "0"))
+    ),
 }
 
 # end-env-vars-definition

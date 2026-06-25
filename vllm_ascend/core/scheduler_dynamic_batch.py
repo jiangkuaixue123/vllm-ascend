@@ -31,6 +31,7 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.structured_output import StructuredOutputManager
 
+from vllm_ascend.core.fake_prefix_cache import maybe_apply_fake_prefix_cache
 from vllm_ascend.utils import vllm_version_is
 
 
@@ -352,6 +353,8 @@ class SchedulerDynamicBatch(Scheduler):
                     continue
 
                 num_external_computed_tokens = 0
+                real_num_external_computed_tokens = 0
+                fake_prefix_cache_applied = False
                 load_kv_async = False
 
                 # Get already-cached tokens.
@@ -376,6 +379,15 @@ class SchedulerDynamicBatch(Scheduler):
                             continue
 
                     # Total computed tokens (local + external).
+                    real_num_external_computed_tokens = num_external_computed_tokens
+                    num_external_computed_tokens = maybe_apply_fake_prefix_cache(
+                        request,
+                        self.block_size,
+                        num_new_local_computed_tokens,
+                        num_external_computed_tokens,
+                        load_kv_async,
+                    )
+                    fake_prefix_cache_applied = num_external_computed_tokens != real_num_external_computed_tokens
                     num_computed_tokens = num_new_local_computed_tokens + num_external_computed_tokens
                 # KVTransfer: WAITING reqs have num_computed_tokens > 0
                 # after async KV recvs are completed.
@@ -444,7 +456,7 @@ class SchedulerDynamicBatch(Scheduler):
                     num_new_local_computed_tokens,
                     new_computed_blocks,
                     num_lookahead_tokens=effective_lookahead_tokens,
-                    delay_cache_blocks=load_kv_async,
+                    delay_cache_blocks=load_kv_async or fake_prefix_cache_applied,
                     num_encoder_tokens=num_encoder_tokens,
                 )
 
@@ -460,7 +472,7 @@ class SchedulerDynamicBatch(Scheduler):
                     self.connector.update_state_after_alloc(
                         request,
                         new_computed_blocks + new_blocks,
-                        num_external_computed_tokens,
+                        real_num_external_computed_tokens,
                     )
 
                 # Request was already popped from self.waiting

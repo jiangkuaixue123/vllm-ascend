@@ -40,6 +40,7 @@ from vllm.v1.request import Request, RequestStatus
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
 
+from vllm_ascend.core.fake_prefix_cache import maybe_apply_fake_prefix_cache
 from vllm_ascend.core.profiling_chunk_predictor import ProfilingChunkManager
 from vllm_ascend.utils import vllm_version_is
 
@@ -464,6 +465,8 @@ class ProfilingChunkScheduler(Scheduler):
                     continue
 
                 num_external_computed_tokens = 0
+                real_num_external_computed_tokens = 0
+                fake_prefix_cache_applied = False
                 load_kv_async = False
                 connector_prefix_cache_queries, connector_prefix_cache_hits = 0, 0
 
@@ -483,13 +486,22 @@ class ProfilingChunkScheduler(Scheduler):
                             step_skipped_waiting.prepend_request(request)
                             continue
 
-                        if vllm_version_is("0.19.1"):
-                            request.num_external_computed_tokens = ext_tokens
                         num_external_computed_tokens = ext_tokens
 
                         connector_prefix_cache_queries = request.num_tokens - num_new_local_computed_tokens
                         connector_prefix_cache_hits = num_external_computed_tokens
 
+                    real_num_external_computed_tokens = num_external_computed_tokens
+                    num_external_computed_tokens = maybe_apply_fake_prefix_cache(
+                        request,
+                        self.block_size,
+                        num_new_local_computed_tokens,
+                        num_external_computed_tokens,
+                        load_kv_async,
+                    )
+                    if vllm_version_is("0.19.1"):
+                        request.num_external_computed_tokens = num_external_computed_tokens
+                    fake_prefix_cache_applied = num_external_computed_tokens != real_num_external_computed_tokens
                     num_computed_tokens = num_new_local_computed_tokens + num_external_computed_tokens
 
                     if not vllm_version_is("0.19.1") and request.prefill_stats is not None:
@@ -590,7 +602,7 @@ class ProfilingChunkScheduler(Scheduler):
                     new_computed_blocks=new_computed_blocks,
                     num_lookahead_tokens=effective_lookahead_tokens,
                     num_external_computed_tokens=num_external_computed_tokens,
-                    delay_cache_blocks=load_kv_async,
+                    delay_cache_blocks=load_kv_async or fake_prefix_cache_applied,
                     num_encoder_tokens=num_encoder_tokens,
                 )
 
@@ -603,7 +615,7 @@ class ProfilingChunkScheduler(Scheduler):
                     self.connector.update_state_after_alloc(
                         request,
                         self.kv_cache_manager.get_blocks(request_id),
-                        num_external_computed_tokens,
+                        real_num_external_computed_tokens,
                     )
                     if self.connector_prefix_cache_stats is not None and connector_prefix_cache_queries != 0:
                         self.connector_prefix_cache_stats.record(
