@@ -545,23 +545,6 @@ class NPUModelRunner(GPUModelRunner):
             )
             return should_ubatch, num_tokens_padded, None, cudagraph_mode
 
-        if getattr(self.parallel_config, "async_dp", False):
-            self._async_dp_sync_skip_counter = (
-                getattr(self, "_async_dp_sync_skip_counter", 0) + 1
-            )
-            logger.info(
-                "[async-dp] dp_rank=%s sync_skip=%s "
-                "num_tokens_unpadded=%s num_tokens_padded=%s "
-                "uniform_decode=%s cudagraph_mode=%s",
-                self.dp_rank,
-                self._async_dp_sync_skip_counter,
-                num_tokens_unpadded,
-                num_tokens_padded,
-                uniform_decode,
-                cudagraph_mode,
-            )
-            return False, num_tokens_padded, None, cudagraph_mode
-
         if should_skip_allreduce_across_dp_group(self.vllm_config, is_draft_model):
             num_tokens_after_padding = torch.tensor(
                 [num_tokens_padded] * self.dp_size, device="cpu", dtype=torch.int32
