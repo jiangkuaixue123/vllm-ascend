@@ -22,7 +22,6 @@ from __future__ import annotations
 import functools
 import math
 import os
-import threading
 from contextlib import nullcontext
 from enum import Enum
 from functools import lru_cache
@@ -56,7 +55,6 @@ _CUSTOM_OP_ENABLED = None
 _DEVICE_PRINT_OP_REGISTERED = False
 _CURRENT_STREAM = None
 _PREFETCH_STREAM = None
-_DBO_CURRENT_STREAM = threading.local()
 _WEIGHT_PREFETCH_METHOD = None
 _GLOBAL_STREAM = None
 _SHARED_EXPERTS_CALCULATION_STREAM = None
@@ -348,19 +346,6 @@ def current_stream() -> torch.npu.Stream:
         # we return the default stream.
         _CURRENT_STREAM = torch.npu.current_stream()
     return _CURRENT_STREAM
-
-
-def dbo_current_stream() -> torch.npu.Stream:
-    if not hasattr(_DBO_CURRENT_STREAM, "value") or _DBO_CURRENT_STREAM.value is None:
-        _DBO_CURRENT_STREAM.value = torch.npu.current_stream()
-    return _DBO_CURRENT_STREAM.value
-
-
-def dbo_set_stream(stream: torch.npu.Stream) -> None:
-    global _CURRENT_STREAM
-    _DBO_CURRENT_STREAM.value = stream
-    _CURRENT_STREAM = stream
-    torch.npu.set_stream(stream)
 
 
 def prefetch_stream() -> torch.npu.Stream:
