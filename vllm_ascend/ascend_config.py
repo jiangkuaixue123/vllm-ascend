@@ -71,7 +71,7 @@ class AscendConfig:
         self.dump_config_path = additional_config.get("dump_config_path", None)
         self.layer_sharding = additional_config.get("layer_sharding", None)
         if self.layer_sharding:
-            logger.info(
+            logger.info_once(
                 "Linear layer sharding enabled with config: %s. "
                 "Note: This feature works optimally with FLASHCOMM2 and DSA-CP enabled; "
                 "using it without these features may result in significant performance degradation.",
