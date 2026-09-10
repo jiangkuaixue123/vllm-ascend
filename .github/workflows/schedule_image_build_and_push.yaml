@@ -1,0 +1,121 @@
+name: Build and Push Test Image
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_branch:
+        description: 'Branch of vllm-ascend-day0 to build'
+        required: true
+        type: choice
+        options:
+          - main
+          - dev-DSv4.1
+        default: dev_hy4
+      build_a2:
+        description: 'Build the A2 Dockerfile'
+        required: true
+        default: false
+        type: boolean
+      build_a3:
+        description: 'Build the A3 Dockerfile'
+        required: true
+        default: true
+        type: boolean
+      build_a5:
+        description: 'Build the A5 Dockerfile'
+        required: true
+        default: false
+        type: boolean
+      build_310p:
+        description: 'Build the 310P Dockerfile'
+        required: true
+        default: false
+        type: boolean
+      build_ubuntu:
+        description: 'Build the Ubuntu variant'
+        required: true
+        default: true
+        type: boolean
+      build_openeuler:
+        description: 'Build the openEuler variant'
+        required: true
+        default: false
+        type: boolean
+      release_tag:
+        description: 'Image tag prefix; device and OS are appended automatically'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  prepare_matrix:
+    name: Prepare selected build matrix
+    runs-on: linux-aarch64-cpu-4
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - name: Create device and OS matrix
+        id: matrix
+        shell: bash
+        env:
+          BUILD_A2: ${{ inputs.build_a2 }}
+          BUILD_A3: ${{ inputs.build_a3 }}
+          BUILD_A5: ${{ inputs.build_a5 }}
+          BUILD_310P: ${{ inputs.build_310p }}
+          BUILD_UBUNTU: ${{ inputs.build_ubuntu }}
+          BUILD_OPENEULER: ${{ inputs.build_openeuler }}
+        run: |
+          set -euo pipefail
+
+          devices=()
+          [[ "$BUILD_A2" == "true" ]] && devices+=("910b")
+          [[ "$BUILD_A3" == "true" ]] && devices+=("a3")
+          [[ "$BUILD_A5" == "true" ]] && devices+=("a5")
+          [[ "$BUILD_310P" == "true" ]] && devices+=("310p")
+
+          operating_systems=()
+          [[ "$BUILD_UBUNTU" == "true" ]] && operating_systems+=("ubuntu")
+          [[ "$BUILD_OPENEULER" == "true" ]] && operating_systems+=("openeuler")
+
+          if (( ${#devices[@]} == 0 )); then
+            echo "Select at least one device." >&2
+            exit 1
+          fi
+          if (( ${#operating_systems[@]} == 0 )); then
+            echo "Select at least one operating system." >&2
+            exit 1
+          fi
+
+          matrix='{"include":['
+          separator=''
+          for device in "${devices[@]}"; do
+            for operating_system in "${operating_systems[@]}"; do
+              matrix+="${separator}{\"device\":\"${device}\",\"os\":\"${operating_system}\"}"
+              separator=','
+            done
+          done
+          matrix+=']}'
+
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          echo "Selected build matrix: $matrix"
+
+  image_build:
+    name: Build ${{ matrix.device }} / ${{ matrix.os }}
+    needs: prepare_matrix
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix: ${{ fromJSON(needs.prepare_matrix.outputs.matrix) }}
+    uses: ./.github/workflows/_schedule_image_build.yaml
+    with:
+      device: ${{ matrix.device }}
+      os: ${{ matrix.os }}
+      release_tag: ${{ inputs.release_tag }}
+      source_ref: ${{ inputs.source_branch }}
+      quay_username: ${{ vars.QUAY_USER_NAME }}
+      atlas_quay_username: ${{ vars.QUAY_ATLAS_USER_NAME }}
+    secrets:
+      QUAY_TOKEN: ${{ secrets.QUAY_TOKEN }}
+      QUAY_ATLAS_TOKEN: ${{ secrets.QUAY_ATLAS_TOKEN }}

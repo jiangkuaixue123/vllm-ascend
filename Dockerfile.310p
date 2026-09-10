@@ -1,0 +1,8 @@
+FROM alpine:3.20
+
+ARG PIP_INDEX_URL
+ARG COMPILE_CUSTOM_KERNELS
+
+LABEL device="310p" os="ubuntu"
+
+CMD ["echo", "hello from 310p/ubuntu"]

@@ -1,0 +1,168 @@
+name: Build Selected Test Image
+
+on:
+  workflow_call:
+    inputs:
+      device:
+        description: 'Ascend device Dockerfile variant'
+        required: true
+        type: string
+      os:
+        description: 'Base operating system'
+        required: true
+        type: string
+      release_tag:
+        description: 'Image tag prefix; device and OS are appended automatically'
+        required: true
+        type: string
+      source_ref:
+        description: 'Branch or ref of vllm-ascend-day0 to build'
+        required: true
+        type: string
+      quay_username:
+        description: 'Quay username for pushing the image'
+        required: true
+        type: string
+      atlas_quay_username:
+        description: 'Quay username for pushing the intermediate image'
+        required: true
+        type: string
+    secrets:
+      QUAY_TOKEN:
+        description: 'Quay token for pushing the image'
+        required: true
+      QUAY_ATLAS_TOKEN:
+        description: 'Quay token for pushing the intermediate image to the temporary repository'
+        required: true
+
+env:
+  IMAGE_REPO: quay.io/ascend/vllm-ascend
+  TEMP_IMAGE_REPO: quay.io/atlas-ci/vllm-atlas-temp
+
+jobs:
+
+      
+  build-push-digest:
+
+    name: Build ${{ matrix.arch_tag }}
+    runs-on: ${{ matrix.runner }}
+    container:
+      image: swr.cn-north-12.myhuaweicloud.com/base_image/ascend-ci/cann:9.1.0-${{ inputs.device == 'a5' && '950' || inputs.device }}-ubuntu22.04-py3.12
+    #   image: swr.cn-south-1.myhuaweicloud.com/ascendhub/cann:9.1.0-a3-ubuntu22.04-py3.12
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: linux-amd64-cpu-4
+            arch_tag: amd64
+          - platform: linux/arm64
+            runner: linux-aarch64-cpu-4
+            arch_tag: arm64
+
+    steps:
+      - name: Pre-config git access token
+        run: |
+          # as we use a proxy but actions/checkout only set basic auth header for github.com
+          # so we set the extraheader manually
+          rm -fr /etc/gitconfig ~/.gitconfig
+          # TOKEN=`echo -n "x-access-token:${{ secrets.GITHUB_TOKEN}}"|base64`
+          # git config --global http.https://gh-proxy.test.osinfra.cn/.extraheader "AUTHORIZATION: basic $TOKEN" 
+
+          # TOKEN=`echo -n "x-access-token:${{ secrets.GITHUB_TOKEN}}"|base64 -w 0`
+          # git config --global url."http://x-access-token:${{ secrets.GITHUB_TOKEN}}@git-cdn-service.git-cdn.svc.cluster.local:8000/".insteadOf "https://github.com/"
+          git config --global url."https://x-access-token:${{ secrets.GITHUB_TOKEN}}@gh-proxy.test.osinfra.cn/https://github.com/".insteadOf "https://github.com/"
+
+      - name: Checkout vllm-ascend-day0
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ inputs.source_ref }}
+
+      - name: Resolve and validate Dockerfile
+        id: dockerfile
+        shell: bash
+        env:
+          DEVICE: ${{ inputs.device }}
+          BASE_OS: ${{ inputs.os }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+
+          case "$DEVICE" in
+            910b) dockerfile="Dockerfile" ;;
+            a3|a5|310p) dockerfile="Dockerfile.${DEVICE}" ;;
+            *) echo "Unsupported device: $DEVICE" >&2; exit 1 ;;
+          esac
+
+          case "$BASE_OS" in
+            ubuntu) ;;
+            openeuler) dockerfile="${dockerfile}.openEuler" ;;
+            *) echo "Unsupported operating system: $BASE_OS" >&2; exit 1 ;;
+          esac
+
+          if [[ ! "$RELEASE_TAG" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}$ ]]; then
+            echo "Invalid release tag prefix: $RELEASE_TAG" >&2
+            exit 1
+          fi
+          if [[ ! -f "$dockerfile" ]]; then
+            echo "Dockerfile does not exist: $dockerfile" >&2
+            exit 1
+          fi
+
+          echo "path=$dockerfile" >> "$GITHUB_OUTPUT"
+          echo "Selected Dockerfile: $dockerfile"
+
+      # - name: Free up disk space
+      #   uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+      #   with:
+      #     tool-cache: true
+      #     docker-images: false
+
+      - name: Login to Quay (atlas-ci)
+        uses: docker/login-action@v4
+        with:
+          registry: quay.io
+          username: ${{ inputs.atlas_quay_username }}
+          password: ${{ secrets.QUAY_ATLAS_TOKEN }}
+
+      - name: Resolve push target
+        id: push-target
+        shell: bash
+        env:
+          DEVICE: ${{ inputs.device }}
+          BASE_OS: ${{ inputs.os }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          ARCH_TAG: ${{ matrix.arch_tag }}
+        run: |
+          set -euo pipefail
+
+          temp_tag="${RELEASE_TAG}-${DEVICE}-${BASE_OS}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${ARCH_TAG}-temp"
+          echo "build_output=type=image,name=${TEMP_IMAGE_REPO}:${temp_tag},push=true" >> "$GITHUB_OUTPUT"
+
+      # - name: Set up Docker Buildx
+      #   uses: docker/setup-buildx-action@v4
+      #   with:
+      #     driver: docker-container
+      #     use: true
+
+      - name: Build and push architecture image
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ${{ steps.dockerfile.outputs.path }}
+          platforms: ${{ matrix.platform }}
+          push: true
+          outputs: ${{ steps.push-target.outputs.build_output }}
+          build-args: |            
+            APTMIRROR=http://cache-service.nginx-pypi-cache.svc.cluster.local:8081
+            PIP_INDEX_URL=http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple
+            PIP_TRUSTED_HOST=cache-service.nginx-pypi-cache.svc.cluster.local
+            PYTORCH_INDEX_URL=http://cache-service.nginx-pypi-cache.svc.cluster.local/whl/cpu
+            ASCEND_INDEX_URL=http://cache-service.nginx-pypi-cache.svc.cluster.local/ascend/repos/pypi
+            GIT_PROXY=https://gh-proxy.test.osinfra.cn/
+            COMPILE_CUSTOM_KERNELS=1
+          provenance: false
