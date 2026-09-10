@@ -27,6 +27,10 @@ on:
         description: 'Quay username for pushing the intermediate image'
         required: true
         type: string
+      arch:
+        description: 'Architecture to build: both / amd64 / arm64'
+        required: true
+        type: string
     secrets:
       QUAY_TOKEN:
         description: 'Quay token for pushing the image'
@@ -45,6 +49,7 @@ jobs:
   build-push-digest:
 
     name: Build ${{ matrix.arch_tag }}
+    if: ${{ inputs.arch == 'both' || inputs.arch == matrix.arch_tag }}
     runs-on: ${{ matrix.runner }}
     container:
       image: swr.cn-north-12.myhuaweicloud.com/base_image/ascend-ci/cann:9.1.0-${{ inputs.device == 'a5' && '950' || inputs.device }}-ubuntu22.04-py3.12

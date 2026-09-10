@@ -11,6 +11,15 @@ on:
           - main
           - dev-DSv4.1
         default: dev_hy4
+      arch:
+        description: 'Architecture to build (both / amd64 / arm64)'
+        required: true
+        type: choice
+        options:
+          - both
+          - amd64
+          - arm64
+        default: both
       build_a2:
         description: 'Build the A2 Dockerfile'
         required: true
@@ -116,6 +125,7 @@ jobs:
       source_ref: ${{ inputs.source_branch }}
       quay_username: ${{ vars.QUAY_USER_NAME }}
       atlas_quay_username: ${{ vars.QUAY_ATLAS_USER_NAME }}
+      arch: ${{ inputs.arch }}
     secrets:
       QUAY_TOKEN: ${{ secrets.QUAY_TOKEN }}
       QUAY_ATLAS_TOKEN: ${{ secrets.QUAY_ATLAS_TOKEN }}
