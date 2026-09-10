@@ -11,6 +11,10 @@ on:
         description: 'Base operating system'
         required: true
         type: string
+      soc:
+        description: 'Ascend SoC type (e.g. 910b, a3, 310p, 950)'
+        required: true
+        type: string
       release_tag:
         description: 'Image tag prefix; device and OS are appended automatically'
         required: true
@@ -45,25 +49,40 @@ env:
 
 jobs:
 
-      
+  prepare-arch-matrix:
+    name: Prepare architecture matrix
+    runs-on: linux-amd64-cpu-4
+    outputs:
+      arch_matrix: ${{ steps.arch-matrix.outputs.arch_matrix }}
+    steps:
+      - name: Compute architecture matrix
+        id: arch-matrix
+        shell: bash
+        env:
+          ARCH: ${{ inputs.arch }}
+        run: |
+          set -euo pipefail
+          case "$ARCH" in
+            amd64) archs='[{"platform":"linux/amd64","runner":"linux-amd64-cpu-4","arch_tag":"amd64"}]' ;;
+            arm64) archs='[{"platform":"linux/arm64","runner":"linux-aarch64-cpu-4","arch_tag":"arm64"}]' ;;
+            both)  archs='[{"platform":"linux/amd64","runner":"linux-amd64-cpu-4","arch_tag":"amd64"},{"platform":"linux/arm64","runner":"linux-aarch64-cpu-4","arch_tag":"arm64"}]' ;;
+            *) echo "Unsupported arch: $ARCH" >&2; exit 1 ;;
+          esac
+          echo "arch_matrix=$archs" >> "$GITHUB_OUTPUT"
+          echo "Computed architecture matrix: $archs"
+
   build-push-digest:
 
     name: Build ${{ matrix.arch_tag }}
-    if: ${{ inputs.arch == 'both' || inputs.arch == matrix.arch_tag }}
+    needs: prepare-arch-matrix
     runs-on: ${{ matrix.runner }}
     container:
-      image: swr.cn-north-12.myhuaweicloud.com/base_image/ascend-ci/cann:9.1.0-${{ inputs.device == 'a5' && '950' || inputs.device }}-ubuntu22.04-py3.12
+      image: swr.cn-north-12.myhuaweicloud.com/base_image/ascend-ci/cann:9.1.0-${{ inputs.soc }}-ubuntu22.04-py3.12
     #   image: swr.cn-south-1.myhuaweicloud.com/ascendhub/cann:9.1.0-a3-ubuntu22.04-py3.12
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - platform: linux/amd64
-            runner: linux-amd64-cpu-4
-            arch_tag: amd64
-          - platform: linux/arm64
-            runner: linux-aarch64-cpu-4
-            arch_tag: arm64
+        include: ${{ fromJSON(needs.prepare-arch-matrix.outputs.arch_matrix) }}
 
     steps:
       - name: Pre-config git access token
@@ -126,6 +145,53 @@ jobs:
       #     tool-cache: true
       #     docker-images: false
 
+      - name: Get architecture
+        id: get_arch
+        shell: bash
+        run: |
+          ARCH=$(uname -m)
+          case "$ARCH" in
+            x86_64) echo "arch=X64" >> "$GITHUB_OUTPUT" ;;
+            aarch64) echo "arch=ARM64" >> "$GITHUB_OUTPUT" ;;
+            *) echo "arch=$ARCH" >> "$GITHUB_OUTPUT" ;;
+          esac
+
+      - name: Get Dockerfile base image tag
+        id: get_base_image_tag
+        shell: bash
+        run: |
+          DOCKERFILE="${{ steps.dockerfile.outputs.path }}"
+          BASE_IMAGE_TAG=$(grep -m1 '^FROM' "$DOCKERFILE" | awk -F: '{print $NF}')
+          echo "BASE_IMAGE_TAG=$BASE_IMAGE_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Get csrc hash
+        id: get_csrc_hash
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          cd "$GITHUB_WORKSPACE"
+
+          CSRC_MANIFEST=$(git ls-files -s -- csrc setup.py CMakeLists.txt cmake)
+          if [ -z "$CSRC_MANIFEST" ]; then
+            echo "::error::No tracked csrc inputs found."
+            exit 1
+          fi
+
+          CSRC_HASH=$(printf '%s\n' "$CSRC_MANIFEST" | sha256sum | awk '{print $1}')
+          echo "CSRC_HASH=$CSRC_HASH" >> "$GITHUB_OUTPUT"
+
+      - name: Restore vllm-ascend csrc cache
+        id: cache-csrc
+        uses: runs-on/cache/restore@v5
+        with:
+          path: |
+            vllm_ascend/_cann_ops_custom
+            vllm_ascend/*.so
+            vllm_ascend/lib
+            vllm_ascend/include
+          key: vllm-ascend-build-v2-${{ steps.get_arch.outputs.arch }}-${{ inputs.soc }}-${{ steps.get_base_image_tag.outputs.BASE_IMAGE_TAG }}-${{ steps.get_csrc_hash.outputs.CSRC_HASH }}
+
       - name: Login to Quay (atlas-ci)
         uses: docker/login-action@v4
         with:
@@ -163,11 +229,23 @@ jobs:
           push: true
           outputs: ${{ steps.push-target.outputs.build_output }}
           build-args: |            
+            CANN_QUAY_URL=swr.cn-north-12.myhuaweicloud.com/base_image/ascend-ci/cann
             APTMIRROR=http://cache-service.nginx-pypi-cache.svc.cluster.local:8081
             PIP_INDEX_URL=http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple
             PIP_TRUSTED_HOST=cache-service.nginx-pypi-cache.svc.cluster.local
             PYTORCH_INDEX_URL=http://cache-service.nginx-pypi-cache.svc.cluster.local/whl/cpu
             ASCEND_INDEX_URL=http://cache-service.nginx-pypi-cache.svc.cluster.local/ascend/repos/pypi
             GIT_PROXY=https://gh-proxy.test.osinfra.cn/
-            COMPILE_CUSTOM_KERNELS=1
+            COMPILE_CUSTOM_KERNELS=${{ steps.cache-csrc.outputs.cache-hit == 'true' && '0' || '1' }}
           provenance: false
+
+      - name: Save vllm-ascend csrc cache
+        if: ${{ steps.cache-csrc.outputs.cache-hit != 'true' && !cancelled() }}
+        uses: runs-on/cache/save@v5
+        with:
+          path: |
+            vllm_ascend/_cann_ops_custom
+            vllm_ascend/*.so
+            vllm_ascend/lib
+            vllm_ascend/include
+          key: vllm-ascend-build-v2-${{ steps.get_arch.outputs.arch }}-${{ inputs.soc }}-${{ steps.get_base_image_tag.outputs.BASE_IMAGE_TAG }}-${{ steps.get_csrc_hash.outputs.CSRC_HASH }}

@@ -10,6 +10,9 @@ on:
         options:
           - main
           - dev-DSv4.1
+          - dev-DSv4.1-new
+          - dev-v0.26.0rc2
+          - dev-releases-v0.27.1rc
         default: dev_hy4
       arch:
         description: 'Architecture to build (both / amd64 / arm64)'
@@ -100,8 +103,14 @@ jobs:
           matrix='{"include":['
           separator=''
           for device in "${devices[@]}"; do
+            case "$device" in
+              910b) soc="910b" ;;
+              a3)   soc="a3" ;;
+              a5)   soc="950" ;;
+              310p) soc="310p" ;;
+            esac
             for operating_system in "${operating_systems[@]}"; do
-              matrix+="${separator}{\"device\":\"${device}\",\"os\":\"${operating_system}\"}"
+              matrix+="${separator}{\"device\":\"${device}\",\"os\":\"${operating_system}\",\"soc\":\"${soc}\"}"
               separator=','
             done
           done
@@ -121,6 +130,7 @@ jobs:
     with:
       device: ${{ matrix.device }}
       os: ${{ matrix.os }}
+      soc: ${{ matrix.soc }}
       release_tag: ${{ inputs.release_tag }}
       source_ref: ${{ inputs.source_branch }}
       quay_username: ${{ vars.QUAY_USER_NAME }}
