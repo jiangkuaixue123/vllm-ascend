@@ -13,6 +13,7 @@ on:
           - dev-DSv4.1-new
           - dev-v0.26.0rc2
           - dev-releases-v0.27.1rc
+          - dev-step4
         default: dev_hy4
       arch:
         description: 'Architecture to build (both / amd64 / arm64)'
