@@ -140,3 +140,4 @@ jobs:
     secrets:
       QUAY_TOKEN: ${{ secrets.QUAY_TOKEN }}
       QUAY_ATLAS_TOKEN: ${{ secrets.QUAY_ATLAS_TOKEN }}
+      GIT_TOKEN: ${{ secrets.GITHUB_TOKEN }}

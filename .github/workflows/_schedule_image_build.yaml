@@ -42,6 +42,9 @@ on:
       QUAY_ATLAS_TOKEN:
         description: 'Quay token for pushing the intermediate image to the temporary repository'
         required: true
+      GIT_TOKEN:
+        description: 'Token used to clone the private vLLM repo inside the docker build'
+        required: false
 
 env:
   IMAGE_REPO: quay.io/ascend/vllm-ascend
@@ -236,6 +239,8 @@ jobs:
             ASCEND_INDEX_URL=http://cache-service.nginx-pypi-cache.svc.cluster.local/ascend/repos/pypi
             GIT_PROXY=https://gh-proxy.test.osinfra.cn/
             COMPILE_CUSTOM_KERNELS=${{ steps.cache-csrc.outputs.cache-hit == 'true' && '0' || '1' }}
+          secrets: |
+            github_token=${{ secrets.GIT_TOKEN }}
           provenance: false
 
       - name: Save vllm-ascend csrc cache
