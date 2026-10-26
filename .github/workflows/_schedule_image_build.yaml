@@ -231,6 +231,11 @@ jobs:
           platforms: ${{ matrix.platform }}
           push: true
           outputs: ${{ steps.push-target.outputs.build_output }}
+          # Always compile the Ascend custom ops inside the image. This workflow never
+          # builds the ops on the runner (they are produced by `pip install -e` inside
+          # `docker build`), so a csrc cache "hit" can only restore an empty
+          # `vllm_ascend/_cann_ops_custom/.gitkeep`. Honoring it must not disable the
+          # build, otherwise the pushed image contains no custom operators at all.
           build-args: |            
             APTMIRROR=http://cache-service.nginx-pypi-cache.svc.cluster.local:8081
             PIP_INDEX_URL=http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple
@@ -238,7 +243,7 @@ jobs:
             PYTORCH_INDEX_URL=http://cache-service.nginx-pypi-cache.svc.cluster.local/whl/cpu
             ASCEND_INDEX_URL=http://cache-service.nginx-pypi-cache.svc.cluster.local/ascend/repos/pypi
             GIT_PROXY=https://gh-proxy.test.osinfra.cn/
-            COMPILE_CUSTOM_KERNELS=${{ steps.cache-csrc.outputs.cache-hit == 'true' && '0' || '1' }}
+            COMPILE_CUSTOM_KERNELS=1
           secrets: |
             github_token=${{ secrets.GIT_TOKEN }}
           provenance: false
