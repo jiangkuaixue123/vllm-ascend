@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Set MODEL_PATH to the indexed DeepSeek V4.1 Flash W8A8 checkpoint on a 16-die A3."""
 
+import base64
+import io
 import json
 import os
 import time
@@ -10,6 +12,7 @@ from pathlib import Path
 
 import pytest
 import requests
+from PIL import Image
 from prometheus_client.parser import text_string_to_metric_families
 
 from tests.e2e.conftest import RemoteOpenAIServer
@@ -91,3 +94,81 @@ def test_dspark_greedy_matches_target_with_sequence_parallelism(record_property)
                 assert 0 < accepted <= proposed
                 record_property("accepted_draft_fraction", accepted / proposed)
     assert outputs[0] == outputs[1]
+
+
+def test_image_prefix_reuse_with_dspark():
+    model_dir = Path(os.getenv("MODEL_PATH", ""))
+    template = Path(os.getenv("CHAT_TEMPLATE", model_dir / "chat_template.jinja"))
+    if not (model_dir / "quant_model_weights.safetensors.index.json").is_file() or not template.is_file():
+        pytest.skip("Requires V4.1 W8A8 MODEL_PATH and its official CHAT_TEMPLATE")
+    args = [
+        "--served-model-name",
+        "v41",
+        "--tensor-parallel-size",
+        "8",
+        "--data-parallel-size",
+        "2",
+        "--enable-expert-parallel",
+        "--enable-prefix-caching",
+        "--enable-prompt-tokens-details",
+        "--max-model-len",
+        "512",
+        "--max-num-batched-tokens",
+        "128",
+        "--max-num-seqs",
+        "8",
+        "--additional-config",
+        json.dumps(PARALLEL_FLAGS),
+        "--compilation-config",
+        json.dumps({"mode": 0, "cudagraph_mode": "FULL_DECODE_ONLY", "cudagraph_capture_sizes": [24, 48]}),
+        "--speculative-config",
+        json.dumps({"method": "dspark", "num_speculative_tokens": 5}),
+        "--chat-template",
+        str(template),
+        "--chat-template-content-format",
+        "openai",
+        "--limit-mm-per-prompt",
+        '{"image":1}',
+    ]
+    question = "This task concerns the image above. " * 21
+    question += "What is the single color filling this image? Answer in one English word."
+    with RemoteOpenAIServer(str(model_dir), args, server_host="127.0.0.1", max_wait_seconds=2400) as server:
+        for color in ("red", "blue"):
+            stream = io.BytesIO()
+            Image.new("RGB", (224, 224), color).save(stream, "PNG")
+            uri = "data:image/png;base64," + base64.b64encode(stream.getvalue()).decode()
+            rows = []
+            for _ in range(2):
+                response = requests.post(
+                    server.url_for("v1", "chat", "completions"),
+                    headers={"X-data-parallel-rank": "0"},
+                    json={
+                        "model": "v41",
+                        "temperature": 0,
+                        "max_tokens": 12,
+                        "return_token_ids": True,
+                        "chat_template_kwargs": {"enable_thinking": False},
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "image_url", "image_url": {"url": uri}},
+                                    {
+                                        "type": "text",
+                                        "text": question,
+                                    },
+                                ],
+                            }
+                        ],
+                    },
+                    timeout=450,
+                )
+                response.raise_for_status()
+                rows.append(response.json())
+            cold, hot = rows
+            assert color in (cold["choices"][0]["message"]["content"] or "").lower()
+            assert cold["choices"][0]["token_ids"] == hot["choices"][0]["token_ids"]
+            assert (
+                hot["usage"]["prompt_tokens_details"]["cached_tokens"]
+                > cold["usage"]["prompt_tokens_details"]["cached_tokens"]
+            )

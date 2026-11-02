@@ -25,12 +25,13 @@ from .attention import (
     RequestSpan,
     rotary_frequencies,
 )
-from .attention_ops import fp8_quant_dequant, sparse_attn
+from .attention_ops import fp8_quant_dequant
 from .core import hc_pre, make_identity_pre_mix
 from .engram import IndexedMmapStore
 from .fused_weights import load_indexed_v41_weights
 from .model import DeepseekV41Block, read_parameter_slice
 from .moe import DeepseekV41MoE
+from .native_attention import DeepseekV41NativeAttention
 
 
 class DSparkMetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
@@ -84,12 +85,14 @@ def ring_positions(context_length, window_size, *, device):
     return context_length - 1 - (context_length - 1 - slots).remainder(window_size)
 
 
-def block_attention(q, context_kv, query_kv, sink, scale):
+def block_attention(q, context_kv, query_kv, sink, scale, kernel=None):
     """Every query sees the accepted context and every KV of its *own* block."""
     kv = torch.cat((context_kv, query_kv), dim=0).unsqueeze(0)
     indices = torch.arange(kv.shape[1], dtype=torch.int32, device=q.device)
     indices = indices.view(1, 1, -1).expand(1, q.shape[0], -1)
-    return sparse_attn(q.unsqueeze(0), kv, sink, indices, scale)[0]
+    if kernel is None:
+        kernel = DeepseekV41NativeAttention()
+    return kernel(q.unsqueeze(0), kv, sink, indices, scale, mode="SWA draft bidirectional")[0]
 
 
 def is_draft_dummy():
@@ -112,6 +115,7 @@ class DSparkAttention(DeepseekV41Attention):
         self.heads = self.local_heads = config.num_attention_heads // self.tp
         self.groups = config.o_groups // self.tp
         self.dsa_cp = False
+        self.attention_kernel = DeepseekV41NativeAttention()
         self.sequence_group = None
         self.dim = config.head_dim
         self.rope_dim = config.qk_rope_head_dim
@@ -181,7 +185,9 @@ class DSparkAttention(DeepseekV41Attention):
                 history = ring_positions(span.start_pos, self.config.sliding_window, device=q.device)
                 context = self.cache.read(metadata, row, history, 0, 0, self.dim).to(hidden.dtype)
                 rows = slice(span.begin, span.end)
-                attended[rows] = block_attention(q[rows], context, query_kv[rows], self.attn_sink, self.dim**-0.5)
+                attended[rows] = block_attention(
+                    q[rows], context, query_kv[rows], self.attn_sink, self.dim**-0.5, self.attention_kernel
+                )
         self.rotate(attended.unsqueeze(0), positions, inverse=True)
         return self._project_output(attended, hidden.dtype)
 

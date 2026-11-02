@@ -228,7 +228,7 @@ class DeepseekV41MoECommunication:
 
 
 class DeepseekV41Gate(nn.Module):
-    def __init__(self, config: DeepseekV41TextConfig):
+    def __init__(self, config: DeepseekV41TextConfig, *, vision_routing: bool = False):
         super().__init__()
         if config.scoring_func != "sqrtsoftplus" or config.topk_method != "noaux_tc":
             raise ValueError("V4.1 text routing requires sqrtsoftplus/noaux_tc")
@@ -245,15 +245,32 @@ class DeepseekV41Gate(nn.Module):
             requires_grad=False,
         )
 
+        self.bias_vl = nn.Parameter(torch.empty_like(self.bias), requires_grad=False) if vision_routing else None
+
     def logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if not hidden_states.shape[0]:
             return self.weight.new_empty((0, self.weight.shape[0]))
         return F.linear(hidden_states.float(), self.weight)
 
+    def routing_logits(self, states, *, decode, image_mask):
+        logits = self.logits(states)
+        if self.bias_vl is None or decode:
+            return logits
+        # Gather the modality alongside the token's router logits so it follows
+        # exactly the same EP gather, including padding on an idle DP replica.
+        if image_mask is None:
+            image_mask = logits.new_zeros(logits.shape[0])
+        return torch.cat((logits, image_mask.reshape(-1, 1).to(logits.dtype)), dim=-1)
+
     def select_experts(self, hidden_states, gating_output, topk, renormalize):
+        bias = self.bias
+        if self.bias_vl is not None and gating_output.shape[-1] == bias.numel() + 1:
+            logits, modality = gating_output.split((bias.numel(), 1), dim=-1)
+            gating_output = logits
+            bias = torch.where(modality.bool(), self.bias_vl, bias)
         return route_sqrtsoftplus(
             gating_output,
-            self.bias,
+            bias,
             topk,
             renormalize,
             self.scaling_factor,
@@ -309,6 +326,7 @@ class DeepseekV41MoE(nn.Module):
         prefix: str,
         *,
         communication: PackedMoECommunication | None = None,
+        vision_routing: bool = False,
     ):
         super().__init__()
         if config.n_shared_experts != 1 or config.hidden_act != "silu":
@@ -345,7 +363,7 @@ class DeepseekV41MoE(nn.Module):
             self.expert_ids.start,
             self.expert_ids.stop,
         )
-        self.gate = DeepseekV41Gate(config)
+        self.gate = DeepseekV41Gate(config, vision_routing=vision_routing)
         if self.use_fused_runner:
             # Import the registered Ascend ops in the worker process only.
             from .fused_moe import build_fused_experts
@@ -378,7 +396,7 @@ class DeepseekV41MoE(nn.Module):
             tuple(self.shared_experts.w2.weight.shape),
         )
 
-    def _routed_output(self, states: torch.Tensor, *, decode: bool) -> torch.Tensor:
+    def _routed_output(self, states: torch.Tensor, *, decode: bool, image_mask=None) -> torch.Tensor:
         comm = self.communication
         if self.use_fused_runner:
             logger.info_once(
@@ -389,20 +407,32 @@ class DeepseekV41MoE(nn.Module):
                 decode,
                 scope="process",
             )
-            output = self.experts(hidden_states=states, router_logits=self.gate.logits(states))
+            logits = self.gate.routing_logits(states, decode=decode, image_mask=image_mask)
+            output = self.experts(hidden_states=states, router_logits=logits)
             if output.shape != states.shape:
                 raise RuntimeError(f"V4.1 fused MoE returned {output.shape} for local token shard {states.shape}")
             return output.float()
+        reference_image_routing = self.gate.bias_vl is not None and not decode
+        if reference_image_routing:
+            row_types = states.new_zeros(states.shape[0]) if image_mask is None else image_mask
+            states_to_gather = torch.cat((states, row_types.reshape(-1, 1).to(states.dtype)), dim=1)
+        else:
+            states_to_gather = states
         if comm.sequence_parallel:
             logger.info_once("V4.1 MoE executing sequence-parallel EP gather/reduce-scatter")
-            gathered = comm.gather_sequence(states, fixed=decode)
+            gathered = comm.gather_sequence(states_to_gather, fixed=decode)
         elif decode:
-            gathered = comm.gather_decode(states)
+            gathered = comm.gather_decode(states_to_gather)
         else:
-            gathered, counts = comm.gather(states)
+            gathered, counts = comm.gather(states_to_gather)
         if gathered.shape[0] == 0:
             return states.float()
-        weights, indices = self.gate(gathered)
+        if reference_image_routing:
+            gathered, mask = gathered.split((self.hidden_size, 1), dim=1)
+            logits = self.gate.routing_logits(gathered, decode=False, image_mask=mask)
+            weights, indices = self.gate.select_experts(gathered, logits, self.gate.top_k, self.gate.renormalize)
+        else:
+            weights, indices = self.gate(gathered)
         evaluate = local_decode_contributions if decode else local_expert_contributions
         partial = evaluate(gathered, weights, indices, self.experts, self.expert_ids)
         if comm.sequence_parallel:
@@ -419,10 +449,10 @@ class DeepseekV41MoE(nn.Module):
             logger.info_once("V4.1 MoE executing replicated shared expert on TP token shards")
         return comm.shared_output(self.shared_experts(comm.shared_input(states)), states.shape[0])
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, image_mask=None) -> torch.Tensor:
         if hidden_states.ndim != 2 or hidden_states.shape[1] != self.hidden_size:
             raise ValueError("V4.1 MoE requires packed [tokens, hidden_size] inputs")
-        output = self._routed_output(hidden_states, decode=False)
+        output = self._routed_output(hidden_states, decode=False, image_mask=image_mask)
         if hidden_states.shape[0] > 0:
             output = output + self._shared_output(hidden_states).float()
         return output.to(hidden_states.dtype)

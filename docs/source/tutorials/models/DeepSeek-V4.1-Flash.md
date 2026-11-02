@@ -2,7 +2,7 @@
 
 ## 简介
 
-本教程部署 DeepSeek-V4.1-Flash 的 40 层文本模型。实测使用 Atlas A3 单机 16 个 NPU die，每个 die 配备 64 GiB HBM，权重为 Ascend W8A8 动态量化检查点。模型保留 384 个路由专家，每个 token 选择 6 个，并在第 1、14 层使用 Engram。官方参考版本为 `314113f8a7dadb388215396ba5fbee2c610a04d6`。[模型与配置](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/tree/314113f8a7dadb388215396ba5fbee2c610a04d6)
+本教程部署 DeepSeek-V4.1-Flash 的 40 层语言模型和 32 层图像 encoder。实测使用 Atlas A3 单机 16 个 NPU die，每个 die 配备 64 GiB HBM，权重为 Ascend W8A8 动态量化检查点。模型保留 384 个路由专家，每个 token 选择 6 个，并在第 1、14 层使用 Engram。官方参考版本为 `314113f8a7dadb388215396ba5fbee2c610a04d6`。[模型与配置](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/tree/314113f8a7dadb388215396ba5fbee2c610a04d6)
 
 ## 支持情况
 
@@ -16,7 +16,9 @@
 | DSA-CP | 在各 TP rank 的本地 token 上计算完整查询头，使用 all-to-all 转换为输出投影的分头布局。该开关会启用序列并行 |
 | 共享专家 DP | 各 TP rank 加载完整共享专家并处理不同 token。三开关联合在 TP8 / DP2 / EP16 下完成 21 条合成请求的逐 token 对照 |
 | DSpark | 读取检查点中的三层草稿、独立 embedding 和输出头。草稿在 eager 下提议 5 个 token，目标模型按 6 个位置校验 |
-| 图片输入 | 本次验证范围仅含文本 |
+| 图片输入 | ViT、aligner 和图像分隔符从 W8A8 检查点的 BF16 张量加载。可通过聊天 API 的 `image_url` 内容块提供图片 |
+| 前缀缓存 | 同图与文本的 prompt 可复用目标和草稿的已完成 KV 块。Engram 按页恢复历史，图像行会打断相邻的文本 n-gram |
+| A3 注意力算子 | SWA 和 DSA 使用 `npu_sparse_attn_sharedkv`。V4.1 的 1×/2× 压缩候选与窗口 token 一起进入显式 slot 模式，使用一次联合 softmax。DSpark 的草稿块保留块内双向注意力 |
 
 ## 环境准备
 
@@ -115,13 +117,32 @@ curl --fail --noproxy '*' http://127.0.0.1:8000/v1/chat/completions \
 
 在纯插件服务中，文本补全 `The capital of France is` 返回 `Paris.`。图模式的中文、多轮和流式请求均返回 HTTP 200，多轮算术回答 `14`，流式回答正常结束。模型在 decode 期间实际重放了 ACLGraph。
 
+## 图像输入与前缀缓存
+
+以下配置用于短请求验证。3 个开关同时打开，DSpark 每次提出 5 个 token。原生注意力在 A3 上使用插件随附的 CANN 自定义算子。目标 decode 使用 24、48 两个图尺寸，prefill 和草稿使用 eager。
+
+```bash
+cd /workspace
+vllm serve "$MODEL_PATH" \
+  --served-model-name dsv41-0day --host 127.0.0.1 --port 8000 \
+  --tensor-parallel-size 8 --data-parallel-size 2 --enable-expert-parallel \
+  --max-model-len 512 --max-num-batched-tokens 128 --max-num-seqs 8 \
+  --enable-prefix-caching --enable-prompt-tokens-details --limit-mm-per-prompt '{"image":1}' \
+  --chat-template "$CHAT_TEMPLATE" --chat-template-content-format openai --reasoning-parser deepseek_v3 \
+  --compilation-config '{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[24,48]}' \
+  --additional-config '{"enable_dsa_cp":true,"enable_flashcomm1":true,"enable_shared_expert_dp":true}' \
+  --speculative-config '{"method":"dspark","num_speculative_tokens":5}'
+```
+
+通过 `/v1/chat/completions` 发送带 `image_url` 和 `text` 的用户消息。processor 根据图片几何尺寸展开占位符，encoder 输出包含每行的换行向量和起止向量。检查前缀命中时，将重复请求发往相同的 DP，比较响应中的 `usage.prompt_tokens_details.cached_tokens` 和贪心输出 token。选择足够长的 prompt，使其除 DSpark 校验预留外还包含可复用的完整 KV 块。
+
 ## 准确率评测
 
 | 数据集 | 样本数 | 协议 | 准确率 |
 | --- | ---: | --- | --- |
 | GPQA Diamond | 198 | 零样本，seed 0，temperature 0，top-p 1，最大输出 16,384 token，并发 16 | 本轮已停止，完整准确率为空 |
 
-使用数据 revision `56686c06f5e19865c153de0fdb11be3890014df7`，Diamond CSV 的 SHA256 为 `41d1213cd7a4998605a26c2798500652572007161b3a92817ba46b35befcd305`。模板参数为 `enable_thinking=true`、`reasoning_effort=high`。服务端用基线 `deepseek_v3` parser 分离推理和最终回答，评测器只读取最终回答。运行 198 题之前，用非数据集选择题验证了这一边界。固定选项乱序后对 198 题逐题计分，HTTP 错误、截断、无法解析均计错，本轮共发出 33 题，其中 17 题有终态、16 题正确。
+使用数据 revision `56686c06f5e19865c153de0fdb11be3890014df7`，Diamond CSV 的 SHA256 为 `41d1213cd7a4998605a26c2798500652572007161b3a92817ba46b35befcd305`。模板参数为 `enable_thinking=true`、`reasoning_effort=high`。服务端用基线 `deepseek_v3` parser 分离推理和最终回答，评测器只读取最终回答。运行 198 题之前，用非数据集选择题验证了这一边界。固定选项乱序后对 198 题逐题计分，HTTP 错误、截断、无法解析均计错，V005 停测时共发出 33 题，其中 17 题有终态、16 题正确。V006 停测时共发出 52 题，其中 36 题有终态、34 题正确。两轮结果分别保留。
 
 ## 性能与容量
 
@@ -151,3 +172,14 @@ curl --fail --noproxy '*' http://127.0.0.1:8000/v1/chat/completions \
 | 三开关开启，DSpark 开启 | 24 | 59.16 | 964.44 |
 
 相对全关组，三开关加 DSpark 的 TPOT 降低 71.75%。相对只开三项并行优化的组，加入 DSpark 后降低 82.85%。在这条提示的五次正式请求中，草稿共提议 150 个 token，目标接受 150 个。目标端实际重放了 24 行图，其中有 6 个活跃校验位置。
+
+### A3 原生 SWA 和 DSA 的单请求性能
+
+在上文图像与前缀缓存的部署配置下，对照组和原生算子组均使用 Ascend fused MoE、三个并行开关及 DSpark5。固定相同的 20 个输入 token、32 个贪心输出 token，预热一次后串行测五次。两组每次生成的 token ID 完全一致。
+
+| 注意力实现 | TPOT 中位数（ms/token） | TPOT 范围（ms/token） | TTFT 中位数（ms） |
+| --- | ---: | ---: | ---: |
+| 插件原注意力 | 58.51 | 58.28–61.80 | 968.27 |
+| A3 原生 SWA 和 DSA | 43.38 | 43.11–43.94 | 812.37 |
+
+原生算子使该负载的 TPOT 降低 15.13 ms/token（25.86%）。两个 DP 都捕获了 24、48 行 FULL decode 图。单请求阶段记录到 24 行图的重放，6 行活跃，5 次正式请求的 150 个提议均被接受。图像与长文本另行验证了前缀缓存，同一 DP 上重复请求命中 128 个 token，换图或换 DP 首次请求命中 0 个 token。

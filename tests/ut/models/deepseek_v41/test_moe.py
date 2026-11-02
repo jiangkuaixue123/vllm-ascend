@@ -559,3 +559,23 @@ def test_fused_runner_restores_outer_comm_on_failure(monkeypatch):
     with pytest.raises(RuntimeError, match="test dispatch failed"):
         real.forward(torch.empty(0))
     assert forward.moe_comm_method is outer and forward.moe_comm_type == "outer"
+
+
+def test_modality_after_ep_gather_changes_selection_but_not_routing_scores():
+    config = tiny_config()
+    config.num_experts_per_tok = 1
+    gate = moe.DeepseekV41Gate(config, vision_routing=True)
+    with torch.no_grad():
+        gate.weight.fill_(1)
+        gate.bias.zero_()
+        gate.bias[0] = 3
+        gate.bias_vl.zero_()
+        gate.bias_vl[1] = 5
+    inputs = torch.ones(2, config.hidden_size)
+    mask = torch.tensor([False, True])
+    logits = gate.routing_logits(inputs, decode=False, image_mask=mask)
+    weights, indices = gate.select_experts(inputs, logits.flip(0), 1, False)
+    assert indices.flatten().tolist() == [1, 0]
+    torch.testing.assert_close(weights[0], weights[1])
+    assert gate.routing_logits(inputs, decode=True, image_mask=None).shape[-1] == config.n_routed_experts
+    assert gate.routing_logits(inputs[:0], decode=False, image_mask=None).shape == (0, config.n_routed_experts + 1)

@@ -279,6 +279,19 @@ class EngramHasher:
             raise ValueError("Missing or excessive request lookback history")
         return EngramRequestState(position, tuple(history), self.signature)
 
+    def restore_paged_state(self, history_ids, *, position: int) -> EngramRequestState:
+        # A masked image row occupies a real KV slot. Its sentinel breaks
+        # the n-gram even after the original image request has left the batch.
+        history = _cpu_ids(history_ids)
+        if DEAD_TOKEN not in history:
+            return self.new_state(history, position=position)
+        text = [token != DEAD_TOKEN for token in history]
+        return self.new_state(
+            [token if live else 0 for token, live in zip(history, text)],
+            position=position,
+            history_mask=text,
+        )
+
     def hash_tokens(
         self,
         token_ids: Sequence[int] | torch.Tensor,

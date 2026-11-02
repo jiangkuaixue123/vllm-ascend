@@ -202,7 +202,7 @@ def paged_hash_model():
     return model
 
 
-def hash_batch(model, ids, spans, block_tables):
+def hash_batch(model, ids, spans, block_tables, image_mask=None):
     cache = model.layers[0].attn.cache
     tables = torch.tensor(block_tables, dtype=torch.int32)
     slots = []
@@ -213,7 +213,7 @@ def hash_batch(model, ids, spans, block_tables):
         )
     metadata = DeepseekV41Metadata(spans, tables, torch.cat(slots), ids.numel())
     runtime = DeepseekV41Runtime(spans)
-    return model._hash_tokens(ids, runtime, metadata), metadata
+    return model._hash_tokens(ids, runtime, metadata, image_mask), metadata
 
 
 def test_model_hash_restores_bounded_raw_history_across_pages_and_reordered_batch(paged_hash_model, monkeypatch):
@@ -550,3 +550,38 @@ def test_dspark_graph_hash_discards_rejected_suffix(staged_hash_model):
         expected = model.engram_hasher.hash_tokens(previous, model.engram_hasher.new_state(), start_position=0)[-6:]
         for layer_id in model.engram_layer_ids:
             torch.testing.assert_close(model._decode_engram_values[6, layer_id], expected[:, layer_id])
+
+
+def test_image_prefix_keeps_engram_boundary_after_request_eviction(paged_hash_model):
+    model = paged_hash_model
+    prefix = torch.tensor([1, 4, 4, 4])
+    flags = torch.tensor([False, True, True, True])
+    _, metadata = hash_batch(model, prefix, [RequestSpan(0, 4, 4)], [[3, 7]], flags)
+    cache = model.layers[0].attn.cache
+    history_column = cache.dim + cache.index_dim
+    stored = cache.read(metadata, 0, torch.arange(4), 1, history_column, 1).flatten().long()
+    assert stored.tolist() == [1, -1, -1, -1]
+    # A fresh request reuses the full physical prefix, then adds text whose
+    # token id happens to equal the one used for the previous image.
+    suffix = torch.tensor([4, 2, 3])
+    actual, _ = hash_batch(model, suffix, [RequestSpan(0, 3, 7)], [[3, 7, 1, 2]])
+    expected = model.engram_hasher.hash_tokens(
+        torch.cat((prefix, suffix)),
+        model.engram_hasher.new_state(),
+        start_position=0,
+        token_mask=[True, False, False, False, True, True, True],
+    )
+    torch.testing.assert_close(actual, expected[-3:])
+
+
+def test_embedding_merge_uses_scheduler_span_not_vocabulary_id(paged_hash_model):
+    model = paged_hash_model
+    ids = torch.tensor([3, 3, 3, 3])
+    original = model.embed_input_ids(ids).clone()
+    features = torch.arange(8).float().reshape(2, 4)
+    mask = torch.tensor([False, True, True, False])
+    merged = model.embed_input_ids(ids, [features], is_multimodal=mask)
+    torch.testing.assert_close(merged[mask], features)
+    torch.testing.assert_close(merged[~mask], original[~mask])
+    with pytest.raises(ValueError, match="span mask"):
+        model.embed_input_ids(ids, [features])

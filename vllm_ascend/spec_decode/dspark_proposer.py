@@ -454,6 +454,20 @@ class AscendDeepseekV41DSparkProposer(AscendDSparkProposer):
         self._context_slot_mapping_buffers = None
         return super().dummy_run(*args, **kwargs)
 
+    def store_skipped_target_context(self, aux_hidden_states, positions):
+        """Populate draft KV for newly computed target slots when this batch cannot propose."""
+        count = positions.numel()
+        if not count:
+            return
+        if positions.ndim != 1 or not aux_hidden_states or any(h.shape[0] < count for h in aux_hidden_states):
+            raise ValueError("V4.1 skipped draft context needs aligned target positions and auxiliary states")
+        # Each stage can have a different physical pool. Slot mappings describe
+        # only scheduled target rows, never the cached prefix of the request.
+        slots = [self._per_group_slot_mappings[gid][:count] for gid in self._layer_group_idx]
+        hidden = torch.cat([value[:count] for value in aux_hidden_states], dim=-1)
+        context = self._combine_target_hidden_states(self.model, hidden)
+        self.model.precompute_and_store_context_kv(context, positions, slots)
+
     def _combine_target_hidden_states(self, model, hidden_states):
         logger.info_once("V4.1 DSpark projecting target auxiliary states for block proposal")
         return model.combine_hidden_states(hidden_states)

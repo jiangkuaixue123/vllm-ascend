@@ -30,6 +30,8 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from vllm.model_executor.models.interfaces import SupportsMultiModal
+from vllm.model_executor.models.utils import _merge_multimodal_embeddings
 
 from vllm_ascend.models.common.ops.sequence_parallel import sp_all_gather, sp_shard
 from vllm_ascend.models.deepseek_v41.attention import (
@@ -45,6 +47,7 @@ from vllm_ascend.models.deepseek_v41.core import (
     make_identity_pre_mix,
 )
 from vllm_ascend.models.deepseek_v41.engram import (
+    DEAD_TOKEN,
     DeepseekV41Engram,
     EngramHasher,
     EngramLayout,
@@ -53,6 +56,8 @@ from vllm_ascend.models.deepseek_v41.engram import (
 )
 from vllm_ascend.models.deepseek_v41.fused_weights import load_indexed_v41_weights
 from vllm_ascend.models.deepseek_v41.moe import DeepseekV41MoE
+from vllm_ascend.models.deepseek_v41.processor import register_vision_processor
+from vllm_ascend.models.deepseek_v41.vision import embed_images, init_vision_modules
 from vllm_ascend.utils import enable_dsa_cp, enable_sp, shared_expert_dp_enabled
 
 MAX_DECODE_GRAPH_ROWS = 8
@@ -98,7 +103,12 @@ class DeepseekV41Block(nn.Module):
         self.config = config
         prefix = f"layers.{layer_id}"
         self.attn = DeepseekV41Attention(config, vllm_config, layer_id, f"{prefix}.attn")
-        self.ffn = DeepseekV41MoE(config, vllm_config.quant_config, f"{prefix}.ffn")
+        self.ffn = DeepseekV41MoE(
+            config,
+            vllm_config.quant_config,
+            f"{prefix}.ffn",
+            vision_routing=getattr(vllm_config.model_config.hf_config, "vision_config", None) is not None,
+        )
         self.attn_norm = DeepseekV41RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.ffn_norm = DeepseekV41RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.engram = None
@@ -122,7 +132,7 @@ class DeepseekV41Block(nn.Module):
             self.config.hc_sinkhorn_iters,
         )
 
-    def forward(self, hidden_states, pre_mix, runtime, decode_mask=None):
+    def forward(self, hidden_states, pre_mix, runtime, decode_mask=None, image_mask=None):
         if hidden_states.shape[0] == 0:
             # Other DP replicas can be active. Participate in every expert
             # collective while avoiding empty NPU GEMMs and TP reductions.
@@ -135,6 +145,8 @@ class DeepseekV41Block(nn.Module):
         ffn_input = self.ffn_norm(hc_pre(hidden_states, attn_pre))
         if getattr(runtime, "decode", None) is not None:
             output = self.ffn.forward_decode(ffn_input, runtime.decode.active if decode_mask is None else decode_mask)
+        elif image_mask is not None:
+            output = self.ffn(ffn_input, image_mask=image_mask)
         else:
             output = self.ffn(ffn_input)
         return hc_post(output, hidden_states, post, comb), ffn_pre
@@ -173,7 +185,10 @@ def read_parameter_slice(reader, key, parameter, module, tp_rank, tp_size):
     parameter.copy_(value)
 
 
-class DeepseekV41ForCausalLM(nn.Module):
+@register_vision_processor
+class DeepseekV41ForCausalLM(nn.Module, SupportsMultiModal):
+    requires_raw_input_tokens = True
+    requires_image_token_mask = True
     supports_eagle3 = True
     has_own_lm_head = True
     has_own_embed_tokens = True
@@ -207,6 +222,10 @@ class DeepseekV41ForCausalLM(nn.Module):
         )
         self._decode_engram_values: dict[tuple[int, int], torch.Tensor] = {}
         config = self.config
+        hf_config = vllm_config.model_config.hf_config
+        if getattr(hf_config, "vision_config", None) is not None:
+            with self._mark_tower_model(vllm_config, "image"):
+                init_vision_modules(self, hf_config)
         self.embed = VocabParallelEmbedding(config.vocab_size, config.hidden_size, prefix="embed")
         self.layers = nn.ModuleList(
             [DeepseekV41Block(config, vllm_config, layer_id) for layer_id in range(config.num_hidden_layers)]
@@ -320,10 +339,27 @@ class DeepseekV41ForCausalLM(nn.Module):
             engram.set_rotation_contract("external")
         logger.info("V4.1 Engram uses shared FP32 query inverse rotation; value is pre-rotated")
 
-    def embed_input_ids(self, input_ids):
-        return self.embed(input_ids)
+    def get_language_model(self):
+        return self
 
-    def _hash_tokens(self, input_ids, runtime, metadata):
+    @classmethod
+    def get_placeholder_str(cls, modality: str, i: int):
+        if modality == "image":
+            return "<｜deepseek_image｜>"
+        raise ValueError(f"V4.1 does not support {modality} input")
+
+    def embed_multimodal(self, **kwargs):
+        return embed_images(self, **kwargs)
+
+    def embed_input_ids(self, input_ids, multimodal_embeddings=None, *, is_multimodal=None):
+        embedded = self.embed(input_ids)
+        if not multimodal_embeddings:
+            return embedded
+        if is_multimodal is None:
+            raise ValueError("V4.1 image embeddings require the scheduled image span mask")
+        return _merge_multimodal_embeddings(embedded, multimodal_embeddings, is_multimodal)
+
+    def _hash_tokens(self, input_ids, runtime, metadata, image_mask=None):
         if self.engram_hasher is None:
             return None
         if not runtime.requests:
@@ -337,6 +373,7 @@ class DeepseekV41ForCausalLM(nn.Module):
         history_column = cache.dim + cache.index_dim
         hashes = []
         cpu_ids = input_ids.cpu()
+        text_rows = None if image_mask is None else (~image_mask).tolist()
         for request_idx, request in enumerate(runtime.requests):
             history = []
             if request.start_pos:
@@ -347,16 +384,20 @@ class DeepseekV41ForCausalLM(nn.Module):
                 )
                 history = cache.read(metadata, request_idx, positions, 1, history_column, 1)
                 history = history.flatten().long().cpu()
-            state = self.engram_hasher.new_state(history, position=request.start_pos)
+            state = self.engram_hasher.restore_paged_state(history, position=request.start_pos)
             hashes.append(
                 self.engram_hasher.hash_tokens(
                     cpu_ids[request.begin : request.end],
                     state,
                     start_position=request.start_pos,
+                    token_mask=None if text_rows is None else text_rows[request.begin : request.end],
                 )
             )
         if metadata is not None:
-            cache.write(metadata, input_ids.unsqueeze(-1), 1, history_column)
+            stored = (
+                input_ids if image_mask is None else input_ids.masked_fill(image_mask.to(input_ids.device), DEAD_TOKEN)
+            )
+            cache.write(metadata, stored.unsqueeze(-1), 1, history_column)
         return torch.cat(hashes, dim=0)
 
     def prepare_decode_graph_inputs(self, input_ids, positions, intermediate_tensors=None, inputs_embeds=None) -> int:
@@ -411,7 +452,9 @@ class DeepseekV41ForCausalLM(nn.Module):
                 # On rejection the next query starts at the accepted boundary,
                 # so rejected slots from the preceding step never seed its hash.
                 if row % decode.query_width == 0 or previous != row - 1:
-                    state = self.engram_hasher.new_state(histories[row][-count:] if count else [], position=pos)
+                    state = self.engram_hasher.restore_paged_state(
+                        histories[row][-count:] if count else [], position=pos
+                    )
                 rows.append(self.engram_hasher.hash_tokens([token], state, start_position=pos))
                 previous = row
             hashes = torch.cat(rows, dim=0)
@@ -477,9 +520,9 @@ class DeepseekV41ForCausalLM(nn.Module):
             return output, [torch.where(active, value, 0) for value in auxiliary]
         return output
 
-    def forward(self, input_ids, positions, intermediate_tensors=None, inputs_embeds=None):
+    def forward(self, input_ids, positions, intermediate_tensors=None, inputs_embeds=None, image_token_mask=None):
         if intermediate_tensors is not None or input_ids is None:
-            raise ValueError("V4.1 text path requires token IDs and no pipeline tensors")
+            raise ValueError("V4.1 requires raw token IDs and no pipeline tensors")
         metadata = self.layers[0].attn.cache.metadata()
         if (
             getattr(self, "decode_enabled", False)
@@ -489,7 +532,14 @@ class DeepseekV41ForCausalLM(nn.Module):
         actual_tokens = metadata.num_actual_tokens if metadata else input_ids.numel()
         runtime = DeepseekV41Runtime(metadata.requests if metadata else [RequestSpan(0, actual_tokens, actual_tokens)])
         ids = input_ids[:actual_tokens]
-        hashes = self._hash_tokens(ids, runtime, metadata)
+        image_mask = image_token_mask[:actual_tokens] if image_token_mask is not None else None
+        hashes = self._hash_tokens(ids, runtime, metadata, image_mask)
+        local_image = None
+        local_text = None
+        if image_mask is not None:
+            mask = image_mask.to(ids.device, non_blocking=True)
+            local_image = sp_shard(mask) if self.sequence_parallel else mask
+            local_text = sp_shard(~mask) if self.sequence_parallel else ~mask
         if actual_tokens == 0:
             hidden_states = self.embed.weight.new_empty((0, self.config.hidden_size))
         else:
@@ -499,9 +549,14 @@ class DeepseekV41ForCausalLM(nn.Module):
         for layer_id, layer in enumerate(self.layers):
             if layer.engram is not None and actual_tokens:
                 index = self.engram_layer_ids.index(layer_id)
-                hidden_states = layer.engram(hidden_states, hashes[:, index], sequence_parallel=self.sequence_parallel)
+                hidden_states = layer.engram(
+                    hidden_states, hashes[:, index], token_mask=local_text, sequence_parallel=self.sequence_parallel
+                )
             self._capture_aux(auxiliary, layer_id, hidden_states, actual_tokens)
-            hidden_states, pre_mix = layer(hidden_states, pre_mix, runtime)
+            if local_image is None:
+                hidden_states, pre_mix = layer(hidden_states, pre_mix, runtime)
+            else:
+                hidden_states, pre_mix = layer(hidden_states, pre_mix, runtime, image_mask=local_image)
         output = self._finish_hc(hidden_states, pre_mix, actual_tokens)
         if actual_tokens < input_ids.numel():
             padding = output.new_zeros(input_ids.numel() - actual_tokens, self.config.hidden_size)

@@ -2,9 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Paged V4.1 latent attention with eager prefill and uniform graph decode.
 
-This reference path follows the frozen official V4.1 inference/model.py. Cache
-values retain their quantize/dequantize results in FP32 pages. Decode replay
-uses fixed-address tensor metadata for positions, slots and the live-row mask.
+Cache values retain the official quantize/dequantize results in FP32 pages.
+The A3 BF16 shared-KV operator consumes the selected latent vectors. Decode
+replay updates positions, slots and live-row masks at fixed addresses.
 """
 
 import math
@@ -35,15 +35,15 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 
-from vllm_ascend.utils import enable_dsa_cp, enable_sp
+from vllm_ascend.utils import enable_custom_op, enable_dsa_cp, enable_sp
 
 from .attention_ops import (
     apply_rotary_emb_real,
     fp4_quant_dequant,
     fp8_quant_dequant,
-    sparse_attn,
 )
 from .core import rms_norm
+from .native_attention import DeepseekV41NativeAttention
 
 
 @dataclass(frozen=True)
@@ -106,6 +106,9 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
         self.max_model_len = vllm_config.model_config.max_model_len
         self.block_size = kv_cache_spec.block_size
         self.query_width = 1 + vllm_config.num_speculative_tokens
+        context = vllm_config.compilation_config.static_forward_context
+        self.native_layers = [context[name] for name in layer_names]
+        self.native_decode_plans = {}
 
     def _update_decode(self, common, capture=False, bounds=None):
         if not self.decode_graph_enabled and not capture:
@@ -126,6 +129,13 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
         device = common.seq_lens.device
         width = math.ceil(self.max_model_len / self.block_size)
         if rows not in self.decode_buffers:
+            if device.type == "npu" and self.native_layers:
+                if not enable_custom_op():
+                    raise RuntimeError("V4.1 graph decode requires the Ascend shared-KV custom operator")
+                for layer in self.native_layers:
+                    if layer.native_layout is not None:
+                        kernel, heads, tp, selected = layer.native_layout
+                        kernel.pin_decode_plan(device, heads, rows // tp, selected, self.native_decode_plans)
             self.decode_buffers[rows] = DeepseekV41DecodeMetadata(
                 torch.zeros(rows, dtype=torch.int64, device=device),
                 torch.full((rows,), -1, dtype=torch.int64, device=device),
@@ -226,6 +236,7 @@ class DeepseekV41Cache(nn.Module, AttentionLayerBase):
         self.width = max(2 * self.dim, self.dim + self.index_dim + 1)
         self.block_size = vllm_config.cache_config.block_size
         self.kv_cache = None
+        self.native_layout = None
         context = vllm_config.compilation_config.static_forward_context
         if prefix in context:
             raise ValueError(f"Duplicate cache layer {prefix}")
@@ -449,6 +460,7 @@ class DeepseekV41Attention(nn.Module):
         self.tp = tp
         self.dim = config.head_dim
         self.rope_dim = config.qk_rope_head_dim
+        self.attention_kernel = DeepseekV41NativeAttention()
         self.owns_kv = layer_id in config.kv_source_layer_ids
         self.owns_index = layer_id in config.index_source_layer_ids
         quant_config = vllm_config.quant_config
@@ -502,6 +514,11 @@ class DeepseekV41Attention(nn.Module):
         self.register_buffer(
             "frequencies", rotary_frequencies(config, self.ratio > 0).to(self.attn_sink.device), persistent=False
         )
+        if getattr(vllm_config.compilation_config, "cudagraph_capture_sizes", None):
+            capacity = vllm_config.model_config.max_model_len
+            compressed = min(config.index_topk, capacity // self.ratio) if self.ratio else 0
+            selected_width = min(config.sliding_window, capacity) + compressed
+            self.cache.native_layout = (self.attention_kernel, self.heads, tp if self.dsa_cp else 1, selected_width)
 
     def rotate(self, x, positions, inverse=False):
         phases = positions.float().unsqueeze(-1) * self.frequencies
@@ -728,7 +745,15 @@ class DeepseekV41Attention(nn.Module):
             selected = torch.where(compressed[..., None], comp, selected)
             valid = valid | (compressed & md.active[:, None])
         ids = torch.where(valid, columns, -1).to(torch.int32).unsqueeze(1)
-        attended = sparse_attn(q.unsqueeze(1), selected.to(x.dtype), self.attn_sink, ids, self.dim**-0.5)[:, 0]
+        attended = self.attention_kernel(
+            q.unsqueeze(1),
+            selected.to(x.dtype),
+            self.attn_sink,
+            ids,
+            self.dim**-0.5,
+            mode="DSA target indexed decode" if self.ratio else "SWA target indexed decode",
+            uniform_decode=True,
+        )[:, 0]
         self.rotate(attended.unsqueeze(0), pos, inverse=True)
         output = self._project_output(attended, x.dtype)
         return torch.where(local_md.active[:, None], output, 0)
@@ -795,12 +820,18 @@ class DeepseekV41Attention(nn.Module):
                     -1,
                 )
                 kv = torch.cat((kv, shared.compressed), 0)
-            attended = sparse_attn(
+            else:
+                # The implicit SWA operator aligns Q with the suffix of KV.
+                # A CP shard can end before the last token of this request.
+                kv = kv[: kv.shape[0] - (end - hi)]
+            attended = self.attention_kernel(
                 q.unsqueeze(0),
                 kv.unsqueeze(0),
                 self.attn_sink,
                 indices.int().unsqueeze(0),
                 self.dim**-0.5,
+                mode="DSA target indexed prefill" if self.ratio else "SWA target causal prefill",
+                swa_window=None if self.ratio else self.config.sliding_window,
             )[0]
             self.rotate(attended.unsqueeze(0), positions, inverse=True)
             output[rows] = attended

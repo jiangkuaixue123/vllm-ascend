@@ -213,6 +213,8 @@ class DeepseekV41Config(PretrainedConfig):
                 raise TypeError(f"{name} must be a dict or {config_class.__name__}")
             setattr(self, name, value)
         self.image_token_id = image_token_id
+        # The Ascend speculative proposer reads the target language config.
+        self.text_config.image_token_index = image_token_id
         super().__init__(
             bos_token_id=bos_token_id,
             eos_token_id=eos_token_id,

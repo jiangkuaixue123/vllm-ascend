@@ -2654,6 +2654,13 @@ class NPUModelRunner(GPUModelRunner):
 
         def propose_draft_token_ids(sampled_token_ids):
             if not input_fits_in_drafter:
+                # The target can still finish a reusable prefix block when a
+                # request in this batch has no space for a draft query. Retain
+                # its projected context before doing the separate dummy EP step.
+                if isinstance(self.drafter, AscendDeepseekV41DSparkProposer):
+                    self.drafter.store_skipped_target_context(
+                        aux_hidden_states, self._get_positions(scheduler_output.total_num_scheduled_tokens)
+                    )
                 self._skip_drafting(
                     scheduler_output,
                     sampled_token_ids if use_padded_batch else None,
@@ -3024,6 +3031,22 @@ class NPUModelRunner(GPUModelRunner):
                 self.speculative_config,
             )
 
+    def _gather_mm_embeddings(self, scheduler_output, shift_computed_tokens=0):
+        embeddings, mask = super()._gather_mm_embeddings(scheduler_output, shift_computed_tokens)
+        if not shift_computed_tokens and getattr(self.model, "requires_image_token_mask", False):
+            # _preprocess consumes this same scheduled batch immediately after
+            # embedding its tokens. Preserve the CPU mask for Engram hashing.
+            self._scheduled_image_mask = mask if embeddings else None
+        return embeddings, mask
+
+    def _extract_mm_kwargs(self, scheduler_output):
+        kwargs = super()._extract_mm_kwargs(scheduler_output)
+        image_mask = getattr(self, "_scheduled_image_mask", None)
+        if image_mask is not None:
+            kwargs["image_token_mask"] = image_mask
+            self._scheduled_image_mask = None
+        return kwargs
+
     def _model_forward(
         self,
         num_tokens_padded: int,
@@ -3137,8 +3160,10 @@ class NPUModelRunner(GPUModelRunner):
     ) -> tuple[CUDAGraphMode, BatchDescriptor, bool, torch.Tensor | None, CUDAGraphStat | None]:
         num_tokens_padded = self._pad_for_sequence_parallelism(num_tokens)
         has_initial_state = np.all(self.input_batch.num_computed_tokens_cpu[:num_reqs] > 0)
-        if self.use_dcp:
-            # DCP decode graphs require the full prompt to be computed.
+        if self.use_dcp or getattr(self.model, "requires_image_token_mask", False) is True:
+            # A final prefill chunk can have exactly the speculative query width.
+            # It still needs prompt embeddings and image routing until every
+            # scheduled request has consumed its complete prompt.
             has_initial_state = has_initial_state and np.all(
                 self.input_batch.num_computed_tokens_cpu[:num_reqs] >= self.input_batch.num_prompt_tokens[:num_reqs]
             )
@@ -3849,6 +3874,8 @@ class NPUModelRunner(GPUModelRunner):
             assert num_tokens_padded <= self.max_num_tokens
             if self.supports_mm_inputs and not self.model_config.is_encoder_decoder or self.enable_prompt_embeds:
                 input_ids = None
+                if getattr(self.model, "requires_raw_input_tokens", False):
+                    input_ids = self.input_ids.gpu[:num_tokens_padded]
                 inputs_embeds = self.inputs_embeds.gpu[:num_tokens_padded]
             else:
                 input_ids = self.input_ids.gpu[:num_tokens_padded]

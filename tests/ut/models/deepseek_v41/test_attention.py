@@ -14,6 +14,7 @@ import torch.multiprocessing as mp
 from torch import nn
 
 from vllm_ascend.models.deepseek_v41 import attention
+from vllm_ascend.models.deepseek_v41.attention_ops import sparse_attn
 
 
 @pytest.fixture(params=["cpu", "npu"], autouse=True)
@@ -88,6 +89,9 @@ def make_layer(monkeypatch):
         finally:
             torch.set_default_dtype(previous_dtype)
         generator = torch.Generator(device="cpu").manual_seed(100 + layer_id)
+        # This 32-dimensional fixture exercises model math and page handling.
+        # The native kernel has a separate full-width test on the A3.
+        layer.attention_kernel = lambda q, kv, sink, indices, scale, **kwargs: sparse_attn(q, kv, sink, indices, scale)
         with torch.no_grad():
             for name, parameter in layer.named_parameters():
                 if name.endswith("norm.weight"):
@@ -240,13 +244,13 @@ def test_query_projection_does_not_add_per_head_rmsnorm(make_layer, monkeypatch)
     layer = make_layer(0)
     x = hidden_tokens(1)
     captured = []
-    original = attention.sparse_attn
+    original = layer.attention_kernel
 
     def capture(q, *args, **kwargs):
         captured.append(q.clone())
         return original(q, *args, **kwargs)
 
-    monkeypatch.setattr(attention, "sparse_attn", capture)
+    monkeypatch.setattr(layer, "attention_kernel", capture)
     with torch.no_grad():
         layer.wq_b.weight.mul_(7)
         expected = layer.wq_b(layer.q_norm(layer.wq_a(x)[0]))[0].reshape(1, 1, 2, 32)
@@ -392,6 +396,8 @@ def test_npu_graph_replays_changed_position_page_and_idle_mask(make_layer, tenso
 def test_decode_metadata_replay_changes_values_but_retains_capture_addresses():
     builder = object.__new__(attention.DeepseekV41MetadataBuilder)
     builder.decode_buffers = {}
+    builder.native_layers = []
+    builder.native_decode_plans = {}
     builder.capture_sizes = {1, 2, 4, 8}
     builder.decode_graph_enabled = True
     builder.max_model_len = 16
@@ -428,6 +434,8 @@ def test_decode_metadata_replay_changes_values_but_retains_capture_addresses():
 def test_decode_metadata_buckets_keep_distinct_buffers_and_mask_padding():
     builder = object.__new__(attention.DeepseekV41MetadataBuilder)
     builder.decode_buffers = {}
+    builder.native_layers = []
+    builder.native_decode_plans = {}
     builder.capture_sizes = {1, 2, 4, 8}
     builder.decode_graph_enabled = True
     builder.max_model_len = 16
@@ -741,6 +749,8 @@ def test_dspark_six_token_verify_and_rejection_use_causal_pages(make_layer, rati
     tables = [[0, 2, 4, 6], [1, 3, 5, 7]]
     builder = object.__new__(attention.DeepseekV41MetadataBuilder)
     builder.decode_buffers = {}
+    builder.native_layers = []
+    builder.native_decode_plans = {}
     builder.capture_sizes = {12}
     builder.decode_graph_enabled = True
     builder.query_width = 6
