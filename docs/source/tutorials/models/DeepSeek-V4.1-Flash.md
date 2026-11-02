@@ -183,3 +183,9 @@ vllm serve "$MODEL_PATH" \
 | A3 原生 SWA 和 DSA | 43.38 | 43.11–43.94 | 812.37 |
 
 原生算子使该负载的 TPOT 降低 15.13 ms/token（25.86%）。两个 DP 都捕获了 24、48 行 FULL decode 图。单请求阶段记录到 24 行图的重放，6 行活跃，5 次正式请求的 150 个提议均被接受。图像与长文本另行验证了前缀缓存，同一 DP 上重复请求命中 128 个 token，换图或换 DP 首次请求命中 0 个 token。
+
+### TP4 / DP4 混部的 8192-token 调度预算
+
+在 16 卡 A3 的 TP4 / DP4 / EP16 配置上，开启 `enable_dsa_cp` 和 `enable_shared_expert_dp`，关闭显式 `enable_flashcomm1`。DSA-CP 仍会启用序列并行。配合 DSpark5、前缀缓存、32K 上下文、每个 DP 最多 8 条序列，以及 FULL_DECODE_ONLY 图尺寸 24、48，设置 `--max-num-batched-tokens 8192` 后实测每个 DP 的调度上限为 8160。
+
+大批量 eager prefill 将 MoE 已聚合的专家输入、DSA 查询打分和输出投影输入量化分块计算。四个 DP 各报告 11.14 GiB 可用 KV、33,920 个缓存 token。每个 DP 同时接收一条 8,208-token 合成输入，冷缓存下均跨越调度步，并生成相同的 3 个 token。另一次全局 32 路短请求验证中，四个 DP 均实际重放了 48 行 FULL decode 图。33,920 是每个 DP 全部在途请求共用的 token 容量。

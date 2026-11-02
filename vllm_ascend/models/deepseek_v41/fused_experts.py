@@ -6,8 +6,9 @@ from dataclasses import replace
 
 import torch
 import torch_npu
+from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed import get_ep_group
-from vllm.forward_context import get_forward_context
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import logger
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
@@ -20,6 +21,10 @@ from vllm_ascend.ops.fused_moe.token_dispatcher import TokenDispatcherWithAllGat
 from vllm_ascend.ops.register_custom_ops import ep_pad_and_reduce_scatter
 from vllm_ascend.quantization.method_adapters import AscendFusedMoEMethod
 from vllm_ascend.quantization.quant_type import QuantType
+
+# The native dispatcher allocates one expanded row per (gathered token, route),
+# including remote routes. Bound its local workspace independently of DP and EP.
+MAX_EAGER_ROUTED_TOKENS = 1024
 
 
 def dispatched_scales(row_ids, route_weights, owned, num_rows):
@@ -112,6 +117,41 @@ class DeepseekV41AllGatherComm(AllGatherCommImpl):
             num_experts=self.moe_config.num_experts,
             num_local_experts=self.moe_config.num_local_experts,
         )
+
+    def fused_experts(self, fused_experts_input):
+        inputs = fused_experts_input
+        rows = inputs.hidden_states.shape[0]
+        if rows <= MAX_EAGER_ROUTED_TOKENS or (
+            is_forward_context_available() and get_forward_context().cudagraph_runtime_mode == CUDAGraphMode.FULL
+        ):
+            return super().fused_experts(inputs)
+
+        # prepare() has already gathered the rows and selected their routes.
+        # Each chunk runs only local dispatch, grouped GEMMs and unpermute.
+        # finalize() receives one complete output in the original gather order.
+        routed_out = inputs.hidden_states.new_empty(inputs.hidden_states.shape, dtype=torch.float32)
+        counts = inputs.topk_ids.new_zeros((self.moe_config.num_local_experts,), dtype=torch.int64)
+        for start in range(0, rows, MAX_EAGER_ROUTED_TOKENS):
+            part = slice(start, start + MAX_EAGER_ROUTED_TOKENS)
+            routing = inputs.routing
+            chunk = replace(
+                inputs,
+                hidden_states=inputs.hidden_states[part],
+                topk_weights=inputs.topk_weights[part],
+                topk_ids=inputs.topk_ids[part],
+                routing=replace(
+                    routing,
+                    pertoken_scale=None if routing.pertoken_scale is None else routing.pertoken_scale[part],
+                    mc2_mask=None if routing.mc2_mask is None else routing.mc2_mask[part],
+                ),
+            )
+            result = super().fused_experts(chunk)
+            if start == 0:
+                before_dispatch = result.before_dispatch_evt
+            routed_out[part].copy_(result.routed_out)
+            # AllGather dispatch returns per-expert counts (group_list_type=1).
+            counts.add_(result.expert_tokens)
+        return replace(result, routed_out=routed_out, expert_tokens=counts, before_dispatch_evt=before_dispatch)
 
     def _apply_mlp(self, inputs):
         weights = inputs.weights

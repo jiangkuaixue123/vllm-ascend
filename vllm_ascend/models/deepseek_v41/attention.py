@@ -45,6 +45,20 @@ from .attention_ops import (
 from .core import rms_norm
 from .native_attention import DeepseekV41NativeAttention
 
+# Bound the per-head score tensor for eager prefill; cached candidates span the whole request.
+_INDEX_SCORE_TILE_BYTES = 32 * 1024 * 1024
+# At TP4 this bounds each WO quantizer's temporary FP32 tensor to 8 MiB.
+_OUTPUT_QDQ_TILE_ROWS = 256
+
+
+def _quantize_projection_input(output):
+    """Consume the attention output; E4M3 quantization groups only its last dimension."""
+    if output.shape[0] <= _OUTPUT_QDQ_TILE_ROWS:
+        return fp8_quant_dequant(output, 32)
+    for tile in output.split(_OUTPUT_QDQ_TILE_ROWS):
+        fp8_quant_dequant(tile, 32, inplace=True)
+    return output
+
 
 @dataclass(frozen=True)
 class RequestSpan:
@@ -591,30 +605,42 @@ class DeepseekV41Attention(nn.Module):
             return shared.topk
         indexer = self.indexer
         q = indexer.wq_b(qr)[0].view(-1, self.index_heads, self.config.index_head_dim)
-        self.rotate(q.unsqueeze(0), positions)
-        q = fp4_quant_dequant(q, 32, scale_format="e8m0")
         weights = indexer.weights_proj(x)[0] * (self.config.index_head_dim**-0.5 * self.config.index_n_heads**-0.5)
-        scores = torch.einsum("shd,td->sht", q, shared.index_keys)
-        scores = (scores.relu_() * weights.unsqueeze(-1)).sum(1)
-        if self.tp > 1 and not self.dsa_cp:
-            scores = tensor_model_parallel_all_reduce(scores)
-        lengths = ((positions + 1) // self.ratio).unsqueeze(-1)
-        scores.masked_fill_(torch.arange(count, device=x.device) >= lengths, -torch.inf)
+        row_bytes = self.index_heads * max(
+            count * max(q.element_size(), weights.element_size()), self.config.index_head_dim * 4
+        )
+        tile_rows = max(1, _INDEX_SCORE_TILE_BYTES // row_bytes)
+        k = min(self.config.index_topk, count)
+        topk = torch.empty((x.shape[0], k), device=x.device, dtype=torch.long)
         candidate_layer = self.config.candidate_source_layer_id
         if self.layer_id == candidate_layer:
-            shared.candidates = select_candidate_blocks(
-                scores,
-                lengths,
-                self.config.candidate_topk_blocks,
-                self.config.candidate_block_size,
-            )
-        elif 0 <= candidate_layer < self.layer_id:
-            if shared.candidates is None:
-                raise RuntimeError("Candidate source did not execute")
-            scores.masked_fill_(~shared.candidates, -torch.inf)
-        indices = topk_columns(scores, min(self.config.index_topk, count))
-        indices = indices.sort(-1).values
-        shared.topk = torch.where(indices < lengths, indices, -1)
+            shared.candidates = torch.empty((x.shape[0], count), device=x.device, dtype=torch.bool)
+        elif 0 <= candidate_layer < self.layer_id and shared.candidates is None:
+            raise RuntimeError("Candidate source did not execute")
+        columns = torch.arange(count, device=x.device)
+        for start in range(0, x.shape[0], tile_rows):
+            rows = slice(start, start + tile_rows)
+            query = q[rows]
+            self.rotate(query.unsqueeze(0), positions[rows])
+            query = fp4_quant_dequant(query, 32, scale_format="e8m0")
+            per_head = torch.einsum("shd,td->sht", query, shared.index_keys)
+            per_head.relu_()
+            per_head = per_head.to(torch.promote_types(per_head.dtype, weights.dtype))
+            scores = per_head.mul_(weights[rows].unsqueeze(-1)).sum(1)
+            del per_head
+            if self.tp > 1 and not self.dsa_cp:
+                scores = tensor_model_parallel_all_reduce(scores)
+            lengths = ((positions[rows] + 1) // self.ratio).unsqueeze(-1)
+            scores.masked_fill_(columns >= lengths, -torch.inf)
+            if self.layer_id == candidate_layer:
+                shared.candidates[rows] = select_candidate_blocks(
+                    scores, lengths, self.config.candidate_topk_blocks, self.config.candidate_block_size
+                )
+            elif 0 <= candidate_layer < self.layer_id:
+                scores.masked_fill_(~shared.candidates[rows], -torch.inf)
+            indices = topk_columns(scores, k).sort(-1).values
+            topk[rows] = torch.where(indices < lengths, indices, -1)
+        shared.topk = topk
         return shared.topk
 
     def _decode_compressed(self, x, pos, md, runtime):
@@ -846,7 +872,7 @@ class DeepseekV41Attention(nn.Module):
             output = torch.empty_like(send)
             dist.all_to_all_single(output, send, group=self.sequence_group.device_group)
         output = output.view(-1, self.groups, self.local_heads * self.dim // self.groups)
-        output = fp8_quant_dequant(output, 32)
+        output = _quantize_projection_input(output)
         projection = self.wo_a.weight.view(self.groups, self.config.o_lora_rank, -1)
         output = torch.einsum("sgd,grd->sgr", output, projection).flatten(1)
         if self.sequence_group is not None:

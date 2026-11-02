@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -39,7 +40,8 @@ def grouped_cpu(x, weight, group_list, group_list_type, group_type, split_item, 
 
 @pytest.mark.parametrize("top_k,quant", [(3, False), (6, False), (3, True), (6, True)])
 @pytest.mark.parametrize("idle", [False, True])
-def test_grouped_allgather_keeps_fp32_route_before_down(monkeypatch, top_k, quant, idle):
+@pytest.mark.parametrize("chunked", [False, True])
+def test_grouped_allgather_keeps_fp32_route_before_down(monkeypatch, top_k, quant, idle, chunked):
     # Two of eight experts are local. Remote pairs deliberately alias valid
     # destinations using the signed native index encoding; padded GMM rows are NaN.
     experts, hidden, intermediate = 8, 4, 6
@@ -58,6 +60,8 @@ def test_grouped_allgather_keeps_fp32_route_before_down(monkeypatch, top_k, quan
         swiglu_beta=0.0,
     )
     comm.token_dispatcher = comm._get_token_dispatcher()
+    if chunked:
+        monkeypatch.setattr(fused, "MAX_EAGER_ROUTED_TOKENS", 2)
     monkeypatch.setattr(moe_comm_method, "_EXTRA_CTX", SimpleNamespace(moe_comm_method=comm))
     monkeypatch.setattr(token_dispatcher, "get_ep_group", lambda: SimpleNamespace(rank_in_group=1))
     monkeypatch.setattr(moe_mlp, "enable_fusion_gmmswigluquant", lambda: False)
@@ -77,9 +81,13 @@ def test_grouped_allgather_keeps_fp32_route_before_down(monkeypatch, top_k, quan
     s1 = torch.rand(2, 2 * intermediate, generator=generator)
     s2 = torch.rand(2, hidden, generator=generator).bfloat16()
 
-    def dispatch(x, expert_ids, *, active_num, active_expert_range, quant_mode, **kwargs):
-        assert active_num == ids.numel() and active_expert_range == [2, 4]
-        assert quant_mode == (1 if quant else -1)
+    dispatch_ids = []
+    prepared = quant and chunked
+
+    def dispatch(x, expert_ids, *, active_num, active_expert_range, quant_mode, scale, **kwargs):
+        dispatch_ids.append(expert_ids)
+        assert active_num == expert_ids.numel() and active_expert_range == [2, 4]
+        assert quant_mode == (1 if quant and not prepared else -1)
         flat = expert_ids.flatten()
         belonging = [torch.where(flat == i)[0] for i in (2, 3)]
         original = torch.cat(belonging)
@@ -87,18 +95,26 @@ def test_grouped_allgather_keeps_fp32_route_before_down(monkeypatch, top_k, quan
         mapping[original] = torch.arange(len(original), dtype=torch.int32)
         sorted_x = torch.zeros(active_num, hidden, dtype=x.dtype)
         sorted_x[: len(original)] = x[original // top_k]
-        sorted_x, scale = quantize(sorted_x) if quant else (sorted_x, None)
+        if prepared:
+            assert x.dtype == torch.int8 and scale.shape == (x.shape[0],)
+            sorted_scale = scale.new_zeros(active_num)
+            sorted_scale[: len(original)] = scale[original // top_k]
+            scale = sorted_scale
+        elif quant:
+            sorted_x, scale = quantize(sorted_x)
         return sorted_x, mapping, torch.tensor([len(index) for index in belonging]), scale
 
     def combine(permuted_tokens, sorted_indices, probs):
         assert permuted_tokens.dtype == probs.dtype == torch.float32
-        torch.testing.assert_close(probs, (owned[ids.long()] >= 0).float())
-        return (permuted_tokens[sorted_indices.abs().long()].view(5, top_k, hidden) * probs[:, :, None]).sum(1)
+        torch.testing.assert_close(probs, (owned[dispatch_ids[-1].long()] >= 0).float())
+        return (permuted_tokens[sorted_indices.abs().long()].view(-1, top_k, hidden) * probs[:, :, None]).sum(1)
 
     monkeypatch.setattr(token_dispatcher.DeviceOperator, "npu_moe_init_routing", dispatch)
     monkeypatch.setattr(token_dispatcher.DeviceOperator, "npu_moe_token_unpermute", combine)
+    prepared_states, token_scale = quantize(states) if prepared else (states, None)
     inputs = build_fused_experts_input(
-        hidden_states=states,
+        hidden_states=prepared_states,
+        pertoken_scale=token_scale,
         topk_weights=route,
         topk_ids=ids,
         w1=w1,
@@ -109,7 +125,11 @@ def test_grouped_allgather_keeps_fp32_route_before_down(monkeypatch, top_k, quan
         quant_type=qtype,
         expert_map=owned,
     )
-    output = comm.fused_experts(inputs).routed_out
+    result = comm.fused_experts(inputs)
+    output = result.routed_out
+    assert [len(batch) for batch in dispatch_ids] == ([2, 2, 1] if chunked else [5])
+    torch.testing.assert_close(torch.cat(dispatch_ids), ids)
+    torch.testing.assert_close(result.expert_tokens, torch.stack([(ids == expert).sum() for expert in (2, 3)]))
 
     def project(x, w, s):
         if quant:
@@ -222,11 +242,62 @@ def test_ep_prepare_and_finalize_trim_physical_rows_to_the_input_shard(monkeypat
         stage.prepare(oversized, oversized)
 
 
+@pytest.mark.parametrize("full", [False, True])
+def test_large_expert_batch_keeps_routing_rows_and_full_capture_path(monkeypatch, full):
+    rows, hidden = 5, 4
+    states = torch.arange(rows * hidden).float().reshape(rows, hidden)
+    ids = torch.arange(rows).int().remainder(2)[:, None]
+    route = torch.linspace(0.25, 0.75, rows)[:, None]
+    scales = torch.arange(1, rows + 1).float()
+    mask = torch.tensor([True, False, True, True, False])
+    weights = torch.zeros(1)
+    inputs = build_fused_experts_input(
+        hidden_states=states,
+        topk_weights=route,
+        topk_ids=ids,
+        w1=weights,
+        w2=weights,
+        quant_type=fused.QuantType.NONE,
+        dynamic_eplb=False,
+        pertoken_scale=scales,
+        mc2_mask=mask,
+    )
+    comm = object.__new__(fused.DeepseekV41AllGatherComm)
+    comm.moe_config = SimpleNamespace(num_local_experts=2)
+    chunks = []
+
+    def local_dispatch(self, batch):
+        chunks.append(batch)
+        return moe_comm_method.FusedExpertsResult(
+            routed_out=batch.hidden_states * batch.topk_weights,
+            expert_tokens=torch.bincount(batch.topk_ids.flatten().long(), minlength=2),
+            before_dispatch_evt=len(chunks),
+            before_combine_evt=len(chunks),
+        )
+
+    monkeypatch.setattr(fused, "MAX_EAGER_ROUTED_TOKENS", 2)
+    monkeypatch.setattr(fused, "is_forward_context_available", lambda: True)
+    mode = fused.CUDAGraphMode.FULL if full else fused.CUDAGraphMode.NONE
+    monkeypatch.setattr(fused, "get_forward_context", lambda: SimpleNamespace(cudagraph_runtime_mode=mode))
+    monkeypatch.setattr(fused.AllGatherCommImpl, "fused_experts", local_dispatch)
+    result = comm.fused_experts(inputs)
+    assert [len(c.hidden_states) for c in chunks] == ([5] if full else [2, 2, 1])
+    torch.testing.assert_close(torch.cat([c.routing.mc2_mask for c in chunks]), mask)
+    torch.testing.assert_close(torch.cat([c.routing.pertoken_scale for c in chunks]), scales)
+    torch.testing.assert_close(result.routed_out, states * route)
+    torch.testing.assert_close(result.expert_tokens, torch.tensor([3, 2]))
+    assert result.before_dispatch_evt == 1 and result.before_combine_evt == len(chunks)
+
+
 @pytest.mark.parametrize("top_k", [3, 6])
-def test_w8a8_grouped_capture_replay_on_npu(monkeypatch, top_k):
+@pytest.mark.parametrize("chunked", [False, True])
+def test_w8a8_grouped_capture_replay_on_npu(monkeypatch, top_k, chunked):
     if not torch.npu.is_available():
         pytest.skip("Ascend NPU is required")
     from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ
+
+    if chunked:
+        monkeypatch.setattr(fused, "MAX_EAGER_ROUTED_TOKENS", 3)
 
     gen = torch.Generator().manual_seed(137)
     rows, hidden, intermediate, experts, local = 8, 128, 128, 8, 4
@@ -282,18 +353,32 @@ def test_w8a8_grouped_capture_replay_on_npu(monkeypatch, top_k):
             answer += torch.where(matches.any(1, keepdim=True), value.float(), 0)
         return answer
 
+    def execute():
+        batch = inputs
+        if chunked:
+            # The production SP prepare has already quantized gathered tokens.
+            prepared, scale = fused.torch_npu.npu_dynamic_quant(states, dst_type=torch.int8)
+            batch = replace(inputs, hidden_states=prepared, routing=replace(inputs.routing, pertoken_scale=scale))
+        return comm.fused_experts(batch).routed_out
+
     with torch.inference_mode():
-        eager = comm.fused_experts(inputs).routed_out
+        eager = execute()
         torch.npu.synchronize()
         torch.testing.assert_close(eager.cpu(), expected().cpu(), rtol=0, atol=0)
         graph = torch.npu.NPUGraph()
         with torch.npu.graph(graph):
-            observed = comm.fused_experts(inputs).routed_out
+            observed = execute()
         ids.copy_(torch.roll(ids, 3, dims=0))
         route.mul_(0.73)
         graph.replay()
         torch.npu.synchronize()
         torch.testing.assert_close(observed.cpu(), expected().cpu(), rtol=0, atol=0)
+        previous_ids = ids.clone()
+        ids.zero_()  # All routes are owned by a different EP rank.
+        graph.replay()
+        torch.npu.synchronize()
+        assert torch.count_nonzero(observed.cpu()) == 0
+        ids.copy_(previous_ids)
         states.zero_()
         graph.replay()
         torch.npu.synchronize()
