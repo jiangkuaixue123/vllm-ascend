@@ -1,0 +1,90 @@
+vllm_ascend/models/deepseek_v41/moe.py
+  s_bdf42c2b7e6c00::t_3d4df0d02484e4 9,23,26,34,128-129,137,139-143,146-149,152,156-159,197-228,248-253,255,257-258,263-265,277-278,283-286,288-289,299,316,327,331-333,349-366,373,380-420,425,427,443
+  s_bdf42c2b7e6c00::t_6c52eee4d7ca2c 328-330,367-372
+  s_bdf42c2b7e6c00::t_5f54614a46a970 374-378
+vllm_ascend/models/deepseek_v41/model.py
+  s_bdf42c2b7e6c00::t_3e4ab23007c156 34,54,56,61,66-69,72,125,137,177-180,188-195,200-203,206,264-280,406,410-414,416,444-457,460-462,468-469,471-478,497-498,502-503,505,526
+  s_bdf42c2b7e6c00::t_4724e6a3b32090 507-510,520-525
+tests/ut/models/deepseek_v41/test_attention.py
+  s_bdf42c2b7e6c00::t_226292a4329a0b 41-43,670-672,766
+  s_bdf42c2b7e6c00::t_71bad4f6aa3f6e 600-650,652-653,656-665,668-669,673-676,678-680,683-684,689-694,698,700-701,706,708-717
+  s_bdf42c2b7e6c00::t_62b94975c1e52a 651,654-655,666-667,677,681-682,685-688,695-697,699,702-705,707
+  s_bdf42c2b7e6c00::t_dbc3120d76685a 7,12-13,55,64
+  s_bdf42c2b7e6c00::t_4a0e4a042a2225 734-765,767-808
+tests/ut/models/deepseek_v41/test_engram.py
+  s_bdf42c2b7e6c00::t_36c29650a53206 420-421,423,425-443,457,465
+  s_bdf42c2b7e6c00::t_bda78bbc17e023 422,424,444-456,458-464,466-476
+docs/source/tutorials/models/DeepSeek-V4.1-Flash.md
+  s_bdf42c2b7e6c00::t_ac423c6d5ef9e1 18,90-103
+  s_bdf42c2b7e6c00::t_26e1be82e31191 142-153
+  s_bdf42c2b7e6c00::t_c14aa8916032e5 15-17,80-89,104,122,124
+vllm_ascend/models/deepseek_v41/attention.py
+  s_bdf42c2b7e6c00::t_db910f8afbb417 668-675,682-688,690-692,696,698-699,702-704,734,740-743,745-746,752,764,771-785,806,810-817,821-829
+  s_bdf42c2b7e6c00::t_d2f67656380eea 23
+  s_bdf42c2b7e6c00::t_147efd9e48e403 681,693
+  s_bdf42c2b7e6c00::t_226292a4329a0b 75-78,498-499,676-680
+  s_bdf42c2b7e6c00::t_773ee5407b511d 14,19,38-39,70-74,79-82,98-99,108,110,114-120,135,141-144,156-165,178-180,184-189,194-195,287-296,406,408-409,416,443-446,448,464-465,497,582,651
+tests/ut/models/deepseek_v41/test_moe.py
+  s_bdf42c2b7e6c00::t_bc477e11fdb12b 327-361,365,369-382,386-410,415-419,424-427,435,437-450,456-462
+  s_bdf42c2b7e6c00::t_7be1e297b9edfa 8-9,14,463-491
+  s_bdf42c2b7e6c00::t_c880d1ce5ba048 362-364,366-368,383-385,411-414,420-423,428-434,436,451-455,507
+  s_bdf42c2b7e6c00::t_535a51707047ef 4-5,492-506,508-561
+vllm_ascend/models/deepseek_v41/engram.py
+  s_bdf42c2b7e6c00::t_3e4ab23007c156 47-48,746-748,754,758,764-766,773-774,779,781-789
+tests/ut/models/deepseek_v41/test_model.py
+  s_bdf42c2b7e6c00::t_36c29650a53206 490-510,521
+  s_bdf42c2b7e6c00::t_3e4ab23007c156 109,195
+  s_bdf42c2b7e6c00::t_dd74d01f4f049b 511-520,522-552
+tests/e2e/nightly/single_node/models/test_deepseek_v41_dspark.py
+  s_bdf42c2b7e6c00::t_489776d7154c99 1-93
+tests/ut/models/deepseek_v41/test_dspark.py
+  s_bdf42c2b7e6c00::t_2b227be8aa9128 1-362
+tests/ut/models/deepseek_v41/test_dspark_runtime.py
+  s_bdf42c2b7e6c00::t_82a622f8ad8ad4 1-295
+tests/ut/models/deepseek_v41/test_fused_experts.py
+  s_bdf42c2b7e6c00::t_661b1bbde32dc8 1-300
+tests/ut/models/deepseek_v41/test_fused_weights.py
+  s_bdf42c2b7e6c00::t_73418b3cdc1d83 1-160
+vllm_ascend/models/__init__.py
+  s_bdf42c2b7e6c00::t_397d2986ba8bc2 3,8-11
+vllm_ascend/models/deepseek_v41/config.py
+  s_bdf42c2b7e6c00::t_e39b89133938c4 8-9
+vllm_ascend/models/deepseek_v41/dspark.py
+  s_bdf42c2b7e6c00::t_7d9da8e1260898 1-345
+vllm_ascend/models/deepseek_v41/fused_experts.py
+  s_bdf42c2b7e6c00::t_9b4655906a7cf6 1-210
+vllm_ascend/models/deepseek_v41/fused_moe.py
+  s_bdf42c2b7e6c00::t_ae7cfcac2f8dea 1-60
+vllm_ascend/models/deepseek_v41/fused_weights.py
+  s_bdf42c2b7e6c00::t_dbbc7e69263614 1-111
+vllm_ascend/ops/register_custom_ops.py
+  s_bdf42c2b7e6c00::t_b6613562a32d65 82-86
+vllm_ascend/patch/platform/patch_speculative_config.py
+  s_bdf42c2b7e6c00::t_f8b967807c9a08 7-8,11,76-98,100
+vllm_ascend/quantization/configs/modelslim_config.py
+  s_bdf42c2b7e6c00::t_7b293fe27a9b7d 100-101
+vllm_ascend/spec_decode/__init__.py
+  s_bdf42c2b7e6c00::t_33ac18af76ccb5 21,25,47-48
+vllm_ascend/spec_decode/dspark_proposer.py
+  s_bdf42c2b7e6c00::t_d43e67304c79c4 8,421-459
+vllm_ascend/spec_decode/llm_base_proposer.py
+  s_bdf42c2b7e6c00::t_e9e4cebbba2a51 113-114,430-433,446-449,878
+vllm_ascend/worker/model_runner_v1.py
+  s_bdf42c2b7e6c00::t_e08bfd9c18587d 159,3425-3429,5198-5206
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "ef85e46d73b21d93245a36a9d77ce01e3f49ebad",
+  "prompts": {},
+  "sessions": {
+    "s_bdf42c2b7e6c00": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a19a98-e8ee-75a2-acbb-8e0c453d3b99",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "jiangkuaixue123 <jiangxiaozhou111@163.com>"
+    }
+  }
+}
