@@ -1,0 +1,85 @@
+vllm_ascend/spec_decode/dspark_proposer.py
+  s_bdf42c2b7e6c00::t_30b74476d33082 457-470
+vllm_ascend/models/deepseek_v41/attention.py
+  s_bdf42c2b7e6c00::t_5c8fc791c40247 754,833
+  s_bdf42c2b7e6c00::t_983747cac5ece5 5-7,46,463,748,756,823-827,834
+  s_bdf42c2b7e6c00::t_c5277020c93080 38
+  s_bdf42c2b7e6c00::t_fc85e5f34e3b0d 109-111,132-138,239,517,520-521
+  s_bdf42c2b7e6c00::t_2851d48b972e9c 749-753
+  s_bdf42c2b7e6c00::t_266f4640024555 518-519,755
+vllm_ascend/models/deepseek_v41/dspark.py
+  s_bdf42c2b7e6c00::t_5c8fc791c40247 95
+  s_bdf42c2b7e6c00::t_983747cac5ece5 28,34,118,188-190
+  s_bdf42c2b7e6c00::t_a5b24944c05101 88,93-94
+vllm_ascend/models/deepseek_v41/native_attention.py
+  s_bdf42c2b7e6c00::t_fa9792a659d0e9 82-85
+  s_bdf42c2b7e6c00::t_fc85e5f34e3b0d 43,45,47,52-78
+  s_bdf42c2b7e6c00::t_12dce6691b5c0f 1-26,28-42,46,80-81,86-97,110-119,121-124,126,128-129,133-138,141-155,165,174,176-180
+  s_bdf42c2b7e6c00::t_95b390a767b963 27,139-140
+  s_bdf42c2b7e6c00::t_266f4640024555 44,48-51,79,120,125,127,156-164
+  s_bdf42c2b7e6c00::t_2851d48b972e9c 98-109,130-132,166-173
+  s_bdf42c2b7e6c00::t_5c8fc791c40247 175
+vllm_ascend/worker/model_runner_v1.py
+  s_bdf42c2b7e6c00::t_d4d961f6030f65 3163-3166
+  s_bdf42c2b7e6c00::t_30b74476d33082 2657-2663
+  s_bdf42c2b7e6c00::t_4227e714ab25cb 3034-3049,3877-3878
+tests/ut/models/deepseek_v41/test_native_attention.py
+  s_bdf42c2b7e6c00::t_203681a17c2328 1-14,16,18-52,58-74,78-92,141-148,150-151,153-157,168-173,175-177,179-183,189,194,196,198-206
+  s_bdf42c2b7e6c00::t_5b9a94264bca19 112-140
+  s_bdf42c2b7e6c00::t_bea1e0b33ab22f 75-77
+  s_bdf42c2b7e6c00::t_d4d961f6030f65 190-192
+  s_bdf42c2b7e6c00::t_e223c35a3e7d34 93-111,184-187
+  s_bdf42c2b7e6c00::t_2fe61cce9c0fd5 158-166
+  s_bdf42c2b7e6c00::t_a5b24944c05101 15,17,167,174
+  s_bdf42c2b7e6c00::t_2851d48b972e9c 53-57,149,152,178,188,193,195,197
+tests/ut/models/deepseek_v41/test_dispatch.py
+  s_bdf42c2b7e6c00::t_4248e6d3301df1 1-63
+tests/ut/models/deepseek_v41/test_attention.py
+  s_bdf42c2b7e6c00::t_95b390a767b963 17
+  s_bdf42c2b7e6c00::t_d021308880290d 399-400,437-438,752-753
+  s_bdf42c2b7e6c00::t_983747cac5ece5 92-94,247,253
+tests/ut/models/deepseek_v41/test_prefix_cache.py
+  s_bdf42c2b7e6c00::t_fd615c4e36a733 1-16,21-57,72-121,125,131-152
+  s_bdf42c2b7e6c00::t_e48ed9f91d66fd 18-20,58-71,122-124,126-130
+  s_bdf42c2b7e6c00::t_019641766cc5cf 17
+docs/source/tutorials/models/DeepSeek-V4.1-Flash.md
+  s_bdf42c2b7e6c00::t_5689651172a4bd 5,19-21,120-138,145,175-185
+tests/e2e/nightly/single_node/models/test_deepseek_v41_dspark.py
+  s_bdf42c2b7e6c00::t_f62e1a1878d92d 5-6,15,97-174
+tests/ut/models/deepseek_v41/test_model.py
+  s_bdf42c2b7e6c00::t_4900f6bc91e50a 205,216,553-587
+tests/ut/models/deepseek_v41/test_moe.py
+  s_bdf42c2b7e6c00::t_70baf90958bd2d 562-581
+tests/ut/models/deepseek_v41/test_processor.py
+  s_bdf42c2b7e6c00::t_3f88e04bcb2472 1-88
+tests/ut/models/deepseek_v41/test_vision.py
+  s_bdf42c2b7e6c00::t_9f08191251accc 1-97
+vllm_ascend/models/deepseek_v41/config.py
+  s_bdf42c2b7e6c00::t_fe08162da44141 216-217
+vllm_ascend/models/deepseek_v41/engram.py
+  s_bdf42c2b7e6c00::t_d98309c3021703 282-294
+vllm_ascend/models/deepseek_v41/model.py
+  s_bdf42c2b7e6c00::t_88f6a77203b3c0 33-34,50,59-60,106-111,135,148-149,188-191,225-228,342-360,362,376,387,393,397-400,455-457,523,525,535-542,552-554,556-559
+vllm_ascend/models/deepseek_v41/moe.py
+  s_bdf42c2b7e6c00::t_4313ea35d99756 231,248-249,255-264,266-270,273,329,366,399,410-411,415-420,423,425,427,430-435,452,455
+vllm_ascend/models/deepseek_v41/processor.py
+  s_bdf42c2b7e6c00::t_6039e18c5a6aa2 1-157
+vllm_ascend/models/deepseek_v41/vision.py
+  s_bdf42c2b7e6c00::t_b2ff9e15e6f39b 1-157
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "c17d9e6e1da3d9909d6bce30bf7b6a2ea5802ce4",
+  "prompts": {},
+  "sessions": {
+    "s_bdf42c2b7e6c00": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a19a98-e8ee-75a2-acbb-8e0c453d3b99",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "jiangkuaixue123 <jiangxiaozhou111@163.com>"
+    }
+  }
+}
