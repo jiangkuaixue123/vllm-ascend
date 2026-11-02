@@ -79,7 +79,11 @@ def _maybe_pad_and_reduce_impl(x: torch.Tensor) -> torch.Tensor:
     if _EXTRA_CTX.is_draft_model and is_vl_model():
         return tensor_model_parallel_all_reduce(x)
 
-    dp_metadata = forward_context.dp_metadata
+    return ep_pad_and_reduce_scatter(x, forward_context.dp_metadata)
+
+
+def ep_pad_and_reduce_scatter(x: torch.Tensor, dp_metadata) -> torch.Tensor:
+    """Restore EP gather padding and return this rank's sequence-parallel token rows."""
     if dp_metadata is None:
         return get_ep_group().reduce_scatter(x, 0)
 

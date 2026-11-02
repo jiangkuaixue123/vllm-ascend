@@ -110,6 +110,8 @@ def _is_glm_model(model_config) -> bool:
 
 
 class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
+    share_target_weights = True
+
     _runnable: ACLGraphWrapper | Callable
 
     def _create_draft_vllm_config(self) -> VllmConfig:
@@ -425,9 +427,10 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             target_language_model = model
 
         # share embed_tokens with the target model if needed
-        self._maybe_share_embeddings(target_language_model)
-        self._maybe_share_topk_indices(target_language_model)
-        self._maybe_share_lm_head(target_language_model)
+        if self.share_target_weights:
+            self._maybe_share_embeddings(target_language_model)
+            self._maybe_share_topk_indices(target_language_model)
+            self._maybe_share_lm_head(target_language_model)
 
         if (
             self.parallel_drafting
@@ -439,6 +442,10 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 if self.eagle3_use_aux_hidden_state
                 else self.model.mask_hidden.view(self.hidden_size)
             )
+
+    def _combine_target_hidden_states(self, model, hidden_states):
+        assert isinstance(model, _HIDDEN_STATE_DRAFTER_TYPES)
+        return model.combine_hidden_states(hidden_states)
 
     def _maybe_share_embeddings(self, target_language_model: nn.Module) -> None:
         """
@@ -868,8 +875,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             model = self.model
             if isinstance(model, BreakableACLGraphWrapper):
                 model = model.unwrap()
-            assert isinstance(model, _HIDDEN_STATE_DRAFTER_TYPES)
-            target_hidden_states = model.combine_hidden_states(target_hidden_states)
+            target_hidden_states = self._combine_target_hidden_states(model, target_hidden_states)
             assert target_hidden_states.shape[-1] == self.hidden_size
 
         num_tokens, token_indices_to_sample, common_attn_metadata, long_seq_args = self.set_inputs_first_pass(

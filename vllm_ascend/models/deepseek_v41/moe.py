@@ -6,7 +6,7 @@
 The equations follow the official inference/model.py at revision
 314113f8a7dadb388215396ba5fbee2c610a04d6. Routing weights are applied before the
 down projection, including its activation quantization. This implementation
-does not implement the MoERunner/EPLB protocol or sequence-parallel inputs.
+supports replicated or sequence-sharded input rows with static expert placement.
 """
 
 from collections.abc import Sequence
@@ -20,8 +20,10 @@ from vllm.config import get_current_vllm_config
 from vllm.distributed import (
     get_dp_group,
     get_ep_group,
+    get_tp_group,
     tensor_model_parallel_all_reduce,
 )
+from vllm.logger import logger
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     ReplicatedLinear,
@@ -29,6 +31,7 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
 
+from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.models.deepseek_v41.config import DeepseekV41TextConfig
 from vllm_ascend.models.deepseek_v41.core import (
     clipped_swiglu,
@@ -122,6 +125,8 @@ class PackedMoECommunication(Protocol):
     dp_rank: int
     ep_rank: int
     ep_size: int
+    sequence_parallel: bool
+    replicated_shared: bool
 
     def gather(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, tuple[int, ...]]: ...
 
@@ -129,21 +134,29 @@ class PackedMoECommunication(Protocol):
 
     def gather_decode(self, states: torch.Tensor) -> torch.Tensor: ...
 
+    def gather_sequence(self, states: torch.Tensor, *, fixed: bool) -> torch.Tensor: ...
+
+    def reduce_sequence(self, contributions: torch.Tensor, local_rows: int) -> torch.Tensor: ...
+
+    def shared_input(self, states: torch.Tensor) -> torch.Tensor: ...
+
+    def shared_output(self, output: torch.Tensor, local_rows: int) -> torch.Tensor: ...
+
 
 class DeepseekV41MoECommunication:
-    """Gather different DP batches before summing disjoint EP contributions.
+    """Preserve token ownership across the physical TP, DP and EP groups."""
 
-    Each TP rank must receive the same complete local-DP packed input. Routing
-    is computed after gathering, avoiding an additional gather of gate output.
-    Group injection keeps the packing contract independently testable on CPU.
-    """
-
-    def __init__(self, dp_group, ep_group):
+    def __init__(self, dp_group, ep_group, tp_group=None, *, sequence_parallel=False, replicated_shared=False):
         self.dp_group = dp_group
         self.ep_group = ep_group
+        self.tp_group = tp_group
         self.dp_rank = dp_group.rank_in_group
         self.ep_rank = ep_group.rank_in_group
         self.ep_size = ep_group.world_size
+        self.sequence_parallel = sequence_parallel
+        self.replicated_shared = replicated_shared
+        if (sequence_parallel or replicated_shared) and (tp_group is None or tp_group.world_size < 2):
+            raise ValueError("Shared-expert DP and sequence parallelism require a physical TP group")
 
     def _token_counts(self, local_count: int) -> tuple[int, ...]:
         if self.dp_group.world_size == 1:
@@ -181,6 +194,38 @@ class DeepseekV41MoECommunication:
             return states
         return self.dp_group.all_gather(states.contiguous(), dim=0)
 
+    def gather_sequence(self, states: torch.Tensor, *, fixed: bool) -> torch.Tensor:
+        """Gather unique TP token shards in EP-rank order, padding unequal DP batches."""
+        local_rows = states.shape[0]
+        rows = local_rows if fixed else max(self._token_counts(local_rows))
+        if not rows:
+            return states
+        padded = F.pad(states, (0, 0, 0, rows - local_rows)) if rows != local_rows else states
+        return self.ep_group.all_gather(padded.contiguous(), dim=0)
+
+    def reduce_sequence(self, contributions: torch.Tensor, local_rows: int) -> torch.Tensor:
+        # The gather and scatter use the same EP group/order. Each token owner
+        # receives the sum of its experts exactly once, then drops only EP padding.
+        return self.ep_group.reduce_scatter(contributions.contiguous(), dim=0)[:local_rows]
+
+    def shared_input(self, states: torch.Tensor) -> torch.Tensor:
+        if self.sequence_parallel and not self.replicated_shared:
+            return self.tp_group.all_gather(states.contiguous(), dim=0)
+        if self.replicated_shared and not self.sequence_parallel:
+            tp = self.tp_group.world_size
+            pad = (-states.shape[0]) % tp
+            padded = F.pad(states, (0, 0, 0, pad)) if pad else states
+            rows = padded.shape[0] // tp
+            return padded.narrow(0, self.tp_group.rank_in_group * rows, rows).contiguous()
+        return states
+
+    def shared_output(self, output: torch.Tensor, local_rows: int) -> torch.Tensor:
+        if self.sequence_parallel and not self.replicated_shared:
+            return self.tp_group.reduce_scatter(output.float().contiguous(), dim=0).to(output.dtype)
+        if self.replicated_shared and not self.sequence_parallel:
+            return self.tp_group.all_gather(output.contiguous(), dim=0)[:local_rows]
+        return output
+
 
 class DeepseekV41Gate(nn.Module):
     def __init__(self, config: DeepseekV41TextConfig):
@@ -200,15 +245,23 @@ class DeepseekV41Gate(nn.Module):
             requires_grad=False,
         )
 
-    def forward(self, hidden_states: torch.Tensor):
+    def logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if not hidden_states.shape[0]:
+            return self.weight.new_empty((0, self.weight.shape[0]))
+        return F.linear(hidden_states.float(), self.weight)
+
+    def select_experts(self, hidden_states, gating_output, topk, renormalize):
         return route_sqrtsoftplus(
-            F.linear(hidden_states.float(), self.weight),
+            gating_output,
             self.bias,
-            self.top_k,
-            self.renormalize,
+            topk,
+            renormalize,
             self.scaling_factor,
             self.temperature,
         )
+
+    def forward(self, hidden_states: torch.Tensor):
+        return self.select_experts(hidden_states, self.logits(hidden_states), self.top_k, self.renormalize)
 
 
 class DeepseekV41MoEExpert(nn.Module):
@@ -221,16 +274,19 @@ class DeepseekV41MoEExpert(nn.Module):
         prefix: str,
         *,
         shared: bool = False,
+        replicated_shared: bool = False,
+        sequence_parallel: bool = False,
     ):
         super().__init__()
         hidden, intermediate = config.hidden_size, config.moe_intermediate_size
         self.swiglu_limit = config.swiglu_limit
-        self.shared = shared
-        up_class = ColumnParallelLinear if shared else ReplicatedLinear
-        down_class = RowParallelLinear if shared else ReplicatedLinear
+        sharded = shared and not replicated_shared
+        self.reduce_shared = sharded and not sequence_parallel
+        up_class = ColumnParallelLinear if sharded else ReplicatedLinear
+        down_class = RowParallelLinear if sharded else ReplicatedLinear
         common = dict(bias=False, quant_config=quant_config, return_bias=False)
-        up_options = {} if shared else {"disable_tp": True}
-        down_options = {"input_is_parallel": True, "reduce_results": False} if shared else {"disable_tp": True}
+        up_options = {} if sharded else {"disable_tp": True}
+        down_options = {"input_is_parallel": True, "reduce_results": False} if sharded else {"disable_tp": True}
         self.w1 = up_class(hidden, intermediate, prefix=f"{prefix}.w1", **common, **up_options)
         self.w2 = down_class(intermediate, hidden, prefix=f"{prefix}.w2", **common, **down_options)
         self.w3 = up_class(hidden, intermediate, prefix=f"{prefix}.w3", **common, **up_options)
@@ -240,7 +296,7 @@ class DeepseekV41MoEExpert(nn.Module):
         if routing_weights is not None:
             activation = activation * routing_weights
         output = self.w2(activation.to(hidden_states.dtype))
-        if self.shared:
+        if self.reduce_shared:
             output = tensor_model_parallel_all_reduce(output.float())
         return output.to(hidden_states.dtype)
 
@@ -257,6 +313,7 @@ class DeepseekV41MoE(nn.Module):
         super().__init__()
         if config.n_shared_experts != 1 or config.hidden_act != "silu":
             raise ValueError("V4.1 requires one shared SwiGLU expert")
+        self.use_fused_runner = communication is None
         if communication is None:
             parallel = get_current_vllm_config().parallel_config
             if (
@@ -267,7 +324,13 @@ class DeepseekV41MoE(nn.Module):
                 or parallel.prefill_context_parallel_size != 1
             ):
                 raise ValueError("Reference V4.1 MoE requires static linear EP without PCP/DBO")
-            communication = DeepseekV41MoECommunication(get_dp_group(), get_ep_group())
+            communication = DeepseekV41MoECommunication(
+                get_dp_group(),
+                get_ep_group(),
+                get_tp_group(),
+                sequence_parallel=parallel.use_sequence_parallel_moe,
+                replicated_shared=get_ascend_config().enable_shared_expert_dp,
+            )
             expected_ep_size = parallel.tensor_parallel_size * parallel.data_parallel_size
             if communication.ep_size != expected_ep_size or (
                 expected_ep_size > 1 and not parallel.enable_expert_parallel
@@ -283,28 +346,85 @@ class DeepseekV41MoE(nn.Module):
             self.expert_ids.stop,
         )
         self.gate = DeepseekV41Gate(config)
-        self.experts = nn.ModuleList(
-            [
-                DeepseekV41MoEExpert(config, quant_config, f"{prefix}.experts.{expert_id}")
-                if expert_id in self.expert_ids
-                else None
-                for expert_id in range(config.n_routed_experts)
-            ]
+        if self.use_fused_runner:
+            # Import the registered Ascend ops in the worker process only.
+            from .fused_moe import build_fused_experts
+
+            self.experts = build_fused_experts(
+                config, quant_config, f"{prefix}.experts", self.gate, communication.sequence_parallel
+            )
+        else:
+            # The injected communication path is the CPU numerical reference.
+            self.experts = nn.ModuleList(
+                [
+                    DeepseekV41MoEExpert(config, quant_config, f"{prefix}.experts.{expert_id}")
+                    if expert_id in self.expert_ids
+                    else None
+                    for expert_id in range(config.n_routed_experts)
+                ]
+            )
+        self.shared_experts = DeepseekV41MoEExpert(
+            config,
+            quant_config,
+            f"{prefix}.shared_experts",
+            shared=True,
+            replicated_shared=communication.replicated_shared,
+            sequence_parallel=communication.sequence_parallel,
         )
-        self.shared_experts = DeepseekV41MoEExpert(config, quant_config, f"{prefix}.shared_experts", shared=True)
+        logger.info_once(
+            "V4.1 MoE layout: sequence_parallel=%s replicated_shared=%s shared_w2_shape=%s",
+            communication.sequence_parallel,
+            communication.replicated_shared,
+            tuple(self.shared_experts.w2.weight.shape),
+        )
+
+    def _routed_output(self, states: torch.Tensor, *, decode: bool) -> torch.Tensor:
+        comm = self.communication
+        if self.use_fused_runner:
+            logger.info_once(
+                "V4.1 executing Ascend fused MoE runner: experts=%d top_k=%d sequence_parallel=%s decode=%s",
+                self.n_routed_experts,
+                self.gate.top_k,
+                comm.sequence_parallel,
+                decode,
+                scope="process",
+            )
+            output = self.experts(hidden_states=states, router_logits=self.gate.logits(states))
+            if output.shape != states.shape:
+                raise RuntimeError(f"V4.1 fused MoE returned {output.shape} for local token shard {states.shape}")
+            return output.float()
+        if comm.sequence_parallel:
+            logger.info_once("V4.1 MoE executing sequence-parallel EP gather/reduce-scatter")
+            gathered = comm.gather_sequence(states, fixed=decode)
+        elif decode:
+            gathered = comm.gather_decode(states)
+        else:
+            gathered, counts = comm.gather(states)
+        if gathered.shape[0] == 0:
+            return states.float()
+        weights, indices = self.gate(gathered)
+        evaluate = local_decode_contributions if decode else local_expert_contributions
+        partial = evaluate(gathered, weights, indices, self.experts, self.expert_ids)
+        if comm.sequence_parallel:
+            return comm.reduce_sequence(partial, states.shape[0])
+        reduced = comm.reduce(partial)
+        if decode:
+            slots = states.shape[0]
+            return reduced.narrow(0, comm.dp_rank * slots, slots)
+        return select_dp_tokens(reduced, counts, comm.dp_rank)
+
+    def _shared_output(self, states: torch.Tensor) -> torch.Tensor:
+        comm = self.communication
+        if comm.replicated_shared:
+            logger.info_once("V4.1 MoE executing replicated shared expert on TP token shards")
+        return comm.shared_output(self.shared_experts(comm.shared_input(states)), states.shape[0])
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if hidden_states.ndim != 2 or hidden_states.shape[1] != self.hidden_size:
             raise ValueError("V4.1 MoE requires packed [tokens, hidden_size] inputs")
-        gathered, counts = self.communication.gather(hidden_states)
-        if gathered.shape[0] == 0:
-            return hidden_states
-        weights, indices = self.gate(gathered)
-        contributions = local_expert_contributions(gathered, weights, indices, self.experts, self.expert_ids)
-        reduced = self.communication.reduce(contributions)
-        output = select_dp_tokens(reduced, counts, self.communication.dp_rank)
+        output = self._routed_output(hidden_states, decode=False)
         if hidden_states.shape[0] > 0:
-            output = output + self.shared_experts(hidden_states).float()
+            output = output + self._shared_output(hidden_states).float()
         return output.to(hidden_states.dtype)
 
     def forward_decode(self, hidden_states: torch.Tensor, token_mask: torch.Tensor) -> torch.Tensor:
@@ -320,11 +440,5 @@ class DeepseekV41MoE(nn.Module):
             raise ValueError("Expected fixed decode states [slots, hidden] and bool slot mask")
         valid = token_mask.unsqueeze(-1)
         states = torch.where(valid, hidden_states, 0.0)
-        gathered = self.communication.gather_decode(states)
-        weights, indices = self.gate(gathered)
-        contributions = local_decode_contributions(gathered, weights, indices, self.experts, self.expert_ids)
-        reduced = self.communication.reduce(contributions)
-        slots = states.shape[0]
-        local = reduced.narrow(0, self.communication.dp_rank * slots, slots)
-        output = local + self.shared_experts(states).float()
+        output = self._routed_output(states, decode=True) + self._shared_output(states).float()
         return torch.where(valid, output.to(states.dtype), 0.0)

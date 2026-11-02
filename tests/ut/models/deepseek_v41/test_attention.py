@@ -4,10 +4,13 @@
 
 import importlib
 import importlib.util
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 from torch import nn
 
 from vllm_ascend.models.deepseek_v41 import attention
@@ -35,6 +38,9 @@ class TinyLinear(nn.Module):
         self.reduce_results = kwargs.get("reduce_results", True)
         dtype = kwargs.get("params_dtype", torch.bfloat16)
         self.weight = nn.Parameter(torch.empty(output_size, input_size, dtype=dtype))
+        self.quant_method = SimpleNamespace(
+            apply=lambda layer, x, bias: torch.nn.functional.linear(x, layer.weight, bias)
+        )
 
     def forward(self, x):
         return torch.nn.functional.linear(x, self.weight), None
@@ -46,7 +52,7 @@ def make_layer(monkeypatch):
     for name in ("ReplicatedLinear", "ColumnParallelLinear", "RowParallelLinear"):
         monkeypatch.setattr(attention, name, TinyLinear)
 
-    def create(ratio=2, layer_id=0, layers=1, kv_sources=None, index_sources=None):
+    def create(ratio=2, layer_id=0, layers=1, kv_sources=None, index_sources=None, groups=1):
         config = SimpleNamespace(
             hidden_size=32,
             head_dim=32,
@@ -55,7 +61,7 @@ def make_layer(monkeypatch):
             qk_rope_head_dim=4,
             q_lora_rank=32,
             o_lora_rank=32,
-            o_groups=1,
+            o_groups=groups,
             index_n_heads=2,
             compress_ratios=[ratio] * layers,
             rms_norm_eps=1e-6,
@@ -591,6 +597,124 @@ def test_cache_spec_accounts_for_all_fp32_state_channels(make_layer):
     assert layer.cache.pages()[0].shape == (48, spec.head_size)
 
 
+class CPUSequenceGroup:
+    """Use real Gloo collectives for the tiny TP2 layout comparison."""
+
+    def __init__(self, rank):
+        self.rank_in_group = rank
+        self.world_size = 2
+        self.device_group = dist.group.WORLD
+        self.gathers = self.scatters = 0
+
+    def all_gather(self, x, dim):
+        assert dim == 0
+        self.gathers += 1
+        out = x.new_empty(2 * x.shape[0], *x.shape[1:])
+        dist.all_gather_into_tensor(out, x.contiguous())
+        return out
+
+    def reduce_scatter(self, x, dim):
+        assert dim == 0 and x.dtype == torch.float32
+        self.scatters += 1
+        out = x.new_empty(x.shape[0] // 2, *x.shape[1:])
+        dist.reduce_scatter_tensor(out, x.contiguous())
+        return out
+
+
+def sequence_attention_worker(rank, init_uri):
+    dist.init_process_group("gloo", init_method=init_uri, rank=rank, world_size=2)
+    torch.set_num_threads(1)
+    try:
+        with pytest.MonkeyPatch.context() as patch, torch.no_grad():
+            make = make_layer.__wrapped__(patch)
+            full = make(groups=2)
+            group = CPUSequenceGroup(rank)
+
+            class Column(TinyLinear):
+                def __init__(self, input_size, output_size, **kwargs):
+                    super().__init__(input_size, output_size // 2, **kwargs)
+
+            class Row(TinyLinear):
+                def __init__(self, input_size, output_size, **kwargs):
+                    super().__init__(input_size // 2, output_size, **kwargs)
+
+            def reduce(tensor):
+                dist.all_reduce(tensor)
+                return tensor
+
+            patch.setattr(attention, "get_tensor_model_parallel_world_size", lambda: 2)
+            patch.setattr(attention, "get_tp_group", lambda: group)
+            patch.setattr(attention, "ColumnParallelLinear", Column)
+            patch.setattr(attention, "RowParallelLinear", Row)
+            patch.setattr(attention, "tensor_model_parallel_all_reduce", reduce)
+
+            def build(sp, cp, layer_id):
+                patch.setattr(attention, "enable_sp", lambda _: sp)
+                patch.setattr(attention, "enable_dsa_cp", lambda: cp)
+                layer = make(2, layer_id, 2, [0], [0, 1], groups=2)
+                layer.config.candidate_source_layer_id = 0
+                weights = dict(full.named_parameters())
+                for name, value in layer.named_parameters():
+                    source = weights[name]
+                    if source.shape != value.shape:
+                        axis = 1 if name == "wo_b.weight" else 0
+                        source = source.chunk(2, dim=axis)[rank]
+                    value.copy_(source)
+                return layer
+
+            for cp in (False, True):
+                reference, sequence = build(False, False, 0), build(True, cp, 0)
+                following_ref, following_seq = build(False, False, 1), build(True, cp, 1)
+                assert sequence.wq_b.weight.shape[0] == (2 if cp else 1) * full.dim
+                q_rows = []
+                sequence.wq_b.register_forward_pre_hook(
+                    lambda mod, args, q_rows=q_rows: q_rows.append(args[0].shape[0])
+                )
+                packed = hidden_tokens(5)
+                padded = torch.nn.functional.pad(packed, (0, 0, 0, 1))
+                spans = [attention.RequestSpan(0, 4, 4), attention.RequestSpan(4, 5, 1)]
+                tables = [[3, 7, 0, 0], [1, 8, 0, 0]]
+                expected, ref_runtime = run_batch(reference, packed, spans, tables)
+                expected = torch.nn.functional.pad(expected, (0, 0, 0, 1))
+                sequence.cache.metadata = reference.cache.metadata
+                start = rank * 3
+                seq_runtime = attention.DeepseekV41Runtime(spans)
+                observed = sequence(padded[start : start + 3], seq_runtime)
+                torch.testing.assert_close(observed, expected[start : start + 3], rtol=0, atol=0)
+                torch.testing.assert_close(sequence.cache.kv_cache, reference.cache.kv_cache, rtol=0, atol=0)
+                following_ref.cache.metadata = following_seq.cache.metadata = reference.cache.metadata
+                expected = torch.nn.functional.pad(following_ref(packed, ref_runtime), (0, 0, 0, 1))
+                observed = following_seq(padded[start : start + 3], seq_runtime)
+                torch.testing.assert_close(observed, expected[start : start + 3], rtol=0, atol=0)
+                # Start with one completely idle TP shard, then change both
+                # requests, including a page boundary on the first request.
+                for live_lengths in ([5, 0, 0, 0], [6, 0, 2, 0], [0, 0, 0, 0]):
+                    md = multirow_metadata(live_lengths, [tables[0], [0] * 4, tables[1], [0] * 4])
+                    reference.cache.metadata = sequence.cache.metadata = lambda md=md: md
+                    tokens = hidden_tokens(4, 85)
+                    ref_runtime = attention.DeepseekV41Runtime.for_decode(md)
+                    seq_runtime = attention.DeepseekV41Runtime.for_decode(md)
+                    expected = reference(tokens, ref_runtime)
+                    start = 2 * rank
+                    observed = sequence(tokens[start : start + 2], seq_runtime)
+                    torch.testing.assert_close(observed, expected[start : start + 2], rtol=0, atol=0)
+                    torch.testing.assert_close(sequence.cache.kv_cache, reference.cache.kv_cache, rtol=0, atol=0)
+                    following_seq.cache.metadata = following_ref.cache.metadata = reference.cache.metadata
+                    expected = following_ref(tokens, ref_runtime)
+                    observed = following_seq(tokens[start : start + 2], seq_runtime)
+                    torch.testing.assert_close(observed, expected[start : start + 2], rtol=0, atol=0)
+                assert q_rows == ([3, 2, 2, 2] if cp else [6, 4, 4, 4])
+            assert group.gathers == group.scatters == 16
+    finally:
+        dist.destroy_process_group()
+
+
+def test_sequence_parallel_prefill_and_decode_match_tp_reference(tmp_path, tensor_device):
+    if tensor_device != "cpu":
+        pytest.skip("This two-rank reference test uses CPU Gloo")
+    mp.spawn(sequence_attention_worker, args=((Path(tmp_path) / "store").as_uri(),), nprocs=2, join=True)
+
+
 def test_output_projection_reduces_fp32_after_local_bf16_gemm(make_layer, monkeypatch):
     layer = make_layer(0)
     assert layer.wo_b.reduce_results is False
@@ -607,3 +731,78 @@ def test_output_projection_reduces_fp32_after_local_bf16_gemm(make_layer, monkey
     actual, _ = run_batch(layer, x, [attention.RequestSpan(0, 2, 2)], [[3]])
     assert reductions == [torch.float32]
     torch.testing.assert_close(actual, (local.float() * 2).to(x.dtype), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("ratio", [0, 2])
+@torch.no_grad()
+def test_dspark_six_token_verify_and_rejection_use_causal_pages(make_layer, ratio, tensor_device):
+    """The replacement query starts at the accepted prefix, even with stale future KV."""
+    eager, verifier = make_layer(ratio), make_layer(ratio)
+    tables = [[0, 2, 4, 6], [1, 3, 5, 7]]
+    builder = object.__new__(attention.DeepseekV41MetadataBuilder)
+    builder.decode_buffers = {}
+    builder.capture_sizes = {12}
+    builder.decode_graph_enabled = True
+    builder.query_width = 6
+    builder.max_model_len = 16
+    builder.block_size = 4
+    graph = None
+    graph_inputs = hidden_tokens(12, 19)
+    for starts, seed in (([0, 0], 21), ([2, 5], 39)):
+        spans = [attention.RequestSpan(i * 6, (i + 1) * 6, start + 6) for i, start in enumerate(starts)]
+        slots = [tables[i][p // 4] * 4 + p % 4 for i, start in enumerate(starts) for p in range(start, start + 6)]
+        common = SimpleNamespace(
+            num_input_tokens=12,
+            num_actual_tokens=12,
+            num_reqs=2,
+            max_query_len=6,
+            max_seq_len=max(starts) + 6,
+            seq_lens=torch.tensor(starts) + 6,
+            # Simulate an optimistic scheduler estimate after rejection.
+            seq_lens_cpu_upper_bound=torch.tensor([15, 15]),
+            query_start_loc_cpu=torch.tensor([0, 6, 12]),
+            slot_mapping=torch.tensor(slots),
+            block_table_tensor=torch.tensor(tables, dtype=torch.int32),
+        )
+        md = builder.build(0, common)
+        assert md.requests == spans
+        assert md.decode.seq_lens.tolist() == [p + 1 for start in starts for p in range(start, start + 6)]
+        verifier.cache.metadata = lambda md=md: md
+        states = hidden_tokens(12, seed)
+        expected, _ = run_batch(eager, states, spans, tables)
+        runtime = attention.DeepseekV41Runtime.for_decode(md)
+        if tensor_device == "cpu":
+            actual = verifier(states, runtime)
+        else:
+            if graph is None:
+                builder.build_for_cudagraph_capture(common)
+                verifier(graph_inputs, runtime)
+                torch.npu.synchronize()
+                graph = torch.npu.NPUGraph()
+                with torch.npu.graph(graph):
+                    graph_output = verifier(graph_inputs, runtime)
+                builder.build(0, common)
+            graph_inputs.copy_(states)
+            graph.replay()
+            torch.npu.synchronize()
+            actual = graph_output
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@torch.no_grad()
+def test_verify_cache_scatter_keeps_slot_zero_with_padding(make_layer):
+    cache = make_layer(0).cache
+    slots = torch.tensor([-1, 0, 7, -1, 4, -1])
+    live = slots >= 0
+    md = attention.DeepseekV41DecodeMetadata(
+        torch.ones(6, dtype=torch.int64), slots, torch.zeros(6, 4, dtype=torch.int32), live, 16, 6
+    )
+    values = torch.arange(24, dtype=torch.float32).view(6, 4)
+    expected = cache.pages()[0].clone()
+    expected[0, 1:5] = values[1]
+    expected[7, 1:5] = values[2]
+    expected[4, 1:5] = values[4]
+    cache.decode_write(md, values, 0, 1, live)
+    torch.testing.assert_close(cache.pages()[0], expected, rtol=0, atol=0)
+    cache.decode_write(md, values * -1, 0, 1, torch.zeros_like(live))
+    torch.testing.assert_close(cache.pages()[0], expected, rtol=0, atol=0)

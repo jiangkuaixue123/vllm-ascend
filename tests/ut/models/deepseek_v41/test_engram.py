@@ -417,3 +417,60 @@ def test_decode_reduction_never_mutates_rank_local_graph_input(table_checkpoint)
                 out=staged,
             )
         assert torch.equal(staged, local)
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize("decode", [False, True])
+def test_sequence_sharded_gate_reduces_table_rows_to_their_token_owner(table_checkpoint, monkeypatch, decode, rank):
+    root, prefix = table_checkpoint
+    # Alternate between the two vocabulary owners. Padding is a token row,
+    # not an extra lookup in the vocabulary.
+    ids = torch.tensor([[0], [4], [1]])
+    states = torch.arange(12, dtype=torch.bfloat16).view(3, 2, 2) / 7
+    padded = torch.cat((states, states.new_zeros(1, 2, 2)))
+    projection = nn.Linear(32, 6, bias=False, dtype=torch.bfloat16)
+    weights = torch.ones(2, 2, dtype=torch.bfloat16)
+    with IndexedMmapStore(root) as store:
+        full = DeepseekV41Engram(
+            MmapEngramEmbedding(store, prefix, tp_rank=0, tp_size=1),
+            projection,
+            weights,
+            weights,
+            eps=1e-6,
+            rotation_contract="unrotated",
+        )
+        oracle = full(states, ids)
+        expected = torch.cat((oracle, oracle.new_zeros(1, 2, 2)))
+        begin = 2 * rank
+        part = DeepseekV41Engram(
+            MmapEngramEmbedding(store, prefix, tp_rank=rank, tp_size=2),
+            projection,
+            weights,
+            weights,
+            eps=1e-6,
+            rotation_contract="unrotated",
+            tp_reduce=lambda *args: pytest.fail("SP must reduce-scatter to token owners"),
+        )
+        raw = part.embedding(ids, device="cpu")
+        full_vals = full.embedding(ids, device="cpu")
+        calls = []
+
+        def reduce_scatter(values):
+            calls.append(tuple(values.shape))
+            torch.testing.assert_close(values[:3], raw.flatten(1))
+            if values.shape[0] == 4:
+                assert not values[3].count_nonzero()
+            summed = torch.cat((full_vals, full_vals.new_zeros(1, 1, 32))).flatten(1)
+            return summed[begin : begin + 2]
+
+        monkeypatch.setattr("vllm_ascend.models.deepseek_v41.engram.sp_reduce_scatter", reduce_scatter)
+        if decode:
+            staged = part.prepare_decode(ids, bucket_size=4, device="cpu")
+            before = staged.clone()
+            mask = torch.tensor([True, True, True, False])[begin : begin + 2]
+            result = part.forward_decode(padded[begin : begin + 2], staged, mask, sequence_parallel=True)
+            torch.testing.assert_close(staged, before)
+        else:
+            result = part(padded[begin : begin + 2], ids, sequence_parallel=True)
+        torch.testing.assert_close(result, expected[begin : begin + 2])
+        assert calls == [(4 if decode else 3, 32)]

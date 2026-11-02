@@ -8,7 +8,6 @@ tables on the host and uses separate TP attention and DP/EP expert domains.
 """
 
 import json
-from collections import defaultdict
 from collections.abc import Iterable
 from pathlib import Path
 
@@ -32,6 +31,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 
+from vllm_ascend.models.common.ops.sequence_parallel import sp_all_gather, sp_shard
 from vllm_ascend.models.deepseek_v41.attention import (
     DeepseekV41Attention,
     DeepseekV41RMSNorm,
@@ -51,20 +51,25 @@ from vllm_ascend.models.deepseek_v41.engram import (
     IndexedMmapStore,
     MmapEngramEmbedding,
 )
+from vllm_ascend.models.deepseek_v41.fused_weights import load_indexed_v41_weights
 from vllm_ascend.models.deepseek_v41.moe import DeepseekV41MoE
+from vllm_ascend.utils import enable_dsa_cp, enable_sp, shared_expert_dp_enabled
 
 MAX_DECODE_GRAPH_ROWS = 8
 
 
-def _decode_capture_sizes(compilation):
+def _decode_capture_sizes(compilation, query_width=1):
     sizes = tuple(compilation.cudagraph_capture_sizes or ())
     if (
         compilation.cudagraph_mode != CUDAGraphMode.FULL_DECODE_ONLY
         or not sizes
-        or any(type(size) is not int or not 1 <= size <= MAX_DECODE_GRAPH_ROWS for size in sizes)
+        or any(
+            type(size) is not int or size % query_width or not 1 <= size // query_width <= MAX_DECODE_GRAPH_ROWS
+            for size in sizes
+        )
         or len(set(sizes)) != len(sizes)
     ):
-        raise ValueError("V4.1 requires eager or FULL_DECODE_ONLY with unique capture sizes in [1, 8]")
+        raise ValueError(f"V4.1 requires FULL_DECODE_ONLY capture sizes for 1–8 requests of width {query_width}")
     return frozenset(sizes)
 
 
@@ -117,7 +122,7 @@ class DeepseekV41Block(nn.Module):
             self.config.hc_sinkhorn_iters,
         )
 
-    def forward(self, hidden_states, pre_mix, runtime):
+    def forward(self, hidden_states, pre_mix, runtime, decode_mask=None):
         if hidden_states.shape[0] == 0:
             # Other DP replicas can be active. Participate in every expert
             # collective while avoiding empty NPU GEMMs and TP reductions.
@@ -129,7 +134,7 @@ class DeepseekV41Block(nn.Module):
         ffn_pre, post, comb = self.mixes(hidden_states, "ffn")
         ffn_input = self.ffn_norm(hc_pre(hidden_states, attn_pre))
         if getattr(runtime, "decode", None) is not None:
-            output = self.ffn.forward_decode(ffn_input, runtime.decode.active)
+            output = self.ffn.forward_decode(ffn_input, runtime.decode.active if decode_mask is None else decode_mask)
         else:
             output = self.ffn(ffn_input)
         return hc_post(output, hidden_states, post, comb), ffn_pre
@@ -169,6 +174,10 @@ def read_parameter_slice(reader, key, parameter, module, tp_rank, tp_size):
 
 
 class DeepseekV41ForCausalLM(nn.Module):
+    supports_eagle3 = True
+    has_own_lm_head = True
+    has_own_embed_tokens = True
+    aux_hidden_state_layers: tuple[int, ...] = ()
     packed_modules_mapping: dict[str, list[str]] = {}
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -176,15 +185,25 @@ class DeepseekV41ForCausalLM(nn.Module):
         self.config = vllm_config.model_config.hf_text_config
         self.vllm_config = vllm_config
         parallel = vllm_config.parallel_config
+        self.sequence_parallel = enable_sp(vllm_config)
+        logger.info_once(
+            "V4.1 parallel layout: sequence_parallel=%s dsa_cp=%s shared_expert_dp=%s tp=%d",
+            self.sequence_parallel,
+            enable_dsa_cp(),
+            shared_expert_dp_enabled(),
+            parallel.tensor_parallel_size,
+        )
         if parallel.pipeline_parallel_size != 1 or parallel.decode_context_parallel_size != 1:
             raise ValueError("V4.1 reference path currently requires PP1 and DCP1")
         if parallel.enable_eplb:
             raise ValueError("V4.1 reference experts do not implement EPLB migration")
-        if vllm_config.speculative_config is not None:
-            raise ValueError("V4.1 DSpark integration has not been implemented")
+        spec = vllm_config.speculative_config
+        if spec is not None and not spec.use_dspark():
+            raise ValueError("V4.1 supports DSpark speculative decoding only")
+        query_width = 1 if spec is None else 1 + spec.num_speculative_tokens
         self.decode_enabled = not vllm_config.model_config.enforce_eager
         self._decode_capture_sizes = (
-            _decode_capture_sizes(vllm_config.compilation_config) if self.decode_enabled else frozenset()
+            _decode_capture_sizes(vllm_config.compilation_config, query_width) if self.decode_enabled else frozenset()
         )
         self._decode_engram_values: dict[tuple[int, int], torch.Tensor] = {}
         config = self.config
@@ -241,6 +260,23 @@ class DeepseekV41ForCausalLM(nn.Module):
                 )
         self.engram_layer_ids = tuple(config.engram_layer_ids)
         self._weights_loaded = False
+
+    def get_eagle3_default_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        # vLLM passes one-based boundaries. DSpark reads the layer input
+        # after Engram injection, before either attention or HC mixing.
+        return tuple(index + 1 for index in self.config.dspark_target_layer_ids)
+
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        if tuple(layers) != self.get_eagle3_default_aux_hidden_state_layers():
+            raise ValueError("DSpark auxiliary layers must match the checkpoint projection order")
+        self.aux_hidden_state_layers = tuple(layers)
+
+    def _capture_aux(self, aux, layer_id, hidden, rows):
+        if layer_id + 1 in self.aux_hidden_state_layers:
+            value = hidden.mean(dim=1)
+            if self.sequence_parallel and rows:
+                value = sp_all_gather(value)[:rows]
+            aux.append(value)
 
     def _configure_engram_rotation(self):
         if not self.engram_layer_ids:
@@ -367,11 +403,17 @@ class DeepseekV41ForCausalLM(nn.Module):
                     past = positions.long()[:, None] - shifts
                     histories = cache.decode_read(decode, past, 1, history_column, 1).squeeze(-1).long().cpu().tolist()
             rows = []
+            previous = -2
             for row in live:
                 _, pos, token, _ = header[row]
                 count = min(pos, lookback)
-                state = self.engram_hasher.new_state(histories[row][-count:] if count else [], position=pos)
+                # Each packed verification query sees its own earlier proposals.
+                # On rejection the next query starts at the accepted boundary,
+                # so rejected slots from the preceding step never seed its hash.
+                if row % decode.query_width == 0 or previous != row - 1:
+                    state = self.engram_hasher.new_state(histories[row][-count:] if count else [], position=pos)
                 rows.append(self.engram_hasher.hash_tokens([token], state, start_position=pos))
+                previous = row
             hashes = torch.cat(rows, dim=0)
         else:
             hashes = torch.empty(
@@ -399,20 +441,41 @@ class DeepseekV41ForCausalLM(nn.Module):
                 cache.pages()[1][slots, history_column] = input_ids.index_select(0, rows).float()
         return len(live)
 
+    def _start_hc(self, embedded):
+        # HC is token-local. Keep its four streams on the contiguous TP token
+        # shard across blocks; all EP ranks still participate on an idle DP.
+        if self.sequence_parallel and embedded.shape[0]:
+            embedded = sp_shard(embedded)
+        hidden = embedded.unsqueeze(-2).repeat(1, self.config.hc_mult, 1)
+        return hidden, make_identity_pre_mix(hidden)
+
+    def _finish_hc(self, hidden, pre_mix, rows):
+        if not rows:
+            return hidden.new_empty((0, self.config.hidden_size))
+        output = self.norm(hc_pre(hidden, pre_mix))
+        return sp_all_gather(output)[:rows] if self.sequence_parallel else output
+
     def _forward_decode(self, input_ids, metadata):
         runtime = DeepseekV41Runtime.for_decode(metadata)
-        hidden_states = self.embed(input_ids).unsqueeze(-2).repeat(1, self.config.hc_mult, 1)
-        pre_mix = make_identity_pre_mix(hidden_states)
+        local_active = sp_shard(runtime.decode.active) if self.sequence_parallel else runtime.decode.active
+        hidden_states, pre_mix = self._start_hc(self.embed(input_ids))
+        auxiliary = []
         for layer_id, layer in enumerate(self.layers):
             if layer.engram is not None:
                 hidden_states = layer.engram.forward_decode(
                     hidden_states,
                     self._decode_engram_values[(input_ids.shape[0], layer_id)],
-                    runtime.decode.active,
+                    local_active,
+                    sequence_parallel=self.sequence_parallel,
                 )
-            hidden_states, pre_mix = layer(hidden_states, pre_mix, runtime)
-        output = self.norm(hc_pre(hidden_states, pre_mix))
-        return torch.where(runtime.decode.active[:, None], output, 0)
+            self._capture_aux(auxiliary, layer_id, hidden_states, input_ids.shape[0])
+            hidden_states, pre_mix = layer(hidden_states, pre_mix, runtime, local_active)
+        output = self._finish_hc(hidden_states, pre_mix, input_ids.shape[0])
+        active = runtime.decode.active[:, None]
+        output = torch.where(active, output, 0)
+        if self.aux_hidden_state_layers:
+            return output, [torch.where(active, value, 0) for value in auxiliary]
+        return output
 
     def forward(self, input_ids, positions, intermediate_tensors=None, inputs_embeds=None):
         if intermediate_tensors is not None or input_ids is None:
@@ -431,27 +494,20 @@ class DeepseekV41ForCausalLM(nn.Module):
             hidden_states = self.embed.weight.new_empty((0, self.config.hidden_size))
         else:
             hidden_states = self.embed(ids) if inputs_embeds is None else inputs_embeds[:actual_tokens]
-        hidden_states = hidden_states.unsqueeze(-2).repeat(1, self.config.hc_mult, 1)
-        pre_mix = make_identity_pre_mix(hidden_states)
+        hidden_states, pre_mix = self._start_hc(hidden_states)
+        auxiliary = []
         for layer_id, layer in enumerate(self.layers):
             if layer.engram is not None and actual_tokens:
                 index = self.engram_layer_ids.index(layer_id)
-                hidden_states = layer.engram(hidden_states, hashes[:, index])
+                hidden_states = layer.engram(hidden_states, hashes[:, index], sequence_parallel=self.sequence_parallel)
+            self._capture_aux(auxiliary, layer_id, hidden_states, actual_tokens)
             hidden_states, pre_mix = layer(hidden_states, pre_mix, runtime)
-        output = (
-            self.norm(hc_pre(hidden_states, pre_mix))
-            if actual_tokens
-            else hidden_states.new_empty((0, self.config.hidden_size))
-        )
+        output = self._finish_hc(hidden_states, pre_mix, actual_tokens)
         if actual_tokens < input_ids.numel():
-            output = torch.cat(
-                (
-                    output,
-                    output.new_zeros(input_ids.numel() - actual_tokens, self.config.hidden_size),
-                ),
-                0,
-            )
-        return output
+            padding = output.new_zeros(input_ids.numel() - actual_tokens, self.config.hidden_size)
+            output = torch.cat((output, padding))
+            auxiliary = [torch.cat((value, padding)) for value in auxiliary]
+        return (output, auxiliary) if self.aux_hidden_state_layers else output
 
     def compute_logits(self, hidden_states):
         return self.logits_processor(self.head, hidden_states.float())
@@ -461,33 +517,13 @@ class DeepseekV41ForCausalLM(nn.Module):
         # The generic iterator materializes gigantic host tables and includes
         # stale duplicate tensors. Use the checkpoint's authoritative index.
         store = self.engram_store or IndexedMmapStore(self.model_path)
-        parameters = dict(self.named_parameters())
-        modules = dict(self.named_modules())
-        by_shard = defaultdict(list)
-        for name, parameter in parameters.items():
-            if name not in store.weight_map:
-                raise KeyError(f"Required V4.1 parameter absent from index: {name}")
-            by_shard[store.weight_map[name]].append((name, parameter))
-        loaded = set()
-        for shard, items in sorted(by_shard.items()):
-            path = (self.model_path / shard).resolve()
-            if not path.is_relative_to(self.model_path.resolve()):
-                raise ValueError("Checkpoint shard escapes model directory")
-            with safe_open(str(path), framework="pt", device="cpu") as reader:
-                for name, parameter in items:
-                    module = modules[name.rsplit(".", 1)[0]]
-                    read_parameter_slice(
-                        reader,
-                        name,
-                        parameter,
-                        module,
-                        get_tensor_model_parallel_rank(),
-                        get_tensor_model_parallel_world_size(),
-                    )
-                    loaded.add(name)
-            logger.info("V4.1 loaded indexed shard %s (%d local tensors)", shard, len(items))
-        if loaded != set(parameters):
-            raise RuntimeError(f"Unloaded V4.1 parameters: {set(parameters) - loaded}")
+        loaded = load_indexed_v41_weights(
+            self,
+            store.weight_map,
+            get_tensor_model_parallel_rank(),
+            get_tensor_model_parallel_world_size(),
+            read_parameter_slice,
+        )
         self._configure_engram_rotation()
         self._weights_loaded = True
         logger.info(

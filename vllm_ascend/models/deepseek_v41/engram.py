@@ -44,6 +44,8 @@ from sympy import isprime
 from tokenizers import Regex, normalizers
 from torch import nn
 
+from vllm_ascend.models.common.ops.sequence_parallel import sp_reduce_scatter
+
 HASH_SEED_MULTIPLIER = 10007
 DEAD_TOKEN = -1
 E8M0_BLOCK_SIZE = 32
@@ -741,37 +743,50 @@ class DeepseekV41Engram(nn.Module):
             out.index_copy_(0, destination, values)
         return out
 
-    def forward_decode(self, x: torch.Tensor, values: torch.Tensor, token_mask: torch.Tensor) -> torch.Tensor:
+    def forward_decode(
+        self, x: torch.Tensor, values: torch.Tensor, token_mask: torch.Tensor, *, sequence_parallel: bool = False
+    ) -> torch.Tensor:
         """Use only device tensors in the captured TP reduction and gate."""
         if self.rotation_contract == "unresolved":
             raise RuntimeError("Verify Engram rotation and configure its explicit transforms")
         if (
             values.ndim != 3
-            or values.shape[0] != x.shape[0]
+            or values.shape[0] != x.shape[0] * (self.embedding.tp_size if sequence_parallel else 1)
             or values.shape[-1] != self.embedding.embedding_dim
             or values.dtype != torch.bfloat16
             or values.device != x.device
-            or token_mask.shape != values.shape[:1]
+            or token_mask.shape != x.shape[:1]
             or token_mask.dtype != torch.bool
             or token_mask.device != x.device
         ):
             raise ValueError("Invalid staged Engram decode values or slot mask")
         # A TP implementation may reduce in place. The graph input stays rank-local.
-        return self._apply_values(x, values.clone() if self.embedding.tp_size > 1 else values, token_mask)
+        if self.embedding.tp_size > 1 and not sequence_parallel:
+            values = values.clone()
+        return self._apply_values(x, values, token_mask, sequence_parallel=sequence_parallel)
 
     def forward(
         self,
         x: torch.Tensor,
         hash_ids: torch.Tensor,
         token_mask: torch.Tensor | None = None,
+        *,
+        sequence_parallel: bool = False,
     ) -> torch.Tensor:
         if self.rotation_contract == "unresolved":
             raise RuntimeError("Verify Engram rotation and configure its explicit transforms")
         values = self.embedding(hash_ids, device=x.device)
-        return self._apply_values(x, values, token_mask)
+        return self._apply_values(x, values, token_mask, sequence_parallel=sequence_parallel)
 
-    def _apply_values(self, x: torch.Tensor, values: torch.Tensor, token_mask: torch.Tensor | None) -> torch.Tensor:
-        if self.embedding.tp_size > 1:
+    def _apply_values(
+        self, x: torch.Tensor, values: torch.Tensor, token_mask: torch.Tensor | None, *, sequence_parallel: bool = False
+    ) -> torch.Tensor:
+        if sequence_parallel:
+            # The mmap tables are vocabulary-sharded, not token-sharded. Every
+            # TP rank looked up the same hashes. Sum those contributions only
+            # for the output token rows this rank owns.
+            values = sp_reduce_scatter(values.flatten(1)).reshape(x.shape[0], *values.shape[1:])
+        elif self.embedding.tp_size > 1:
             reduced = self.tp_reduce(values, self.embedding.tp_group)
             if reduced is not None:
                 values = reduced

@@ -4,8 +4,11 @@ from copy import copy
 from transformers import DeepseekV2Config, PretrainedConfig
 from vllm.config.speculative import SpeculativeConfig
 
+from vllm_ascend.models.deepseek_v41.config import DSPARK_ARCHITECTURE, DeepseekV41Config, DeepseekV41TextConfig
+
 _orig_post_init = SpeculativeConfig.__post_init__
 _orig_hf_config_override = SpeculativeConfig.hf_config_override
+_orig_update_arch = SpeculativeConfig.update_arch_
 
 # Transformers 5.14 inherited a hidden_size % num_heads check from Llama in
 # DeepseekV2Config. K3 MLA has independent projection/head dimensions (e.g.
@@ -70,5 +73,29 @@ def _dspark_post_init(self):
             draft_hf_config.ptd_token_id = getattr(draft_hf_config, "mask_token_id", None)  # type: ignore
 
 
+def _update_draft_arch(self):
+    # Upstream dispatches embedded DSpark checkpoints to the V4 draft class.
+    # V4.1 stores its text/draft configuration inside the multimodal wrapper.
+    # Select the trained V4.1 architecture before vLLM inspects the class.
+    if self.method == "dspark" and isinstance(self.target_model_config.hf_text_config, DeepseekV41TextConfig):
+        if self.model != self.target_model_config.model:
+            raise ValueError("V4.1 DSpark uses the draft stages embedded in the target checkpoint")
+        if self.draft_tensor_parallel_size not in (None, self.target_parallel_config.tensor_parallel_size):
+            raise ValueError("V4.1 DSpark requires the target tensor-parallel group size")
+        draft = self.draft_model_config.hf_config
+        text = draft.text_config
+        if self.num_speculative_tokens not in (None, text.dspark_block_size):
+            raise ValueError(f"V4.1 DSpark requires its trained block of {text.dspark_block_size} tokens")
+        self.num_speculative_tokens = text.dspark_block_size
+        draft.model_type = DeepseekV41Config.model_type
+        draft.architectures = [DSPARK_ARCHITECTURE]
+        draft.dspark_block_size = text.dspark_block_size
+        draft.dspark_target_layer_ids = text.dspark_target_layer_ids
+        draft.ptd_token_id = text.dspark_noise_token_id
+        draft.sample_from_anchor = True
+    return _orig_update_arch(self)
+
+
 SpeculativeConfig.hf_config_override = staticmethod(_normalize_legacy_qwen3_dspark_config)
+SpeculativeConfig.update_arch_ = _update_draft_arch
 SpeculativeConfig.__post_init__ = _dspark_post_init

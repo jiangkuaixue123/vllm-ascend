@@ -156,7 +156,7 @@ from vllm_ascend.sample.sampler import AscendSampler
 from vllm_ascend.spec_decode import get_spec_decode_method
 from vllm_ascend.spec_decode.dflash_proposer import AscendDflashProposer
 from vllm_ascend.spec_decode.draft_proposer import AscendDraftModelProposer
-from vllm_ascend.spec_decode.dspark_proposer import AscendDSparkProposer
+from vllm_ascend.spec_decode.dspark_proposer import AscendDeepseekV41DSparkProposer, AscendDSparkProposer
 from vllm_ascend.spec_decode.eagle_proposer import AscendEagleProposer
 from vllm_ascend.spec_decode.extract_hidden_states_proposer import (
     AscendExtractHiddenStatesProposer,
@@ -3422,6 +3422,11 @@ class NPUModelRunner(GPUModelRunner):
             ubid: int | None = None,
         ) -> None:
             attn_group = self.attn_groups[kv_cache_gid][attn_gid]
+            if isinstance(self.drafter, AscendDeepseekV41DSparkProposer) and self.drafter.owns_draft_group(
+                attn_group.layer_names
+            ):
+                # The proposer builds its own metadata from this group's block table.
+                return
             builder = attn_group.get_metadata_builder(ubid or 0)
             is_gdn_noop = skip_gdn_state_update and isinstance(
                 builder,
@@ -5190,7 +5195,15 @@ class NPUModelRunner(GPUModelRunner):
         for kv_cache_group_spec in kv_cache_config.kv_cache_groups:
             attn_backends = get_attn_backends_for_group(kv_cache_group_spec)
             attention_backend_maps.append(attn_backends[0])
-            attention_backend_list.append(attn_backends[1])
+            target_backends = attn_backends[1]
+            if isinstance(self.drafter, AscendDeepseekV41DSparkProposer):
+                # An eager draft-only backend cannot downgrade the target graph.
+                target_backends = {
+                    key.attn_backend
+                    for key, names in attn_backends[0].items()
+                    if not self.drafter.owns_draft_group(names)
+                }
+            attention_backend_list.append(target_backends)
 
         self._check_and_update_cudagraph_mode(
             attention_backend_list,

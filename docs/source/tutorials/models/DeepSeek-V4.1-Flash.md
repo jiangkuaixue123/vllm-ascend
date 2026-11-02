@@ -12,8 +12,10 @@
 | 专家并行 | TP8、DP2、EP16 运行通过，每个 EP rank 持有 24 个完整路由专家 |
 | Engram | 主机 mmap 按 TP 分片读取命中行，在设备端反量化，在当前 DP 的 TP 组内归约。decode 的命中行在 replay 前更新 |
 | ACLGraph | `FULL_DECODE_ONLY` 已在真实 40 层模型上完成 capture 和 replay，每个 DP 使用 1、2、4、8 行捕获尺寸覆盖 1–8 条 decode 请求。16 个真实 GPQA 请求时，两组都已验证 8 个活跃行重放。prefill 和混合批次使用 eager |
-| flashcomm1 | 当前 MoE 对打包 token 执行计算，要求 TP 内复制输入，与 flashcomm1 的序列分片不兼容 |
-| MTP / DSpark | 当前文本适配尚未实现推测解码 |
+| FlashComm1 | TP 内分片 token；路由专家通过 EP16 收集输入并将输出归约回 token 所在的 rank |
+| DSA-CP | 在各 TP rank 的本地 token 上计算完整查询头，使用 all-to-all 转换为输出投影的分头布局。该开关会启用序列并行 |
+| 共享专家 DP | 各 TP rank 加载完整共享专家并处理不同 token。三开关联合在 TP8 / DP2 / EP16 下完成 21 条合成请求的逐 token 对照 |
+| DSpark | 读取检查点中的三层草稿、独立 embedding 和输出头。草稿在 eager 下提议 5 个 token，目标模型按 6 个位置校验 |
 | 图片输入 | 本次验证范围仅含文本 |
 
 ## 环境准备
@@ -75,6 +77,31 @@ vllm serve "$MODEL_PATH" \
 
 测 eager 时将 `--compilation-config` 及其值替换为 `--enforce-eager`，其余参数保持一致。
 
+### 启用并行优化
+
+在上面的命令中添加以下参数可启用三个开关。联合验证时，使用 `--max-model-len 512`、`--max-num-seqs 8` 和下面的整图配置替换原图配置。每个 DP 的实际 1–8 条均匀 decode 请求使用同一个按 TP8 对齐的图。
+
+```bash
+--additional-config '{"enable_dsa_cp":true,"enable_flashcomm1":true,"enable_shared_expert_dp":true}' \
+--compilation-config '{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[8]}'
+```
+
+在同一节点的 512 上下文上，使用固定的 32 个输出 token 和贪心解码。三个开关联合开启时，两 DP 分别接收 1/0、3/1、8/8 个请求，合计 21 条输出与此前无开关部署逐 token 一致。8/8 批次的实测吞吐分别为 26.99 和 21.75 输出 token/s。
+
+### DSpark 与 fused MoE
+
+该检查点训练了三层 DSpark 草稿。目标模型第 37、38、39 层把 Engram 注入后的 HC 输入提供给草稿。在上面的 TP8 / DP2 / EP16 服务命令中保留三项并行优化，添加投机参数并替换图配置。
+
+```bash
+--additional-config '{"enable_dsa_cp":true,"enable_flashcomm1":true,"enable_shared_expert_dp":true}' \
+--speculative-config '{"method":"dspark","num_speculative_tokens":5}' \
+--compilation-config '{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[24,48]}'
+```
+
+草稿在 eager 下计算，目标模型对锚点和 5 个提议位置做因果校验。每个 DP 最多 8 个请求，24 与 48 个 token 的整图尺寸同时满足 TP8 和每请求 6 个校验位置的对齐要求。prefill 和混合批次走 eager。
+
+文本目标与草稿的路由专家均由 Ascend fused MoE runner 执行。目标每个 token 选择 6/384 个专家，草稿选择 3/128 个。分组矩阵乘在 SwiGLU 之后乘入 FP32 路由权重，再把激活量化给 W2。开启共享专家 DP 时，每个 TP rank 持有该层完整的共享专家。
+
 ## 功能验证
 
 在同一容器的另一个终端查询模型列表并提交聊天请求。`thinking_mode=chat` 指定直接回答，便于复现短请求。
@@ -92,9 +119,9 @@ curl --fail --noproxy '*' http://127.0.0.1:8000/v1/chat/completions \
 
 | 数据集 | 样本数 | 协议 | 准确率 |
 | --- | ---: | --- | --- |
-| GPQA Diamond | 198 | 零样本，seed 0，temperature 0，top-p 1，最大输出 16,384 token，并发 16 | 待 198 题完成 |
+| GPQA Diamond | 198 | 零样本，seed 0，temperature 0，top-p 1，最大输出 16,384 token，并发 16 | 本轮已停止，完整准确率为空 |
 
-使用数据 revision `56686c06f5e19865c153de0fdb11be3890014df7`，Diamond CSV 的 SHA256 为 `41d1213cd7a4998605a26c2798500652572007161b3a92817ba46b35befcd305`。模板参数为 `enable_thinking=true`、`reasoning_effort=high`。服务端用基线 `deepseek_v3` parser 分离推理和最终回答，评测器只读取最终回答。运行 198 题之前，用非数据集选择题验证了这一边界。固定选项乱序后对 198 题逐题计分，HTTP 错误、截断、无法解析均计错，全部题目完成后填写准确率。
+使用数据 revision `56686c06f5e19865c153de0fdb11be3890014df7`，Diamond CSV 的 SHA256 为 `41d1213cd7a4998605a26c2798500652572007161b3a92817ba46b35befcd305`。模板参数为 `enable_thinking=true`、`reasoning_effort=high`。服务端用基线 `deepseek_v3` parser 分离推理和最终回答，评测器只读取最终回答。运行 198 题之前，用非数据集选择题验证了这一边界。固定选项乱序后对 198 题逐题计分，HTTP 错误、截断、无法解析均计错，本轮共发出 33 题，其中 17 题有终态、16 题正确。
 
 ## 性能与容量
 
@@ -112,3 +139,15 @@ curl --fail --noproxy '*' http://127.0.0.1:8000/v1/chat/completions \
 该对照的 TPOT 降低 42.29%，TTFT 增加 130.80 ms。多行图和 32,768 上下文属于不同的服务配置。
 
 在上文的 32,768 上下文、多尺寸图部署中，使用同一输入和 32 个输出 token，3 次单请求 TPOT 分别为 340.80、340.99、340.65 ms/token。中位数为 **340.80 ms/token**，TTFT 中位数为 **1246.51 ms**。两组 DP 的 16 并发实测另行验证，已在真实数据集请求之后观察到每组 8 行的 FULL 重放。
+
+### Fused MoE 与 DSpark 单请求性能
+
+在同一份 fused MoE 插件和 W8A8 检查点上固定 TP8 / DP2 / EP16、512 上下文、128 个 batched tokens、每 DP 最多 8 条序列。每组向 DP0 单独发送相同的 20-token 提示，贪心生成 32 个 token。预热一次后串行测五次，三组的输入和生成 token ID 均一致。TPOT 为最后一个与第一个输出 token 的客户端到达时间差除以 31，投机返回的一帧可含多个 token。
+
+| 配置 | 单请求图尺寸 | TPOT 中位数（ms/token） | TTFT 中位数（ms） |
+| --- | ---: | ---: | ---: |
+| 三开关关闭，DSpark 关闭 | 1 | 209.41 | 856.25 |
+| 三开关开启，DSpark 关闭 | 8 | 344.89 | 1154.63 |
+| 三开关开启，DSpark 开启 | 24 | 59.16 | 964.44 |
+
+相对全关组，三开关加 DSpark 的 TPOT 降低 71.75%。相对只开三项并行优化的组，加入 DSpark 后降低 82.85%。在这条提示的五次正式请求中，草稿共提议 150 个 token，目标接受 150 个。目标端实际重放了 24 行图，其中有 6 个活跃校验位置。

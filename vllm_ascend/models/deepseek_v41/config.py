@@ -5,6 +5,8 @@ from copy import deepcopy
 
 from transformers import AutoConfig, PretrainedConfig
 
+DSPARK_ARCHITECTURE = "DeepseekV41DSparkForCausalLM"
+
 
 class DeepseekV41TextConfig(PretrainedConfig):
     model_type = "deepseek_v41_text"

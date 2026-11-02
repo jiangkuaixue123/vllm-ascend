@@ -106,6 +106,7 @@ def test_invalid_tp_shape_cannot_silently_drop_or_reshape_weights(shape):
 @pytest.fixture
 def indexed_model(tmp_path, monkeypatch):
     model = unloaded_module(model_module.DeepseekV41ForCausalLM)
+    model.sequence_parallel = False
     model.model_path = tmp_path
     model.engram_store = None
     model.engram_layer_ids = ()
@@ -191,6 +192,7 @@ def paged_hash_model():
     cache = DeepseekV41Cache(config, vllm_config, "hash-test.cache")
     cache.kv_cache = torch.zeros(2, 20, 2, 1, cache.width, dtype=torch.float32)
     model = unloaded_module(model_module.DeepseekV41ForCausalLM)
+    model.sequence_parallel = False
     model.config = config
     model.engram_hasher = hasher
     model.layers = nn.ModuleList([IdleRecordingBlock(cache)])
@@ -485,3 +487,66 @@ def test_graph_reports_live_rows_without_engram(staged_hash_model):
     before = cache.kv_cache.clone()
     assert model.prepare_decode_graph_inputs(torch.zeros(4, dtype=torch.long), torch.zeros(4, dtype=torch.long)) == 2
     torch.testing.assert_close(cache.kv_cache, before)
+
+
+def test_sequence_parallel_hc_keeps_local_rows_and_gathers_only_unpadded_tokens(paged_hash_model, monkeypatch):
+    model = paged_hash_model
+    model.sequence_parallel = True
+    rows = torch.arange(5 * model.config.hidden_size, dtype=torch.float32).view(5, -1)
+    padded = torch.cat((rows, rows.new_zeros(1, rows.shape[1])))
+    # Emulate the second contiguous shard: two real rows and one pad row.
+    monkeypatch.setattr(model_module, "sp_shard", lambda x: padded[3:])
+    observed = []
+
+    def gather(local):
+        torch.testing.assert_close(local, padded[3:])
+        observed.append(local.shape)
+        return padded
+
+    monkeypatch.setattr(model_module, "sp_all_gather", gather)
+    local, mix = model._start_hc(rows)
+    assert local.shape == (3, model.config.hc_mult, model.config.hidden_size)
+    torch.testing.assert_close(model._finish_hc(local, mix, len(rows)), rows)
+    assert observed == [(3, model.config.hidden_size)]
+
+
+def test_dspark_graph_buckets_and_aux_layer_input(paged_hash_model):
+    config = SimpleNamespace(
+        cudagraph_mode=model_module.CUDAGraphMode.FULL_DECODE_ONLY, cudagraph_capture_sizes=[24, 48]
+    )
+    assert model_module._decode_capture_sizes(config, 6) == {24, 48}
+    config.cudagraph_capture_sizes = [8]
+    with pytest.raises(ValueError, match="width 6"):
+        model_module._decode_capture_sizes(config, 6)
+    model = paged_hash_model
+    model.config.dspark_target_layer_ids = [0, 1]
+    model.set_aux_hidden_state_layers((1, 2))
+    with pytest.raises(ValueError, match="projection order"):
+        model.set_aux_hidden_state_layers((2, 1))
+    hidden = torch.arange(24, dtype=torch.float32).reshape(3, 2, 4)
+    auxiliary = []
+    for layer_id in range(3):
+        model._capture_aux(auxiliary, layer_id, hidden + layer_id, 3)
+    assert len(auxiliary) == 2
+    for layer_id, captured in enumerate(auxiliary):
+        torch.testing.assert_close(captured, hidden.mean(dim=1) + layer_id)
+
+
+def test_dspark_graph_hash_discards_rejected_suffix(staged_hash_model):
+    model = staged_hash_model
+    model._decode_capture_sizes = {6}
+    cache = model.layers[0].attn.cache
+    table = torch.tensor([[0, 1, 2, 3, 4, 5]], dtype=torch.int32)
+    previous = []
+    for start, tokens in [(0, [2, 6, 8, 9, 12, 3]), (2, [3, 1, 4, 7, 18, 9])]:
+        positions = torch.arange(start, start + 6)
+        decode = DeepseekV41DecodeMetadata(
+            positions + 1, positions, table.expand(6, -1), torch.ones(6, dtype=torch.bool), 12, 6
+        )
+        md = DeepseekV41Metadata([], table, positions, 6, decode)
+        cache.metadata = lambda md=md: md
+        assert model.prepare_decode_graph_inputs(torch.tensor(tokens), positions) == 6
+        previous = previous[:start] + tokens
+        expected = model.engram_hasher.hash_tokens(previous, model.engram_hasher.new_state(), start_position=0)[-6:]
+        for layer_id in model.engram_layer_ids:
+            torch.testing.assert_close(model._decode_engram_values[6, layer_id], expected[:, layer_id])

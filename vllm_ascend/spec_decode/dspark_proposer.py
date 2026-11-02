@@ -5,6 +5,7 @@ from typing import Any
 
 import torch
 from vllm.config import CUDAGraphMode, VllmConfig, get_layers_from_vllm_config
+from vllm.logger import logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
@@ -417,3 +418,42 @@ class AscendDSparkProposer(AscendDflashProposer):
                     multi_steps_attn_metadata=[],
                     num_tokens=num_input_tokens,
                 )
+
+
+class AscendDeepseekV41DSparkProposer(AscendDSparkProposer):
+    """Reuse the block proposer and Markov sampler with the embedded V4.1 draft."""
+
+    # mtp.0.embed and the FP32 mtp.2.head are distinct checkpoint tensors.
+    share_target_weights = False
+
+    def __init__(self, vllm_config, device, runner=None):
+        if get_ascend_config().enable_reduce_sample:
+            raise ValueError("V4.1 DSpark requires the sequential Markov sampler")
+        super().__init__(vllm_config, device, runner)
+
+    def owns_draft_group(self, layer_names) -> bool:
+        """The target never executes the separate eager draft attention layers."""
+        return bool(layer_names) and self._draft_attn_layer_names.issuperset(layer_names)
+
+    def prepare_inputs(self, common_attn_metadata, sampled_token_ids, num_draft_tokens):
+        compact, indices = super().prepare_inputs(common_attn_metadata, sampled_token_ids, num_draft_tokens)
+        # The parent already compacted the primary mapping in place. Other
+        # physical groups must select the same target rows as the aux states.
+        updated = {common_attn_metadata.slot_mapping.data_ptr()}
+        for group in self.draft_attn_groups:
+            slots = self._per_group_slot_mappings[group.kv_cache_group_id]
+            if slots.data_ptr() not in updated:
+                slots[: indices.numel()].copy_(slots.index_select(0, indices.long()))
+                slots[indices.numel() :].fill_(-1)
+                updated.add(slots.data_ptr())
+        return compact, indices
+
+    def dummy_run(self, *args, **kwargs):
+        # A DP replica may become idle immediately after a real proposal. Its
+        # dummy rows participate in EP but must never overwrite prior requests.
+        self._context_slot_mapping_buffers = None
+        return super().dummy_run(*args, **kwargs)
+
+    def _combine_target_hidden_states(self, model, hidden_states):
+        logger.info_once("V4.1 DSpark projecting target auxiliary states for block proposal")
+        return model.combine_hidden_states(hidden_states)

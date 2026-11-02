@@ -11,13 +11,16 @@ import math
 from dataclasses import dataclass, field
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 from vllm.distributed import (
     get_tensor_model_parallel_world_size,
+    get_tp_group,
     tensor_model_parallel_all_reduce,
 )
 from vllm.forward_context import get_forward_context
+from vllm.logger import logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -31,6 +34,8 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
 )
 from vllm.v1.kv_cache_interface import FullAttentionSpec
+
+from vllm_ascend.utils import enable_dsa_cp, enable_sp
 
 from .attention_ops import (
     apply_rotary_emb_real,
@@ -62,6 +67,19 @@ class DeepseekV41DecodeMetadata:
     active: torch.Tensor
     max_model_len: int
 
+    query_width: int = 1
+
+    def shard(self, start, rows):
+        local = slice(start, start + rows)
+        return DeepseekV41DecodeMetadata(
+            self.seq_lens[local],
+            self.slot_mapping[local],
+            self.block_table_tensor[local],
+            self.active[local],
+            self.max_model_len,
+            self.query_width,
+        )
+
 
 @dataclass
 class DeepseekV41Metadata:
@@ -77,7 +95,8 @@ class DeepseekV41Metadata:
 
 
 class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
-    _cudagraph_support = AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
+    _cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
+    query_width = 1
 
     def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
@@ -86,12 +105,19 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
         self.decode_graph_enabled = not vllm_config.model_config.enforce_eager
         self.max_model_len = vllm_config.model_config.max_model_len
         self.block_size = kv_cache_spec.block_size
+        self.query_width = 1 + vllm_config.num_speculative_tokens
 
-    def _update_decode(self, common, capture=False):
+    def _update_decode(self, common, capture=False, bounds=None):
         if not self.decode_graph_enabled and not capture:
             return None
         rows = getattr(common, "num_input_tokens", None) or common.num_actual_tokens
-        if rows not in self.capture_sizes or common.num_reqs > rows or common.max_query_len > 1:
+        width_q = self.query_width
+        if (
+            rows not in self.capture_sizes
+            or rows % width_q
+            or common.num_reqs > rows // width_q
+            or common.max_query_len != width_q
+        ):
             if capture:
                 raise ValueError("V4.1 graph capture requires a configured uniform decode bucket")
             return None
@@ -106,12 +132,16 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
                 torch.zeros(rows, width, dtype=torch.int32, device=device),
                 torch.zeros(rows, dtype=torch.bool, device=device),
                 self.max_model_len,
+                width_q,
             )
         decode = self.decode_buffers[rows]
         decode.block_table_tensor.zero_()
         # The Ascend runner may pad both num_reqs and num_input_tokens while
         # num_actual_tokens remains the count of scheduled one-token rows.
-        live = min(common.num_actual_tokens, common.num_reqs)
+        live = min(common.num_actual_tokens, common.num_reqs * width_q)
+        if width_q > 1 and not capture:
+            if live % width_q or any(end - begin != width_q for begin, end in zip(bounds, bounds[1:]) if begin < live):
+                return None
         decode.seq_lens[live:].zero_()
         decode.slot_mapping[live:].fill_(-1)
         if capture or not live:
@@ -123,8 +153,16 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
         columns = min(width, src.shape[1])
         if columns * self.block_size < common.max_seq_len:
             raise ValueError("V4.1 block table does not span the decode context")
-        decode.block_table_tensor[:live, :columns].copy_(src[:live, :columns])
-        decode.seq_lens[:live].copy_(common.seq_lens[:live])
+        if width_q == 1:
+            decode.block_table_tensor[:live, :columns].copy_(src[:live, :columns])
+            decode.seq_lens[:live].copy_(common.seq_lens[:live])
+        else:
+            # Keep one physical page table per query token. Earlier proposals
+            # must neither attend to later proposals nor index their compressed KV.
+            token = torch.arange(live, device=device)
+            request = token // width_q
+            decode.block_table_tensor[:live, :columns].copy_(src[:, :columns].index_select(0, request))
+            decode.seq_lens[:live].copy_(common.seq_lens.index_select(0, request) + token % width_q + 1 - width_q)
         decode.slot_mapping[:live].copy_(common.slot_mapping[:live])
         decode.active.copy_((decode.seq_lens > 0) & (decode.slot_mapping >= 0))
         return decode
@@ -137,19 +175,24 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
     def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
         common: CommonAttentionMetadata = common_attn_metadata
         bounds = common.query_start_loc_cpu[: common.num_reqs + 1].tolist()
-        # V4.1 rejects speculative decoding; the runner's CPU lengths are
-        # exact in this mode. Otherwise synchronize outside graph capture.
-        lengths_cpu = getattr(common, "seq_lens_cpu_upper_bound", None)
+        decode = self._update_decode(common, bounds=bounds)
+        # Under async rejection only the device has the accepted boundary.
+        lengths_cpu = getattr(common, "seq_lens_cpu_upper_bound", None) if self.query_width == 1 else None
         if lengths_cpu is None:
             lengths_cpu = common.seq_lens.cpu()
         lengths = lengths_cpu[: common.num_reqs].tolist()
-        requests = [RequestSpan(begin, end, length) for begin, end, length in zip(bounds, bounds[1:], lengths)]
+        actual = common.num_actual_tokens
+        requests = [
+            RequestSpan(begin, min(end, actual), length)
+            for begin, end, length in zip(bounds, bounds[1:], lengths)
+            if begin < actual and begin < end
+        ]
         return DeepseekV41Metadata(
             requests,
             common.block_table_tensor,
             common.slot_mapping,
-            bounds[-1],
-            self._update_decode(common),
+            actual,
+            decode,
         )
 
 
@@ -241,6 +284,16 @@ class DeepseekV41Cache(nn.Module, AttentionLayerBase):
         page = self.pages()[bank][:, offset : offset + values.shape[-1]]
         valid = enabled & md.active & (md.slot_mapping >= 0) & (md.slot_mapping < page.shape[0])
         slots = torch.where(valid, md.slot_mapping, 0)
+        if md.query_width > 1:
+            # A verify bucket can contain 48 rows. All live slots are unique.
+            # For the one shared destination of masked rows, select its final
+            # bits before the write, so every alias writes the same value.
+            zero_is_live = valid & (slots == 0)
+            zero_row = zero_is_live.long().argmax().reshape(1)
+            zero_value = torch.where(zero_is_live.any(), values.index_select(0, zero_row).float(), page[:1])
+            updates = torch.where(slots[:, None] == 0, zero_value, values.float())
+            page.index_copy_(0, slots, updates)
+            return
         # Unroll the fixed bucket on the capture stream. A masked row that
         # aliases slot zero reads its latest value, after any earlier live row.
         # A vectorized index_copy_ with duplicate destinations is undefined.
@@ -350,16 +403,17 @@ class DeepseekV41Compressor(nn.Module):
 
 
 class DeepseekV41Indexer(nn.Module):
-    def __init__(self, config, owns_k, quant_config, prefix):
+    def __init__(self, config, owns_k, quant_config, prefix, dsa_cp=False):
         super().__init__()
-        self.wq_b = ColumnParallelLinear(
+        projection = ReplicatedLinear if dsa_cp else ColumnParallelLinear
+        self.wq_b = projection(
             config.q_lora_rank,
             config.index_n_heads * config.index_head_dim,
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.wq_b",
         )
-        self.weights_proj = ColumnParallelLinear(
+        self.weights_proj = projection(
             config.hidden_size,
             config.index_n_heads,
             bias=False,
@@ -386,9 +440,12 @@ class DeepseekV41Attention(nn.Module):
         self.config = config
         self.layer_id = layer_id
         self.ratio = config.compress_ratios[layer_id]
-        self.heads = config.num_attention_heads // tp
+        self.sequence_group = get_tp_group() if tp > 1 and enable_sp(vllm_config) else None
+        self.dsa_cp = self.sequence_group is not None and enable_dsa_cp()
+        self.local_heads = config.num_attention_heads // tp
+        self.heads = config.num_attention_heads if self.dsa_cp else self.local_heads
         self.groups = config.o_groups // tp
-        self.index_heads = config.index_n_heads // tp
+        self.index_heads = config.index_n_heads if self.dsa_cp else config.index_n_heads // tp
         self.tp = tp
         self.dim = config.head_dim
         self.rope_dim = config.qk_rope_head_dim
@@ -404,7 +461,8 @@ class DeepseekV41Attention(nn.Module):
             prefix=f"{prefix}.wq_a",
         )
         self.q_norm = DeepseekV41RMSNorm(config.q_lora_rank, config.rms_norm_eps)
-        self.wq_b = ColumnParallelLinear(
+        q_projection = ReplicatedLinear if self.dsa_cp else ColumnParallelLinear
+        self.wq_b = q_projection(
             config.q_lora_rank,
             config.num_attention_heads * self.dim,
             bias=False,
@@ -436,7 +494,9 @@ class DeepseekV41Attention(nn.Module):
         )
         self.compressor = DeepseekV41Compressor(config, self.ratio) if self.owns_kv else None
         self.indexer = (
-            DeepseekV41Indexer(config, self.owns_kv, quant_config, f"{prefix}.indexer") if self.owns_index else None
+            DeepseekV41Indexer(config, self.owns_kv, quant_config, f"{prefix}.indexer", self.dsa_cp)
+            if self.owns_index
+            else None
         )
         self.cache = DeepseekV41Cache(config, vllm_config, f"{prefix}.cache")
         self.register_buffer(
@@ -519,7 +579,7 @@ class DeepseekV41Attention(nn.Module):
         weights = indexer.weights_proj(x)[0] * (self.config.index_head_dim**-0.5 * self.config.index_n_heads**-0.5)
         scores = torch.einsum("shd,td->sht", q, shared.index_keys)
         scores = (scores.relu_() * weights.unsqueeze(-1)).sum(1)
-        if self.tp > 1:
+        if self.tp > 1 and not self.dsa_cp:
             scores = tensor_model_parallel_all_reduce(scores)
         lengths = ((positions + 1) // self.ratio).unsqueeze(-1)
         scores.masked_fill_(torch.arange(count, device=x.device) >= lengths, -torch.inf)
@@ -588,7 +648,7 @@ class DeepseekV41Attention(nn.Module):
         weights = indexer.weights_proj(x)[0] * (self.config.index_head_dim**-0.5 * self.config.index_n_heads**-0.5)
         scores = torch.einsum("bhd,btd->bht", q, keys)
         scores = (scores.relu_() * weights.unsqueeze(-1)).sum(1)
-        if self.tp > 1:
+        if self.tp > 1 and not self.dsa_cp:
             scores = tensor_model_parallel_all_reduce(scores)
         lengths = torch.where(md.active, md.seq_lens // self.ratio, 0)[:, None]
         scores.masked_fill_(groups >= lengths, -torch.inf)
@@ -605,20 +665,43 @@ class DeepseekV41Attention(nn.Module):
         indices = topk_columns(scores, min(self.config.index_topk, capacity)).sort(-1).values
         runtime.decode_topk = torch.where(indices < lengths, indices, -1)
 
-    def _decode_forward(self, x, runtime):
-        md = self.cache.metadata().decode
-        if md is None or x.shape[0] != md.active.shape[0]:
+    def _sequence_inputs(self, hidden_states, phase):
+        if self.sequence_group is None:
+            return hidden_states, 0
+        group = self.sequence_group
+        gathered = group.all_gather(hidden_states.contiguous(), dim=0)
+        local_rows = hidden_states.shape[0]
+        logger.info_once(
+            "V4.1 sequence attention layout=%s phase=%s tp_rank=%d local_rows=%d global_rows=%d",
+            "dsa_cp" if self.dsa_cp else "flashcomm1",
+            phase,
+            group.rank_in_group,
+            local_rows,
+            gathered.shape[0],
+            scope="process",
+        )
+        return gathered, group.rank_in_group * local_rows
+
+    def _decode_forward(self, local_states, runtime):
+        full_md = self.cache.metadata().decode
+        gathered, offset = self._sequence_inputs(local_states, "uniform_decode")
+        if full_md is None or gathered.shape[0] != full_md.active.shape[0]:
             raise ValueError("V4.1 graph token rows must match the decode metadata bucket")
-        pos = (md.seq_lens - 1).clamp_min(0)
+        local_md = full_md.shard(offset, local_states.shape[0]) if self.sequence_group is not None else full_md
+        x, md = (local_states, local_md) if self.dsa_cp else (gathered, full_md)
+        full_pos = (full_md.seq_lens - 1).clamp_min(0)
+        pos = full_pos[offset : offset + x.shape[0]] if self.dsa_cp else full_pos
         qr = self.q_norm(self.wq_a(x)[0])
         q = self.wq_b(qr)[0].view(x.shape[0], self.heads, self.dim)
-        raw = self.kv_norm(self.wkv(x)[0])
+        raw = self.kv_norm(self.wkv(gathered)[0])
         self.rotate(q.unsqueeze(0), pos)
-        self.rotate(raw.unsqueeze(0), pos)
-        self.cache.decode_write(md, fp8_quant_dequant(raw, 32), 0, 0, md.active)
+        self.rotate(raw.unsqueeze(0), full_pos)
+        self.cache.decode_write(full_md, fp8_quant_dequant(raw, 32), 0, 0, full_md.active)
         extra = 0
         if self.ratio:
-            self._decode_compressed(x, pos, md, runtime)
+            self._decode_compressed(gathered, full_pos, full_md, runtime)
+            if self.owns_kv:
+                runtime.source_decode = md
             self._decode_index(x, qr, pos, md, runtime)
             extra = runtime.decode_topk.shape[-1]
         window = self.config.sliding_window
@@ -648,23 +731,25 @@ class DeepseekV41Attention(nn.Module):
         attended = sparse_attn(q.unsqueeze(1), selected.to(x.dtype), self.attn_sink, ids, self.dim**-0.5)[:, 0]
         self.rotate(attended.unsqueeze(0), pos, inverse=True)
         output = self._project_output(attended, x.dtype)
-        return torch.where(md.active[:, None], output, 0)
+        return torch.where(local_md.active[:, None], output, 0)
 
     def forward(self, hidden_states, runtime):
         if runtime.decode is not None:
             return self._decode_forward(hidden_states, runtime)
         metadata = self.cache.metadata()
-        qr = self.q_norm(self.wq_a(hidden_states)[0])
+        gathered, offset = self._sequence_inputs(hidden_states, "eager")
+        queries_input = hidden_states if self.dsa_cp else gathered
+        start = offset if self.dsa_cp else 0
+        qr = self.q_norm(self.wq_a(queries_input)[0])
         queries = self.wq_b(qr)[0].view(-1, self.heads, self.dim)
-        raw_kv = self.kv_norm(self.wkv(hidden_states)[0])
-        output = torch.empty_like(queries)
+        raw_kv = self.kv_norm(self.wkv(gathered)[0])
+        output = torch.zeros_like(queries)
         for request_idx, request in enumerate(runtime.requests):
             begin, end = request.begin, request.end
             if begin == end:
                 continue
             positions = torch.arange(request.start_pos, request.seq_len, device=hidden_states.device)
-            q, kv = queries[begin:end], raw_kv[begin:end]
-            self.rotate(q.unsqueeze(0), positions)
+            kv = raw_kv[begin:end]
             self.rotate(kv.unsqueeze(0), positions)
             kv = fp8_quant_dequant(kv, 32)
             first = max(0, request.start_pos - self.config.sliding_window + 1)
@@ -673,22 +758,31 @@ class DeepseekV41Attention(nn.Module):
                 self.cache.pages()[0][slots, : self.dim] = kv.float()
                 history = torch.arange(first, request.seq_len, device=hidden_states.device)
                 kv = self.cache.read(metadata, request_idx, history, 0, 0, self.dim).to(kv.dtype)
-            width = min(self.config.sliding_window, request.seq_len)
-            window = (positions - self.config.sliding_window + 1).clamp_min(0)
-            window = window.unsqueeze(-1)
-            window = window + torch.arange(width, device=hidden_states.device)
-            indices = torch.where(window <= positions.unsqueeze(-1), window - first, -1)
             if self.ratio:
                 shared = runtime.shared[request_idx]
                 self._compressed(
-                    hidden_states[begin:end],
+                    gathered[begin:end],
                     positions,
                     metadata,
                     request_idx,
                     request,
                     shared,
                 )
-                compressed_indices = self._index(hidden_states[begin:end], qr[begin:end], positions, shared)
+            # Every CP rank writes the same complete KV cache, even when this
+            # request has no queries in the rank's contiguous token shard.
+            lo, hi = max(begin, start), min(end, start + queries_input.shape[0])
+            if lo >= hi:
+                continue
+            rows = slice(lo - start, hi - start)
+            positions = positions[lo - begin : hi - begin]
+            q = queries[rows]
+            self.rotate(q.unsqueeze(0), positions)
+            width = min(self.config.sliding_window, request.seq_len)
+            window = (positions - self.config.sliding_window + 1).clamp_min(0)
+            window = window.unsqueeze(-1) + torch.arange(width, device=hidden_states.device)
+            indices = torch.where(window <= positions.unsqueeze(-1), window - first, -1)
+            if self.ratio:
+                compressed_indices = self._index(queries_input[rows], qr[rows], positions, shared)
                 indices = torch.cat(
                     (
                         indices,
@@ -709,15 +803,28 @@ class DeepseekV41Attention(nn.Module):
                 self.dim**-0.5,
             )[0]
             self.rotate(attended.unsqueeze(0), positions, inverse=True)
-            output[begin:end] = attended
+            output[rows] = attended
         return self._project_output(output, hidden_states.dtype)
 
     def _project_output(self, output, dtype):
-        output = output.view(-1, self.groups, self.heads * self.dim // self.groups)
+        if self.dsa_cp:
+            # Exchange local tokens and complete heads for complete tokens and
+            # local heads. Each receiver owns the matching wo_a / wo_b slice.
+            send = output.reshape(-1, self.tp, self.local_heads, self.dim).transpose(0, 1).contiguous()
+            send = send.reshape(-1, self.local_heads, self.dim)
+            output = torch.empty_like(send)
+            dist.all_to_all_single(output, send, group=self.sequence_group.device_group)
+        output = output.view(-1, self.groups, self.local_heads * self.dim // self.groups)
         output = fp8_quant_dequant(output, 32)
         projection = self.wo_a.weight.view(self.groups, self.config.o_lora_rank, -1)
         output = torch.einsum("sgd,grd->sgr", output, projection).flatten(1)
-        output = self.wo_b(output)[0].float()
-        if self.tp > 1:
-            output = tensor_model_parallel_all_reduce(output)
+        if self.sequence_group is not None:
+            # The input is already the local WO column slice. Keep the BF16
+            # linear partial and perform precisely one FP32 TP reduce-scatter.
+            output = self.wo_b.quant_method.apply(self.wo_b, output, bias=None)
+            output = self.sequence_group.reduce_scatter(output.float(), dim=0)
+        else:
+            output = self.wo_b(output)[0].float()
+            if self.tp > 1:
+                output = tensor_model_parallel_all_reduce(output)
         return output.to(dtype)

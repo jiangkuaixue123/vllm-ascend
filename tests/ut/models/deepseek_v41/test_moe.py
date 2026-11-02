@@ -1,12 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
+
 import pytest
 import torch
+from safetensors import safe_open
+from safetensors.torch import save_file
 from torch import nn
 
 from vllm_ascend.models.deepseek_v41 import moe
 from vllm_ascend.models.deepseek_v41.config import DeepseekV41TextConfig
+from vllm_ascend.models.deepseek_v41.model import read_parameter_slice
 
 
 def test_ep16_owns_each_of_384_experts_exactly_once():
@@ -319,3 +324,238 @@ def test_decode_changes_routes_without_changing_expert_input_shape(tiny_linears)
         torch.testing.assert_close(captured_shape[valid], eager)
         assert (captured_shape[~valid] == 0).all()
         assert all(expert.w2.seen.shape == (slots, 1) for expert in layer.experts)
+
+
+class ExpectedGroup:
+    """Check the exact collective inputs and return the dense-reference result."""
+
+    def __init__(self, rank, size, operations):
+        self.rank_in_group, self.world_size = rank, size
+        self.operations = list(operations)
+
+    def run(self, op, values):
+        expected_op, expected, result = self.operations.pop(0)
+        assert op == expected_op
+        torch.testing.assert_close(values, expected)
+        return result.clone()
+
+    def all_reduce(self, values):
+        return self.run("sum", values)
+
+    def all_gather(self, values, dim):
+        assert dim == 0
+        return self.run("gather", values)
+
+    def reduce_scatter(self, values, dim):
+        assert dim == 0 and values.dtype == torch.float32
+        return self.run("scatter", values)
+
+
+def pad_rows(states, size):
+    return torch.cat((states, states.new_zeros(size - states.shape[0], states.shape[1])))
+
+
+def silu_times_up(x):
+    return torch.nn.functional.silu(x) * x
+
+
+@pytest.mark.parametrize(
+    "sequence_parallel,replicated_shared", [(False, False), (False, True), (True, False), (True, True)]
+)
+@pytest.mark.parametrize("decode,idle_second", [(False, False), (False, True), (True, False), (True, True)])
+def test_parallel_modes_match_dense_reference_on_tp8_dp2_ep16(
+    monkeypatch, sequence_parallel, replicated_shared, decode, idle_second
+):
+    tp_size, ep_size = 8, 16
+
+    class Column(TinyLinear):
+        def __init__(self, inputs, outputs, **kwargs):
+            super().__init__(inputs, outputs // tp_size, **kwargs)
+
+    class Row(TinyLinear):
+        def __init__(self, inputs, outputs, **kwargs):
+            super().__init__(inputs // tp_size, outputs, **kwargs)
+
+    monkeypatch.setattr(moe, "ReplicatedLinear", TinyLinear)
+    monkeypatch.setattr(moe, "ColumnParallelLinear", Column)
+    monkeypatch.setattr(moe, "RowParallelLinear", Row)
+    monkeypatch.setattr(moe, "tensor_model_parallel_all_reduce", lambda x: x * tp_size)
+    config = moe.DeepseekV41TextConfig(
+        hidden_size=1, moe_intermediate_size=tp_size, n_routed_experts=ep_size, num_experts_per_tok=2
+    )
+    sizes = (8, 8) if decode else (11, 0 if idle_second else 3)
+    raw = [(torch.arange(n).float().unsqueeze(1) + 1 + 2 * d) / 8 for d, n in enumerate(sizes)]
+    masks = [torch.ones(n, dtype=torch.bool) for n in sizes]
+    if decode:
+        masks[0][1::2] = False
+        masks[1][::2] = False
+        if idle_second:
+            masks[1].fill_(False)
+    full = [torch.where(mask[:, None], x, 0.0) for x, mask in zip(raw, masks)]
+    widths = [(n + tp_size - 1) // tp_size for n in sizes]
+    padded = [pad_rows(x, w * tp_size) for x, w in zip(full, widths)]
+    shards = [padded[d].narrow(0, rank * widths[d], widths[d]) for d in range(2) for rank in range(tp_size)]
+    ep_width = max(widths)
+    gathered = torch.cat([pad_rows(x, ep_width) for x in shards]) if sequence_parallel else torch.cat(full)
+    activations = silu_times_up(gathered)
+    # Bias selects experts 0 and 15 at weight .75 each. W2 multiplies expert i
+    # by i+1, and every full expert has eight identical intermediate channels.
+    routed = (1 + ep_size) * 0.75 * tp_size * activations
+    for ep_rank in range(ep_size):
+        dp_rank, tp_rank = divmod(ep_rank, tp_size)
+        local = shards[ep_rank] if sequence_parallel else full[dp_rank]
+        factor = 0.75 * tp_size * (ep_rank + 1) if ep_rank in (0, ep_size - 1) else 0
+        expected_partial = factor * activations
+        if sequence_parallel:
+            dp_chunks = [shards[d * tp_size + tp_rank] for d in range(2)]
+            ep_ops = [
+                ("gather", pad_rows(local, ep_width), gathered),
+                ("scatter", expected_partial, routed.narrow(0, ep_rank * ep_width, ep_width)),
+            ]
+        else:
+            dp_chunks = full
+            ep_ops = [("sum", expected_partial, routed)]
+        tp_ops = []
+        if local.shape[0] and sequence_parallel and not replicated_shared:
+            tp_ops = [
+                ("gather", local, padded[dp_rank]),
+                ("scatter", silu_times_up(padded[dp_rank]), tp_size * silu_times_up(local)),
+            ]
+        elif local.shape[0] and replicated_shared and not sequence_parallel:
+            tp_ops = [("gather", tp_size * silu_times_up(shards[ep_rank]), tp_size * silu_times_up(padded[dp_rank]))]
+        tp = ExpectedGroup(tp_rank, tp_size, tp_ops)
+        ep = ExpectedGroup(ep_rank, ep_size, ep_ops)
+        comm = FixedCountsCommunication(
+            GatherGroup(dp_chunks, dp_rank),
+            ep,
+            tp,
+            sequence_parallel=sequence_parallel,
+            replicated_shared=replicated_shared,
+        )
+        if decode:
+
+            def reject_host_count(count):
+                raise AssertionError("Decode replay performed a dynamic CPU size collective")
+
+            comm._token_counts = reject_host_count
+        layer = moe.DeepseekV41MoE(config, None, "layers.0.ffn", communication=comm)
+        with torch.no_grad():
+            layer.gate.weight.zero_()
+            layer.gate.bias.zero_()
+            layer.gate.bias[0], layer.gate.bias[-1] = 2.0, 1.0
+            layer.experts[ep_rank].w2.weight.fill_(ep_rank + 1)
+        shared_width = tp_size if replicated_shared else 1
+        assert layer.shared_experts.w1.weight.shape == (shared_width, 1)
+        assert layer.shared_experts.w2.weight.shape == (1, shared_width)
+        if decode:
+            mask = (
+                masks[dp_rank].narrow(0, tp_rank * widths[dp_rank], widths[dp_rank])
+                if sequence_parallel
+                else masks[dp_rank]
+            )
+            inputs = local.masked_fill(~mask[:, None], float("nan"))
+            actual = layer.forward_decode(inputs, mask)
+        else:
+            actual = layer(local)
+        expected_output = ((1 + ep_size) * 0.75 + 1) * tp_size * silu_times_up(local)
+        torch.testing.assert_close(actual, expected_output)
+        assert not tp.operations and not ep.operations
+
+
+def test_shared_dp_loads_the_complete_w8a8_matrix_and_channel_companions_on_every_tp_rank(tmp_path, monkeypatch):
+    class QuantReplica(nn.Module):
+        def __init__(self, inputs, outputs, *, disable_tp, **kwargs):
+            super().__init__()
+            assert disable_tp is True
+            self.weight = nn.Parameter(torch.empty(outputs, inputs, dtype=torch.int8), requires_grad=False)
+            self.weight_scale = nn.Parameter(torch.empty(outputs, 1, dtype=torch.bfloat16), requires_grad=False)
+            self.weight_offset = nn.Parameter(torch.empty(outputs, 1, dtype=torch.bfloat16), requires_grad=False)
+
+    monkeypatch.setattr(moe, "ReplicatedLinear", QuantReplica)
+    config = DeepseekV41TextConfig(hidden_size=4, moe_intermediate_size=8)
+    prefix = "layers.0.ffn.shared_experts"
+    tensors = {}
+    for name, (rows, columns) in {"w1": (8, 4), "w2": (4, 8), "w3": (8, 4)}.items():
+        tensors[f"{prefix}.{name}.weight"] = torch.arange(rows * columns, dtype=torch.int8).reshape(rows, columns)
+        tensors[f"{prefix}.{name}.weight_scale"] = torch.arange(1, rows + 1, dtype=torch.bfloat16).reshape(rows, 1)
+        tensors[f"{prefix}.{name}.weight_offset"] = torch.zeros(rows, 1, dtype=torch.bfloat16)
+    path = tmp_path / "shared.safetensors"
+    save_file(tensors, str(path))
+    with torch.no_grad(), safe_open(str(path), framework="pt", device="cpu") as reader:
+        for tp_rank in range(8):
+            expert = moe.DeepseekV41MoEExpert(config, None, prefix, shared=True, replicated_shared=True)
+            for name, param in expert.named_parameters():
+                module = getattr(expert, name.split(".")[0])
+                key = prefix + "." + name
+                read_parameter_slice(reader, key, param, module, tp_rank, 8)
+                assert torch.equal(param, tensors[key])
+
+
+def test_native_runner_owns_routing_and_receives_local_rows(tiny_linears, monkeypatch):
+    from vllm_ascend.models.deepseek_v41 import fused_moe
+
+    parallel = SimpleNamespace(
+        enable_eplb=False,
+        enable_elastic_ep=False,
+        expert_placement_strategy="linear",
+        enable_dbo=False,
+        prefill_context_parallel_size=1,
+        tensor_parallel_size=8,
+        data_parallel_size=2,
+        enable_expert_parallel=True,
+        use_sequence_parallel_moe=True,
+    )
+    group = SimpleNamespace(world_size=16, rank_in_group=0)
+    monkeypatch.setattr(moe, "get_current_vllm_config", lambda: SimpleNamespace(parallel_config=parallel))
+    monkeypatch.setattr(moe, "get_dp_group", lambda: SimpleNamespace(world_size=2, rank_in_group=0))
+    monkeypatch.setattr(moe, "get_ep_group", lambda: group)
+    monkeypatch.setattr(moe, "get_tp_group", lambda: SimpleNamespace(world_size=8, rank_in_group=0))
+    monkeypatch.setattr(moe, "get_ascend_config", lambda: SimpleNamespace(enable_shared_expert_dp=True))
+    received = []
+
+    class Recorder(nn.Module):
+        def forward(self, *, hidden_states, router_logits):
+            received.append((hidden_states.clone(), router_logits.clone()))
+            return hidden_states + 2
+
+    def factory(**kwargs):
+        assert kwargs["runner_cls"] is fused_moe.DeepseekV41FusedMoERunner
+        assert kwargs["is_sequence_parallel"] and kwargs["n_shared_experts"] == 0
+        assert kwargs["ckpt_names"] == ("w1", "w2", "w3")
+        return Recorder()
+
+    monkeypatch.setattr(fused_moe, "FusedMoEFactory", factory)
+    config = tiny_config()
+    config.n_routed_experts = 32
+    layer = moe.DeepseekV41MoE(config, None, "layers.0.ffn")
+    states = torch.ones(2, config.hidden_size)
+    with torch.no_grad():
+        layer.gate.weight.fill_(1)
+        actual = layer._routed_output(states, decode=True)
+        empty = layer._routed_output(states[:0], decode=False)
+    torch.testing.assert_close(actual, states + 2)
+    assert empty.shape == (0, config.hidden_size)
+    assert [s.shape[0] for s, _ in received] == [2, 0]
+    assert [logits.shape for _, logits in received] == [(2, 32), (0, 32)]
+
+
+def test_fused_runner_restores_outer_comm_on_failure(monkeypatch):
+    from vllm_ascend.models.deepseek_v41 import fused_moe
+
+    outer = object()
+    forward = SimpleNamespace(moe_comm_type="outer", moe_comm_method=outer)
+    monkeypatch.setattr(fused_moe, "_EXTRA_CTX", forward)
+    runner = SimpleNamespace(v41_comm=object())
+
+    def fail(self, *args):
+        assert forward.moe_comm_type == fused_moe.MoECommType.ALLGATHER
+        assert forward.moe_comm_method is runner.v41_comm
+        raise RuntimeError("test dispatch failed")
+
+    monkeypatch.setattr(fused_moe.AscendMoERunner, "forward", fail)
+    real = object.__new__(fused_moe.DeepseekV41FusedMoERunner)
+    nn.Module.__init__(real)
+    real.v41_comm = runner.v41_comm
+    with pytest.raises(RuntimeError, match="test dispatch failed"):
+        real.forward(torch.empty(0))
+    assert forward.moe_comm_method is outer and forward.moe_comm_type == "outer"
