@@ -55,6 +55,7 @@ class ACLGraphEntry:
     # for aclgraph debugging, track the input addresses
     # during capture, and check if they are the same during replay
     input_addresses: list[int] | None = None
+    active_decode_replays: int = 0
 
 
 class ACLGraphWrapper:
@@ -93,6 +94,10 @@ class ACLGraphWrapper:
         enable_enpu: bool = False,
     ):
         self.runnable = runnable
+        # Host-backed lookups must refresh persistent graph inputs on every step.
+        self.prepare_decode_graph_inputs = (
+            runnable.prepare_decode_graph_inputs if hasattr(type(runnable), "prepare_decode_graph_inputs") else None
+        )
         self.vllm_config = vllm_config
         self.runtime_mode = runtime_mode
         self.compilation_config = vllm_config.compilation_config
@@ -143,6 +148,10 @@ class ACLGraphWrapper:
             # CUDAGraphWrapper when nesting multiple instances with different
             # runtime modes.
             return self.runnable(*args, **kwargs)
+
+        active_decode_rows = None
+        if self.prepare_decode_graph_inputs is not None and self.runtime_mode == CUDAGraphMode.FULL:
+            active_decode_rows = self.prepare_decode_graph_inputs(*args, **kwargs)
 
         if batch_descriptor not in self.concrete_aclgraph_entries:
             # create a new entry for this batch descriptor
@@ -232,6 +241,8 @@ class ACLGraphWrapper:
             # to save memory
             entry.output = weak_ref_tensors(output)
             entry.aclgraph = aclgraph
+            if active_decode_rows is not None:
+                logger.info_once("Captured FULL decode ACLGraph: capture_size=%d", entry.batch_descriptor.num_tokens)
 
             compilation_counter.num_cudagraph_captured += 1
 
@@ -264,6 +275,21 @@ class ACLGraphWrapper:
         if not self.enable_enpu and need_sync:
             torch.npu.current_stream().synchronize()
         entry.aclgraph.replay()
+        if active_decode_rows:
+            entry.active_decode_replays += 1
+            count = entry.active_decode_replays
+            if count & (count - 1) == 0:
+                logger.info(
+                    "FULL decode ACLGraph progress: capture_size=%d active_rows=%d active_replays=%d",
+                    entry.batch_descriptor.num_tokens,
+                    active_decode_rows,
+                    count,
+                )
+            logger.info_once(
+                "Replayed FULL decode ACLGraph: capture_size=%d active_rows=%d",
+                entry.batch_descriptor.num_tokens,
+                active_decode_rows,
+            )
         return entry.output
 
 
@@ -285,6 +311,13 @@ def update_full_graph_params(
     speculative_config=None,
     draft_attn_metadatas=None,
 ):
+    metadata = forward_context.attn_metadata
+    if (
+        isinstance(metadata, dict)
+        and metadata
+        and all(getattr(layer, "requires_ascend_graph_task_update", True) is False for layer in metadata.values())
+    ):
+        return
     if vllm_version_is("0.27.1"):
         impl_cls = attn_backend.get_impl_cls()
         impl_cls.update_graph_params(

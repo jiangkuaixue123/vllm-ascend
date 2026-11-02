@@ -950,9 +950,10 @@ class AscendModelSlimConfig(QuantizationConfig):
         """
         from vllm_ascend.quantization.utils import get_model_file
 
-        # If quant_description is already populated (e.g. from from_config()),
-        # there is nothing to do.
-        if self.quant_description:
+        # A marker-only HF config selects ModelSlim but does not describe any
+        # layers. Full inline descriptions can still skip the separate file.
+        marker_only = self.quant_description == {"quant_method": ASCEND_QUANTIZATION_METHOD}
+        if self.quant_description and not marker_only:
             return
 
         # Try to get the config file (local or remote)

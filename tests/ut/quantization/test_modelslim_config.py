@@ -314,6 +314,33 @@ class TestAscendModelSlimConfig(TestBase):
 
         self.assertEqual(config.quant_description, quant_data)
 
+    def test_maybe_update_config_marker_only_loads_layer_description(self):
+        config = AscendModelSlimConfig.from_config({"quant_method": ASCEND_QUANTIZATION_METHOD})
+        quant_data = {"layers.0.q_proj.weight": "FLOAT", "layers.0.w1.weight": "W8A8_DYNAMIC"}
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / MODELSLIM_CONFIG_FILENAME
+            config_path.write_text(json.dumps(quant_data))
+            config.maybe_update_config(tmpdir)
+        self.assertEqual(config.quant_description, quant_data)
+        self.assertTrue(config.is_layer_skipped_ascend("layers.0.q_proj"))
+        self.assertEqual(get_linear_quant_type(config.quant_description, "layers.0.w1", {}), "W8A8_DYNAMIC")
+
+    def test_maybe_update_config_marker_with_inline_layers_preserves_description(self):
+        description = {"quant_method": ASCEND_QUANTIZATION_METHOD, "layers.0.w1.weight": "W8A8_DYNAMIC"}
+        config = AscendModelSlimConfig.from_config(description)
+        with patch("vllm_ascend.quantization.utils.get_model_file") as lookup:
+            config.maybe_update_config("/some/model/path")
+        lookup.assert_not_called()
+        self.assertEqual(config.quant_description, description)
+
+    def test_maybe_update_config_marker_only_requires_description_file(self):
+        config = AscendModelSlimConfig.from_config({"quant_method": ASCEND_QUANTIZATION_METHOD})
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            self.assertRaisesRegex(ValueError, "ModelSlim Quantization Config Not Found"),
+        ):
+            config.maybe_update_config(tmpdir)
+
     def test_maybe_update_config_raises_when_file_missing(self):
         config = AscendModelSlimConfig()
 

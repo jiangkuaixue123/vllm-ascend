@@ -1,0 +1,723 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Paged V4.1 latent attention with eager prefill and uniform graph decode.
+
+This reference path follows the frozen official V4.1 inference/model.py. Cache
+values retain their quantize/dequantize results in FP32 pages. Decode replay
+uses fixed-address tensor metadata for positions, slots and the live-row mask.
+"""
+
+import math
+from dataclasses import dataclass, field
+
+import torch
+import torch.nn.functional as F
+from torch import nn
+from vllm.distributed import (
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
+)
+from vllm.forward_context import get_forward_context
+from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+from vllm.model_executor.layers.linear import (
+    ColumnParallelLinear,
+    ReplicatedLinear,
+    RowParallelLinear,
+)
+from vllm.v1.attention.backend import (
+    AttentionBackend,
+    AttentionCGSupport,
+    AttentionMetadataBuilder,
+    CommonAttentionMetadata,
+)
+from vllm.v1.kv_cache_interface import FullAttentionSpec
+
+from .attention_ops import (
+    apply_rotary_emb_real,
+    fp4_quant_dequant,
+    fp8_quant_dequant,
+    sparse_attn,
+)
+from .core import rms_norm
+
+
+@dataclass(frozen=True)
+class RequestSpan:
+    begin: int
+    end: int
+    seq_len: int
+
+    @property
+    def start_pos(self) -> int:
+        return self.seq_len - (self.end - self.begin)
+
+
+@dataclass
+class DeepseekV41DecodeMetadata:
+    """Fixed-address graph inputs, filled by the metadata builder before replay."""
+
+    seq_lens: torch.Tensor
+    slot_mapping: torch.Tensor
+    block_table_tensor: torch.Tensor
+    active: torch.Tensor
+    max_model_len: int
+
+
+@dataclass
+class DeepseekV41Metadata:
+    # Replay reads the refreshed sequence, page and slot tensors directly.
+    # This backend does not record mutable FIA task handles.
+    requires_ascend_graph_task_update = False
+
+    requests: list[RequestSpan]
+    block_table_tensor: torch.Tensor
+    slot_mapping: torch.Tensor
+    num_actual_tokens: int
+    decode: DeepseekV41DecodeMetadata | None = None
+
+
+class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
+    _cudagraph_support = AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
+
+    def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
+        super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+        self.decode_buffers = {}
+        self.capture_sizes = frozenset(vllm_config.compilation_config.cudagraph_capture_sizes or ())
+        self.decode_graph_enabled = not vllm_config.model_config.enforce_eager
+        self.max_model_len = vllm_config.model_config.max_model_len
+        self.block_size = kv_cache_spec.block_size
+
+    def _update_decode(self, common, capture=False):
+        if not self.decode_graph_enabled and not capture:
+            return None
+        rows = getattr(common, "num_input_tokens", None) or common.num_actual_tokens
+        if rows not in self.capture_sizes or common.num_reqs > rows or common.max_query_len > 1:
+            if capture:
+                raise ValueError("V4.1 graph capture requires a configured uniform decode bucket")
+            return None
+        if common.max_seq_len > self.max_model_len:
+            raise ValueError("V4.1 decode context exceeds configured max_model_len")
+        device = common.seq_lens.device
+        width = math.ceil(self.max_model_len / self.block_size)
+        if rows not in self.decode_buffers:
+            self.decode_buffers[rows] = DeepseekV41DecodeMetadata(
+                torch.zeros(rows, dtype=torch.int64, device=device),
+                torch.full((rows,), -1, dtype=torch.int64, device=device),
+                torch.zeros(rows, width, dtype=torch.int32, device=device),
+                torch.zeros(rows, dtype=torch.bool, device=device),
+                self.max_model_len,
+            )
+        decode = self.decode_buffers[rows]
+        decode.block_table_tensor.zero_()
+        # The Ascend runner may pad both num_reqs and num_input_tokens while
+        # num_actual_tokens remains the count of scheduled one-token rows.
+        live = min(common.num_actual_tokens, common.num_reqs)
+        decode.seq_lens[live:].zero_()
+        decode.slot_mapping[live:].fill_(-1)
+        if capture or not live:
+            decode.active.zero_()
+            decode.seq_lens.zero_()
+            decode.slot_mapping.fill_(-1)
+            return decode
+        src = common.block_table_tensor
+        columns = min(width, src.shape[1])
+        if columns * self.block_size < common.max_seq_len:
+            raise ValueError("V4.1 block table does not span the decode context")
+        decode.block_table_tensor[:live, :columns].copy_(src[:live, :columns])
+        decode.seq_lens[:live].copy_(common.seq_lens[:live])
+        decode.slot_mapping[:live].copy_(common.slot_mapping[:live])
+        decode.active.copy_((decode.seq_lens > 0) & (decode.slot_mapping >= 0))
+        return decode
+
+    def build_for_cudagraph_capture(self, common_attn_metadata):
+        common = common_attn_metadata
+        decode = self._update_decode(common, capture=True)
+        return DeepseekV41Metadata([], common.block_table_tensor, common.slot_mapping, 0, decode)
+
+    def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
+        common: CommonAttentionMetadata = common_attn_metadata
+        bounds = common.query_start_loc_cpu[: common.num_reqs + 1].tolist()
+        # V4.1 rejects speculative decoding; the runner's CPU lengths are
+        # exact in this mode. Otherwise synchronize outside graph capture.
+        lengths_cpu = getattr(common, "seq_lens_cpu_upper_bound", None)
+        if lengths_cpu is None:
+            lengths_cpu = common.seq_lens.cpu()
+        lengths = lengths_cpu[: common.num_reqs].tolist()
+        requests = [RequestSpan(begin, end, length) for begin, end, length in zip(bounds, bounds[1:], lengths)]
+        return DeepseekV41Metadata(
+            requests,
+            common.block_table_tensor,
+            common.slot_mapping,
+            bounds[-1],
+            self._update_decode(common),
+        )
+
+
+class DeepseekV41Backend(AttentionBackend):
+    @staticmethod
+    def get_name():
+        return "DEEPSEEK_V41_REFERENCE"
+
+    @staticmethod
+    def get_impl_cls():
+        # Projection and cache operations are composed by the model directly.
+        return DeepseekV41Attention
+
+    @staticmethod
+    def get_builder_cls():
+        return DeepseekV41MetadataBuilder
+
+    @staticmethod
+    def get_kv_cache_shape(num_blocks, block_size, num_kv_heads, head_size, cache_dtype_str="auto"):
+        return (2, num_blocks, block_size, num_kv_heads, head_size)
+
+
+class DeepseekV41Cache(nn.Module, AttentionLayerBase):
+    supports_dcp = False
+
+    def __init__(self, config, vllm_config, prefix):
+        super().__init__()
+        self.prefix = prefix
+        self.dim = config.head_dim
+        self.index_dim = config.index_head_dim
+        self.width = max(2 * self.dim, self.dim + self.index_dim + 1)
+        self.block_size = vllm_config.cache_config.block_size
+        self.kv_cache = None
+        context = vllm_config.compilation_config.static_forward_context
+        if prefix in context:
+            raise ValueError(f"Duplicate cache layer {prefix}")
+        context[prefix] = self
+
+    def get_attn_backend(self):
+        return DeepseekV41Backend
+
+    def get_kv_cache_spec(self, vllm_config):
+        return FullAttentionSpec(
+            block_size=self.block_size,
+            num_kv_heads=1,
+            head_size=self.width,
+            dtype=torch.float32,
+        )
+
+    def metadata(self):
+        metadata = get_forward_context().attn_metadata
+        if metadata is None:
+            return None
+        return metadata[self.prefix]
+
+    def pages(self):
+        if self.kv_cache is None:
+            raise RuntimeError("V4.1 cache was not bound by the model runner")
+        key, value = self.kv_cache
+        return key.reshape(-1, self.width), value.reshape(-1, self.width)
+
+    def slots(self, metadata, request_idx, positions):
+        blocks = metadata.block_table_tensor[request_idx]
+        return blocks[positions // self.block_size].long() * self.block_size + (positions % self.block_size)
+
+    def read(self, metadata, request_idx, positions, bank, offset, width):
+        slots = self.slots(metadata, request_idx, positions)
+        return self.pages()[bank][slots, offset : offset + width]
+
+    def write(self, metadata, values, bank, offset):
+        slots = metadata.slot_mapping[: values.shape[0]].long()
+        self.pages()[bank][slots, offset : offset + values.shape[-1]] = values.float()
+
+    def decode_read(self, md, positions, bank, offset, width):
+        """Read fixed-shape logical positions, zeroing dead rows and future slots."""
+        pos = positions.clamp(0, md.max_model_len - 1)
+        blocks = md.block_table_tensor.gather(1, pos // self.block_size).long()
+        slots = blocks * self.block_size + pos % self.block_size
+        pages = self.pages()[bank]
+        valid = md.active[:, None] & (positions >= 0) & (positions < md.seq_lens[:, None])
+        valid = valid & (slots >= 0) & (slots < pages.shape[0])
+        safe = torch.where(valid, slots, 0)
+        values = pages[:, offset : offset + width].index_select(0, safe.flatten())
+        values = values.reshape(*positions.shape, width)
+        return torch.where(valid[..., None], values, 0)
+
+    def decode_write(self, md, values, bank, offset, enabled):
+        """Preserve cache bits for inactive rows, including a live write to slot zero."""
+        page = self.pages()[bank][:, offset : offset + values.shape[-1]]
+        valid = enabled & md.active & (md.slot_mapping >= 0) & (md.slot_mapping < page.shape[0])
+        slots = torch.where(valid, md.slot_mapping, 0)
+        # Unroll the fixed bucket on the capture stream. A masked row that
+        # aliases slot zero reads its latest value, after any earlier live row.
+        # A vectorized index_copy_ with duplicate destinations is undefined.
+        for row in range(values.shape[0]):
+            slot = slots[row : row + 1]
+            old = page.index_select(0, slot)
+            value = torch.where(valid[row : row + 1, None], values[row : row + 1].float(), old)
+            page.index_copy_(0, slot, value)
+
+
+class DeepseekV41RMSNorm(nn.Module):
+    def __init__(self, dim, eps):
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty(dim))
+        self.eps = eps
+
+    def forward(self, x):
+        return rms_norm(x, self.weight, self.eps)
+
+
+def rotary_frequencies(config, compressed):
+    dim = config.qk_rope_head_dim
+    base = config.compress_rope_theta if compressed else config.rope_theta
+    # Compute constants on CPU exactly once, independent of default device.
+    axis = torch.arange(0, dim, 2, dtype=torch.float32, device="cpu")
+    frequencies = 1 / (base ** (axis / dim))
+    scaling = config.rope_scaling or {}
+    original = scaling.get("original_max_position_embeddings", 0) if compressed else 0
+    if original:
+
+        def corrected(rotations):
+            return dim * math.log(original / (rotations * 2 * math.pi)) / (2 * math.log(base))
+
+        low = max(math.floor(corrected(scaling.get("beta_fast", 32))), 0)
+        high = min(math.ceil(corrected(scaling.get("beta_slow", 1))), dim - 1)
+        ramp = ((axis / 2 - low) / max(high - low, 1e-3)).clamp(0, 1)
+        frequencies = frequencies / scaling["factor"] * ramp + frequencies * (1 - ramp)
+    return frequencies
+
+
+def topk_columns(scores, k):
+    """Keep the FP32 top-k, preferring the lower column only at a tied cutoff."""
+    columns = torch.arange(scores.shape[-1], device=scores.device, dtype=torch.int32)
+    if k == 0 or k == scores.shape[-1]:
+        return columns[:k].long().expand(*scores.shape[:-1], k)
+    top = scores.topk(k, dim=-1)
+    cutoff = top.values[..., -1:]
+    # topk may choose different equal items at different padded widths.
+    # Retain all strictly higher scores; fill only the tied part by column.
+    tied = torch.where(scores == cutoff, columns, scores.shape[-1])
+    first = tied.topk(k, dim=-1, largest=False).values
+    at_cutoff = top.values == cutoff
+    ordinal = at_cutoff.long().cumsum(-1) - 1
+    return torch.where(at_cutoff, first.gather(-1, ordinal.clamp_min(0)).long(), top.indices)
+
+
+def select_candidate_blocks(logits, compress_lens, topk_blocks, block_size):
+    width = logits.shape[-1]
+    if width == 0:
+        return torch.zeros_like(logits, dtype=torch.bool)
+    scores = F.pad(logits, (0, -width % block_size), value=-torch.inf)
+    scores = scores.unflatten(-1, (-1, block_size)).amax(-1)
+    last = (compress_lens - 1) // block_size
+    blocks = torch.arange(scores.shape[-1], device=logits.device)
+    scores = scores.masked_fill(blocks == last, torch.inf)
+    top = topk_columns(scores, min(topk_blocks, scores.shape[-1]))
+    keep = torch.zeros_like(scores, dtype=torch.bool).scatter_(-1, top, scores.gather(-1, top) > -torch.inf)
+    return keep.repeat_interleave(block_size, -1)[..., :width]
+
+
+@dataclass
+class SharedRequestAttention:
+    compressed: torch.Tensor | None = None
+    index_keys: torch.Tensor | None = None
+    topk: torch.Tensor | None = None
+    candidates: torch.Tensor | None = None
+
+
+@dataclass
+class DeepseekV41Runtime:
+    requests: list[RequestSpan]
+    shared: list[SharedRequestAttention] = field(default_factory=list)
+    decode: DeepseekV41DecodeMetadata | None = None
+    source_cache: DeepseekV41Cache | None = None
+    source_decode: DeepseekV41DecodeMetadata | None = None
+    decode_topk: torch.Tensor | None = None
+    decode_candidates: torch.Tensor | None = None
+
+    @classmethod
+    def for_decode(cls, metadata: DeepseekV41Metadata):
+        if metadata.decode is None:
+            raise ValueError("Missing V4.1 graph decode metadata")
+        return cls([], decode=metadata.decode)
+
+    def __post_init__(self):
+        if not self.shared:
+            self.shared = [SharedRequestAttention() for _ in self.requests]
+
+
+class DeepseekV41Compressor(nn.Module):
+    def __init__(self, config, ratio):
+        super().__init__()
+        self.norm = DeepseekV41RMSNorm(config.head_dim, config.rms_norm_eps)
+        dtype = torch.float32 if ratio > 1 else torch.bfloat16
+        self.wkv = nn.Linear(config.hidden_size, config.head_dim, bias=False, dtype=dtype)
+        self.wgate = nn.Linear(config.hidden_size, config.head_dim, bias=False, dtype=dtype) if ratio > 1 else None
+
+
+class DeepseekV41Indexer(nn.Module):
+    def __init__(self, config, owns_k, quant_config, prefix):
+        super().__init__()
+        self.wq_b = ColumnParallelLinear(
+            config.q_lora_rank,
+            config.index_n_heads * config.index_head_dim,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.wq_b",
+        )
+        self.weights_proj = ColumnParallelLinear(
+            config.hidden_size,
+            config.index_n_heads,
+            bias=False,
+            params_dtype=torch.bfloat16,
+            prefix=f"{prefix}.weights_proj",
+        )
+        if owns_k:
+            self.wk = nn.Linear(config.head_dim, config.index_head_dim, bias=False)
+            self.k_norm = DeepseekV41RMSNorm(config.index_head_dim, config.rms_norm_eps)
+
+
+class DeepseekV41Attention(nn.Module):
+    @staticmethod
+    def update_graph_params(*args, **kwargs):
+        # The Ascend wrapper calls this hook after replay. These torch operators
+        # use only fixed-address input tensors and have no mutable kernel plans.
+        return None
+
+    def __init__(self, config, vllm_config, layer_id, prefix):
+        super().__init__()
+        tp = get_tensor_model_parallel_world_size()
+        if config.num_attention_heads % tp or config.o_groups % tp:
+            raise ValueError("V4.1 attention heads and output groups must divide TP")
+        self.config = config
+        self.layer_id = layer_id
+        self.ratio = config.compress_ratios[layer_id]
+        self.heads = config.num_attention_heads // tp
+        self.groups = config.o_groups // tp
+        self.index_heads = config.index_n_heads // tp
+        self.tp = tp
+        self.dim = config.head_dim
+        self.rope_dim = config.qk_rope_head_dim
+        self.owns_kv = layer_id in config.kv_source_layer_ids
+        self.owns_index = layer_id in config.index_source_layer_ids
+        quant_config = vllm_config.quant_config
+        self.attn_sink = nn.Parameter(torch.empty(self.heads, dtype=torch.float32))
+        self.wq_a = ReplicatedLinear(
+            config.hidden_size,
+            config.q_lora_rank,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.wq_a",
+        )
+        self.q_norm = DeepseekV41RMSNorm(config.q_lora_rank, config.rms_norm_eps)
+        self.wq_b = ColumnParallelLinear(
+            config.q_lora_rank,
+            config.num_attention_heads * self.dim,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.wq_b",
+        )
+        self.wkv = ReplicatedLinear(
+            config.hidden_size,
+            self.dim,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.wkv",
+        )
+        self.kv_norm = DeepseekV41RMSNorm(self.dim, config.rms_norm_eps)
+        self.wo_a = ColumnParallelLinear(
+            config.num_attention_heads * self.dim // config.o_groups,
+            config.o_groups * config.o_lora_rank,
+            bias=False,
+            params_dtype=torch.bfloat16,
+            prefix=f"{prefix}.wo_a",
+        )
+        self.wo_b = RowParallelLinear(
+            config.o_groups * config.o_lora_rank,
+            config.hidden_size,
+            bias=False,
+            quant_config=quant_config,
+            reduce_results=False,
+            prefix=f"{prefix}.wo_b",
+        )
+        self.compressor = DeepseekV41Compressor(config, self.ratio) if self.owns_kv else None
+        self.indexer = (
+            DeepseekV41Indexer(config, self.owns_kv, quant_config, f"{prefix}.indexer") if self.owns_index else None
+        )
+        self.cache = DeepseekV41Cache(config, vllm_config, f"{prefix}.cache")
+        self.register_buffer(
+            "frequencies", rotary_frequencies(config, self.ratio > 0).to(self.attn_sink.device), persistent=False
+        )
+
+    def rotate(self, x, positions, inverse=False):
+        phases = positions.float().unsqueeze(-1) * self.frequencies
+        apply_rotary_emb_real(x[..., -self.rope_dim :], phases.cos(), phases.sin(), inverse=inverse)
+        return x
+
+    def _compressed(self, x, positions, metadata, request_idx, request, shared):
+        if not self.owns_kv:
+            if shared.compressed is None or shared.index_keys is None:
+                raise RuntimeError("Compressed attention source did not execute")
+            return
+        ratio, dim = self.ratio, self.dim
+        compressor = self.compressor
+        raw = compressor.wkv(x.float() if ratio > 1 else x)
+        scores = compressor.wgate(x.float()) if ratio > 1 else None
+        completed = positions[(positions + 1) % ratio == 0]
+        if metadata is None:
+            group_kv = raw[: completed.numel() * ratio]
+            group_scores = scores[: completed.numel() * ratio] if scores is not None else None
+        else:
+            slots = self.cache.slots(metadata, request_idx, positions)
+            key_page, value_page = self.cache.pages()
+            key_page[slots, dim : 2 * dim] = raw.float()
+            if scores is not None:
+                value_page[slots, :dim] = scores
+            group_positions = (completed.unsqueeze(-1) - torch.arange(ratio - 1, -1, -1, device=x.device)).flatten()
+            group_kv = self.cache.read(metadata, request_idx, group_positions, 0, dim, dim)
+            group_scores = (
+                self.cache.read(metadata, request_idx, group_positions, 1, 0, dim) if scores is not None else None
+            )
+        if completed.numel():
+            if ratio > 1:
+                latent = (
+                    (group_kv.unflatten(0, (-1, ratio)) * group_scores.unflatten(0, (-1, ratio)).softmax(1))
+                    .sum(1)
+                    .to(x.dtype)
+                )
+            else:
+                latent = group_kv.to(x.dtype)
+            latent = compressor.norm(latent)
+            keys = self.indexer.k_norm(self.indexer.wk(latent))
+            self.rotate(keys.unsqueeze(0), completed + 1 - ratio)
+            keys = fp4_quant_dequant(keys, 32, scale_format="e8m0")
+            self.rotate(latent.unsqueeze(0), completed + 1 - ratio)
+            latent = fp4_quant_dequant(latent, 16, scale_format="e4m3")
+            if metadata is not None:
+                slots = self.cache.slots(metadata, request_idx, completed)
+                key_page[slots, dim : 2 * dim] = latent.float()
+                value_page[slots, dim : dim + self.config.index_head_dim] = keys.float()
+        else:
+            latent = x.new_empty((0, dim))
+            keys = x.new_empty((0, self.config.index_head_dim))
+        if metadata is None:
+            shared.compressed, shared.index_keys = latent, keys
+        else:
+            ends = torch.arange(ratio - 1, request.seq_len, ratio, device=x.device)
+            shared.compressed = self.cache.read(metadata, request_idx, ends, 0, dim, dim).to(x.dtype)
+            shared.index_keys = self.cache.read(metadata, request_idx, ends, 1, dim, self.config.index_head_dim).to(
+                x.dtype
+            )
+
+    def _index(self, x, qr, positions, shared):
+        if not self.owns_index:
+            if shared.topk is None:
+                raise RuntimeError("Attention index source did not execute")
+            return shared.topk
+        count = shared.compressed.shape[0]
+        if count == 0:
+            shared.topk = torch.empty((x.shape[0], 0), device=x.device, dtype=torch.long)
+            return shared.topk
+        indexer = self.indexer
+        q = indexer.wq_b(qr)[0].view(-1, self.index_heads, self.config.index_head_dim)
+        self.rotate(q.unsqueeze(0), positions)
+        q = fp4_quant_dequant(q, 32, scale_format="e8m0")
+        weights = indexer.weights_proj(x)[0] * (self.config.index_head_dim**-0.5 * self.config.index_n_heads**-0.5)
+        scores = torch.einsum("shd,td->sht", q, shared.index_keys)
+        scores = (scores.relu_() * weights.unsqueeze(-1)).sum(1)
+        if self.tp > 1:
+            scores = tensor_model_parallel_all_reduce(scores)
+        lengths = ((positions + 1) // self.ratio).unsqueeze(-1)
+        scores.masked_fill_(torch.arange(count, device=x.device) >= lengths, -torch.inf)
+        candidate_layer = self.config.candidate_source_layer_id
+        if self.layer_id == candidate_layer:
+            shared.candidates = select_candidate_blocks(
+                scores,
+                lengths,
+                self.config.candidate_topk_blocks,
+                self.config.candidate_block_size,
+            )
+        elif 0 <= candidate_layer < self.layer_id:
+            if shared.candidates is None:
+                raise RuntimeError("Candidate source did not execute")
+            scores.masked_fill_(~shared.candidates, -torch.inf)
+        indices = topk_columns(scores, min(self.config.index_topk, count))
+        indices = indices.sort(-1).values
+        shared.topk = torch.where(indices < lengths, indices, -1)
+        return shared.topk
+
+    def _decode_compressed(self, x, pos, md, runtime):
+        if not self.owns_kv:
+            return
+        ratio, dim = self.ratio, self.dim
+        raw = self.compressor.wkv(x.float() if ratio > 1 else x)
+        complete = ((pos + 1) % ratio) == 0
+        self.cache.decode_write(md, raw, 0, dim, md.active)
+        if ratio > 1:
+            score = self.compressor.wgate(x.float())
+            self.cache.decode_write(md, score, 1, 0, md.active)
+            relative = torch.arange(ratio - 1, -1, -1, device=x.device)
+            group_pos = pos[:, None] - relative
+            values = self.cache.decode_read(md, group_pos, 0, dim, dim)
+            scores = self.cache.decode_read(md, group_pos, 1, 0, dim)
+            raw = (values * scores.softmax(1)).sum(1).to(x.dtype)
+        latent = self.compressor.norm(raw)
+        group_start = (pos + 1 - ratio).clamp_min(0)
+        keys = self.indexer.k_norm(self.indexer.wk(latent))
+        self.rotate(keys.unsqueeze(0), group_start)
+        self.rotate(latent.unsqueeze(0), group_start)
+        keys = fp4_quant_dequant(keys, 32, scale_format="e8m0")
+        latent = fp4_quant_dequant(latent, 16, scale_format="e4m3")
+        self.cache.decode_write(md, latent, 0, dim, complete)
+        self.cache.decode_write(md, keys, 1, dim, complete)
+        runtime.source_cache = self.cache
+        runtime.source_decode = md
+
+    def _decode_index(self, x, qr, pos, md, runtime):
+        if not self.owns_index:
+            if runtime.decode_topk is None:
+                raise RuntimeError("Missing V4.1 decode index source")
+            return
+        capacity = md.max_model_len // self.ratio
+        if not capacity:
+            runtime.decode_topk = torch.empty((x.shape[0], 0), dtype=torch.int64, device=x.device)
+            return
+        groups = torch.arange(capacity, device=x.device).unsqueeze(0)
+        ends = ((groups + 1) * self.ratio - 1).expand(x.shape[0], -1)
+        keys = runtime.source_cache.decode_read(
+            runtime.source_decode, ends, 1, self.dim, self.config.index_head_dim
+        ).to(x.dtype)
+        indexer = self.indexer
+        q = indexer.wq_b(qr)[0].view(-1, self.index_heads, self.config.index_head_dim)
+        self.rotate(q.unsqueeze(0), pos)
+        q = fp4_quant_dequant(q, 32, scale_format="e8m0")
+        weights = indexer.weights_proj(x)[0] * (self.config.index_head_dim**-0.5 * self.config.index_n_heads**-0.5)
+        scores = torch.einsum("bhd,btd->bht", q, keys)
+        scores = (scores.relu_() * weights.unsqueeze(-1)).sum(1)
+        if self.tp > 1:
+            scores = tensor_model_parallel_all_reduce(scores)
+        lengths = torch.where(md.active, md.seq_lens // self.ratio, 0)[:, None]
+        scores.masked_fill_(groups >= lengths, -torch.inf)
+        source = self.config.candidate_source_layer_id
+        if self.layer_id == source:
+            runtime.decode_candidates = select_candidate_blocks(
+                scores,
+                lengths,
+                self.config.candidate_topk_blocks,
+                self.config.candidate_block_size,
+            )
+        elif 0 <= source < self.layer_id:
+            scores.masked_fill_(~runtime.decode_candidates, -torch.inf)
+        indices = topk_columns(scores, min(self.config.index_topk, capacity)).sort(-1).values
+        runtime.decode_topk = torch.where(indices < lengths, indices, -1)
+
+    def _decode_forward(self, x, runtime):
+        md = self.cache.metadata().decode
+        if md is None or x.shape[0] != md.active.shape[0]:
+            raise ValueError("V4.1 graph token rows must match the decode metadata bucket")
+        pos = (md.seq_lens - 1).clamp_min(0)
+        qr = self.q_norm(self.wq_a(x)[0])
+        q = self.wq_b(qr)[0].view(x.shape[0], self.heads, self.dim)
+        raw = self.kv_norm(self.wkv(x)[0])
+        self.rotate(q.unsqueeze(0), pos)
+        self.rotate(raw.unsqueeze(0), pos)
+        self.cache.decode_write(md, fp8_quant_dequant(raw, 32), 0, 0, md.active)
+        extra = 0
+        if self.ratio:
+            self._decode_compressed(x, pos, md, runtime)
+            self._decode_index(x, qr, pos, md, runtime)
+            extra = runtime.decode_topk.shape[-1]
+        window = self.config.sliding_window
+        columns = torch.arange(min(window, md.max_model_len) + extra, device=x.device)[None, :]
+        width = md.seq_lens.clamp(0, window)[:, None]
+        raw_pos = (md.seq_lens - window).clamp_min(0)[:, None] + columns
+        in_window = (columns < width) & md.active[:, None]
+        selected = self.cache.decode_read(md, raw_pos, 0, 0, self.dim)
+        valid = in_window
+        if extra:
+            # Preserve eager's exact slot order: compressed items immediately
+            # follow the *live* window even when it is shorter than 128. Only
+            # trailing invalid slots pad the fixed-size 64-slot online softmax.
+            ordinal = columns - width
+            indices = runtime.decode_topk.gather(1, ordinal.clamp(0, extra - 1))
+            compressed = (ordinal >= 0) & (ordinal < extra) & (indices >= 0)
+            comp = runtime.source_cache.decode_read(
+                runtime.source_decode,
+                (indices + 1) * self.ratio - 1,
+                0,
+                self.dim,
+                self.dim,
+            )
+            selected = torch.where(compressed[..., None], comp, selected)
+            valid = valid | (compressed & md.active[:, None])
+        ids = torch.where(valid, columns, -1).to(torch.int32).unsqueeze(1)
+        attended = sparse_attn(q.unsqueeze(1), selected.to(x.dtype), self.attn_sink, ids, self.dim**-0.5)[:, 0]
+        self.rotate(attended.unsqueeze(0), pos, inverse=True)
+        output = self._project_output(attended, x.dtype)
+        return torch.where(md.active[:, None], output, 0)
+
+    def forward(self, hidden_states, runtime):
+        if runtime.decode is not None:
+            return self._decode_forward(hidden_states, runtime)
+        metadata = self.cache.metadata()
+        qr = self.q_norm(self.wq_a(hidden_states)[0])
+        queries = self.wq_b(qr)[0].view(-1, self.heads, self.dim)
+        raw_kv = self.kv_norm(self.wkv(hidden_states)[0])
+        output = torch.empty_like(queries)
+        for request_idx, request in enumerate(runtime.requests):
+            begin, end = request.begin, request.end
+            if begin == end:
+                continue
+            positions = torch.arange(request.start_pos, request.seq_len, device=hidden_states.device)
+            q, kv = queries[begin:end], raw_kv[begin:end]
+            self.rotate(q.unsqueeze(0), positions)
+            self.rotate(kv.unsqueeze(0), positions)
+            kv = fp8_quant_dequant(kv, 32)
+            first = max(0, request.start_pos - self.config.sliding_window + 1)
+            if metadata is not None:
+                slots = self.cache.slots(metadata, request_idx, positions)
+                self.cache.pages()[0][slots, : self.dim] = kv.float()
+                history = torch.arange(first, request.seq_len, device=hidden_states.device)
+                kv = self.cache.read(metadata, request_idx, history, 0, 0, self.dim).to(kv.dtype)
+            width = min(self.config.sliding_window, request.seq_len)
+            window = (positions - self.config.sliding_window + 1).clamp_min(0)
+            window = window.unsqueeze(-1)
+            window = window + torch.arange(width, device=hidden_states.device)
+            indices = torch.where(window <= positions.unsqueeze(-1), window - first, -1)
+            if self.ratio:
+                shared = runtime.shared[request_idx]
+                self._compressed(
+                    hidden_states[begin:end],
+                    positions,
+                    metadata,
+                    request_idx,
+                    request,
+                    shared,
+                )
+                compressed_indices = self._index(hidden_states[begin:end], qr[begin:end], positions, shared)
+                indices = torch.cat(
+                    (
+                        indices,
+                        torch.where(
+                            compressed_indices >= 0,
+                            compressed_indices + kv.shape[0],
+                            -1,
+                        ),
+                    ),
+                    -1,
+                )
+                kv = torch.cat((kv, shared.compressed), 0)
+            attended = sparse_attn(
+                q.unsqueeze(0),
+                kv.unsqueeze(0),
+                self.attn_sink,
+                indices.int().unsqueeze(0),
+                self.dim**-0.5,
+            )[0]
+            self.rotate(attended.unsqueeze(0), positions, inverse=True)
+            output[begin:end] = attended
+        return self._project_output(output, hidden_states.dtype)
+
+    def _project_output(self, output, dtype):
+        output = output.view(-1, self.groups, self.heads * self.dim // self.groups)
+        output = fp8_quant_dequant(output, 32)
+        projection = self.wo_a.weight.view(self.groups, self.config.o_lora_rank, -1)
+        output = torch.einsum("sgd,grd->sgr", output, projection).flatten(1)
+        output = self.wo_b(output)[0].float()
+        if self.tp > 1:
+            output = tensor_model_parallel_all_reduce(output)
+        return output.to(dtype)

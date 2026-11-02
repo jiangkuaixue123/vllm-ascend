@@ -13,6 +13,7 @@
 # This file is a part of the vllm-ascend project.
 #
 import weakref
+from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
 
 import numpy as np
@@ -45,6 +46,18 @@ from vllm_ascend.compilation.acl_graph import (
     update_full_graph_params,
 )
 from vllm_ascend.device_allocator.sleep_mem_optimized import AclGraphSleepWakeupManager
+
+
+def test_full_graph_with_only_static_attention_inputs_skips_fia_update():
+    backend = MagicMock()
+    context = SimpleNamespace(attn_metadata={"layer0": SimpleNamespace(requires_ascend_graph_task_update=False)})
+    update_full_graph_params(backend, None, context, 1, None)
+    backend.get_impl_cls.assert_not_called()
+
+    # A mixed model must still update the backend owning mutable task handles.
+    context.attn_metadata["layer1"] = object()
+    update_full_graph_params(backend, None, context, 1, None)
+    backend.get_impl_cls.return_value.update_graph_params.assert_called_once()
 
 
 def test_update_full_graph_params_dispatches_draft_metadata_by_keyword():
@@ -374,8 +387,21 @@ class TestACLGraphWrapper(TestBase):
         # Set up the compilation counter mock
         mock_compilation_counter.num_cudagraph_captured = 0
 
+        calls = []
+        runnable = self.mock_runnable
+
+        class HostBackedModel:
+            def prepare_decode_graph_inputs(self, *args):
+                calls.append("stage")
+                return 1
+
+            def __call__(self, *args):
+                calls.append("capture_forward")
+                return runnable(*args)
+
+        mock_npu_graph.replay.side_effect = lambda: calls.append("replay")
         wrapper = ACLGraphWrapper(
-            runnable=self.mock_runnable,
+            runnable=HostBackedModel(),
             vllm_config=self.mock_vllm_config,
             runtime_mode=CUDAGraphMode.FULL,
             cudagraph_options=self.mock_cudagraph_options,
@@ -408,6 +434,9 @@ class TestACLGraphWrapper(TestBase):
         # Both calls should return the weak ref output
         self.assertEqual(first_result, "test_output")  # Original output
         self.assertEqual(second_result, "weak_ref_output")  # Weak ref output
+
+        self.assertEqual(calls, ["stage", "capture_forward", "stage", "replay"])
+        self.assertEqual(next(iter(wrapper.concrete_aclgraph_entries.values())).active_decode_replays, 1)
 
     @patch("vllm_ascend.compilation.acl_graph.torch")
     @patch("vllm_ascend.compilation.acl_graph.validate_cudagraph_capturing_enabled")

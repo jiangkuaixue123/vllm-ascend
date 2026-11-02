@@ -1,7 +1,14 @@
 from vllm import ModelRegistry
 
+from vllm_ascend.models.deepseek_v41.config import register_config
+
 
 def register_model():
+    register_config()
+    ModelRegistry.register_model(
+        "DeepseekV41ForCausalLM",
+        "vllm_ascend.models.deepseek_v41.model:DeepseekV41ForCausalLM",
+    )
     ModelRegistry.register_model(
         "KimiLinearForCausalLM",
         "vllm_ascend.models.kimi_k3:AscendKimiLinearForCausalLM",
