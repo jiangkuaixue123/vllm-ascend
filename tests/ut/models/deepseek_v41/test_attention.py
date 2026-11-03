@@ -13,6 +13,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch import nn
 
+from tests.ut.models.deepseek_v41 import paged_cache
 from vllm_ascend.models.deepseek_v41 import attention
 from vllm_ascend.models.deepseek_v41.attention_ops import sparse_attn
 
@@ -101,15 +102,7 @@ def make_layer(monkeypatch):
                 else:
                     values = torch.randn(parameter.shape, generator=generator, device="cpu") * 0.15
                     parameter.copy_(values.to(parameter.device))
-        layer.cache.kv_cache = torch.zeros(
-            2,
-            12,
-            4,
-            1,
-            layer.cache.width,
-            dtype=torch.float32,
-            device=layer.wq_a.weight.device,
-        )
+        paged_cache.allocate(layer.cache, 12, 4, layer.wq_a.weight.device)
         return layer
 
     return create
@@ -190,10 +183,10 @@ def test_request_reorder_and_physical_page_relocation_preserve_history(make_laye
     assert runtime.shared[0] is not runtime.shared[1]
     torch.testing.assert_close(initial[:3], expected_a[:3], rtol=0, atol=0)
     torch.testing.assert_close(initial[3:], expected_b[:5], rtol=0, atol=0)
-    pages = layer.cache.kv_cache
     for source, destination in ((3, 6), (1, 7), (0, 8), (2, 9)):
-        pages[:, destination].copy_(pages[:, source])
-        pages[:, source].fill_(999)
+        for bank in layer.cache.kv_cache:
+            bank[destination].copy_(bank[source])
+            bank[source].fill_(999)
     later, runtime = run_batch(
         layer,
         torch.cat((b[5:], a[3:])),
@@ -323,19 +316,20 @@ def test_static_decode_matches_eager_over_pages_and_pending_groups(make_layer, r
         with torch.no_grad():
             actual = graph(token, attention.DeepseekV41Runtime.for_decode(md))
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-        torch.testing.assert_close(graph.cache.kv_cache, eager.cache.kv_cache, rtol=0, atol=0)
+        torch.testing.assert_close(paged_cache.bits(graph.cache), paged_cache.bits(eager.cache), rtol=0, atol=0)
 
 
 def test_static_decode_dummy_preserves_all_cache_values(make_layer):
     layer = make_layer(2)
-    layer.cache.kv_cache.uniform_(-1, 1)
-    previous = layer.cache.kv_cache.clone()
+    for bank in layer.cache.kv_cache:
+        bank.uniform_(-1, 1)
+    previous = paged_cache.snapshot(layer.cache)
     md = graph_metadata(1, [0, 0, 0, 0], 16, active=False)
     layer.cache.metadata = lambda: md
     with torch.no_grad():
         output = layer(hidden_tokens(1), attention.DeepseekV41Runtime.for_decode(md))
     torch.testing.assert_close(output, torch.zeros_like(output), rtol=0, atol=0)
-    torch.testing.assert_close(layer.cache.kv_cache, previous, rtol=0, atol=0)
+    torch.testing.assert_close(paged_cache.bits(layer.cache), previous, rtol=0, atol=0)
 
 
 def test_npu_graph_replays_changed_position_page_and_idle_mask(make_layer, tensor_device):
@@ -374,23 +368,27 @@ def test_npu_graph_replays_changed_position_page_and_idle_mask(make_layer, tenso
         replay(4, True, table)
         expected, _ = run_batch(eager, states[3:4], [attention.RequestSpan(0, 1, 4)], [table])
         torch.testing.assert_close(result, expected, rtol=0, atol=0)
-        torch.testing.assert_close(captured_layer.cache.kv_cache, eager.cache.kv_cache, rtol=0, atol=0)
+        torch.testing.assert_close(
+            paged_cache.bits(captured_layer.cache), paged_cache.bits(eager.cache), rtol=0, atol=0
+        )
 
-        before_idle = captured_layer.cache.kv_cache.clone()
+        before_idle = paged_cache.snapshot(captured_layer.cache)
         replay(0, False, [0, 0, 0, 0])
         torch.testing.assert_close(result, torch.zeros_like(result), rtol=0, atol=0)
-        torch.testing.assert_close(captured_layer.cache.kv_cache, before_idle, rtol=0, atol=0)
+        torch.testing.assert_close(paged_cache.bits(captured_layer.cache), before_idle, rtol=0, atol=0)
 
         # Relocate the first logical page and append an incomplete ratio-two group.
         moved_table = [8, 6, 7, 1]
         for layer in (eager, captured_layer):
-            pages = layer.cache.kv_cache
-            pages[:, 8].copy_(pages[:, 3])
-            pages[:, 3].fill_(99)
+            for bank in layer.cache.kv_cache:
+                bank[8].copy_(bank[3])
+                bank[3].fill_(99)
         replay(5, True, moved_table)
         expected, _ = run_batch(eager, states[4:5], [attention.RequestSpan(0, 1, 5)], [moved_table])
         torch.testing.assert_close(result, expected, rtol=0, atol=0)
-        torch.testing.assert_close(captured_layer.cache.kv_cache, eager.cache.kv_cache, rtol=0, atol=0)
+        torch.testing.assert_close(
+            paged_cache.bits(captured_layer.cache), paged_cache.bits(eager.cache), rtol=0, atol=0
+        )
 
 
 def test_decode_metadata_replay_changes_values_but_retains_capture_addresses():
@@ -504,7 +502,7 @@ def test_multirow_decode_replays_live_idle_and_relocated_pages(make_layer, tenso
     lengths = [0, 4, 3, 1, 2, 0, 4, 3][:rows]
     states = [hidden_tokens(8, 35 + i) for i in range(rows)]
     for layer in (eager, captured):
-        layer.cache.kv_cache = torch.zeros(2, 2 * rows + 1, 4, 1, layer.cache.width, dtype=torch.float32)
+        paged_cache.allocate(layer.cache, 2 * rows + 1, 4)
         for i, length in enumerate(lengths):
             if length:
                 run_batch(layer, states[i][:length], [attention.RequestSpan(0, length, length)], [tables[i]])
@@ -542,7 +540,7 @@ def test_multirow_decode_replays_live_idle_and_relocated_pages(make_layer, tenso
                 actual, _ = run_batch(eager, inputs[live_rows], spans, [tables[i] for i in live_rows])
                 expected[live_rows] = actual
             torch.testing.assert_close(output, expected, rtol=0, atol=0)
-            torch.testing.assert_close(captured.cache.kv_cache, eager.cache.kv_cache, rtol=0, atol=0)
+            torch.testing.assert_close(paged_cache.bits(captured.cache), paged_cache.bits(eager.cache), rtol=0, atol=0)
             for i in live_rows:
                 lengths[i] += 1
 
@@ -550,8 +548,9 @@ def test_multirow_decode_replays_live_idle_and_relocated_pages(make_layer, tenso
         replay([])
         moved = 2 * rows
         for layer in (eager, captured):
-            layer.cache.kv_cache[:, moved].copy_(layer.cache.kv_cache[:, tables[1][0]])
-            layer.cache.kv_cache[:, tables[1][0]].fill_(99)
+            for bank in layer.cache.kv_cache:
+                bank[moved].copy_(bank[tables[1][0]])
+                bank[tables[1][0]].fill_(99)
         tables[1][0] = moved
         replay(list(range(rows)))
 
@@ -592,17 +591,19 @@ def test_static_decode_reuses_source_pages_and_candidate_selection(make_layer, r
             observed = layer(tokens, graph_runtime)
             expected = first if index == 0 else eager[index](tokens, eager_runtime)
         torch.testing.assert_close(observed, expected, atol=0, rtol=0)
-        torch.testing.assert_close(layer.cache.kv_cache, eager[index].cache.kv_cache, atol=0, rtol=0)
+        torch.testing.assert_close(paged_cache.bits(layer.cache), paged_cache.bits(eager[index].cache), atol=0, rtol=0)
         assert graph_runtime.source_cache is graph[0].cache
 
 
-def test_cache_spec_accounts_for_all_fp32_state_channels(make_layer):
+def test_cache_spec_accounts_for_mixed_precision_source(make_layer):
     layer = make_layer(2)
     spec = layer.cache.get_kv_cache_spec(None)
-    assert spec.dtype == torch.float32
-    assert spec.head_size >= 2 * layer.dim
+    assert spec.dtype == torch.bfloat16
     assert spec.head_size >= layer.dim + layer.config.index_head_dim
+    assert spec.head_size_v == 4 * layer.dim
     assert layer.cache.pages()[0].shape == (48, spec.head_size)
+    assert layer.cache.field(0, layer.dim, layer.dim).dtype == torch.float32
+    assert layer.cache.field(1, layer.dim, layer.config.index_head_dim).dtype == torch.bfloat16
 
 
 class CPUSequenceGroup:
@@ -689,7 +690,9 @@ def sequence_attention_worker(rank, init_uri):
                 seq_runtime = attention.DeepseekV41Runtime(spans)
                 observed = sequence(padded[start : start + 3], seq_runtime)
                 torch.testing.assert_close(observed, expected[start : start + 3], rtol=0, atol=0)
-                torch.testing.assert_close(sequence.cache.kv_cache, reference.cache.kv_cache, rtol=0, atol=0)
+                torch.testing.assert_close(
+                    paged_cache.bits(sequence.cache), paged_cache.bits(reference.cache), rtol=0, atol=0
+                )
                 following_ref.cache.metadata = following_seq.cache.metadata = reference.cache.metadata
                 expected = torch.nn.functional.pad(following_ref(packed, ref_runtime), (0, 0, 0, 1))
                 observed = following_seq(padded[start : start + 3], seq_runtime)
@@ -706,7 +709,9 @@ def sequence_attention_worker(rank, init_uri):
                     start = 2 * rank
                     observed = sequence(tokens[start : start + 2], seq_runtime)
                     torch.testing.assert_close(observed, expected[start : start + 2], rtol=0, atol=0)
-                    torch.testing.assert_close(sequence.cache.kv_cache, reference.cache.kv_cache, rtol=0, atol=0)
+                    torch.testing.assert_close(
+                        paged_cache.bits(sequence.cache), paged_cache.bits(reference.cache), rtol=0, atol=0
+                    )
                     following_seq.cache.metadata = following_ref.cache.metadata = reference.cache.metadata
                     expected = following_ref(tokens, ref_runtime)
                     observed = following_seq(tokens[start : start + 2], seq_runtime)

@@ -146,9 +146,9 @@ vllm serve "$MODEL_PATH" \
 
 ## 性能与容量
 
-真实权重加载约占 35.12 GiB/rank。32,768 上下文配置下，每个 DP 的日志报告可用 KV 约 19.94 GiB/rank、65,280 个 token，满长请求并发估计 1.99。该配置已完成短请求与不同长度并发验证，整段 32,768 token 输入的实测仍待补充。
+早期 TP8 / DP2 参考布局实测，真实权重加载约占 35.12 GiB/rank。32,768 上下文配置下，每个 DP 的日志报告可用 KV 约 19.94 GiB/rank、65,280 个 token，满长请求并发估计 1.99。该配置已完成短请求与不同长度并发验证，整段 32,768 token 输入的实测仍待补充。
 
-配置文件的理论位置上限为 1,048,576。当前缓存约为 320 KiB/token/rank，单条 128K 请求约需 40 GiB/rank，超出现有 KV 空间。128K 加全局 16 条满长序列也超出此配置的容量。此容量估计来自参考缓存布局。
+配置文件的理论位置上限为 1,048,576。早期目标模型使用约 320 KiB/token/rank 的参考缓存布局，因此当时单条 128K 请求预计需要约 40 GiB/rank。
 
 单请求对照使用同一版纯插件、原版 vLLM、TP8 / DP2 / EP16。上下文设为 256，关闭前缀缓存，使用相同的 20 个输入 token，固定生成 32 个 token。每组预热一次，再串行测量三次；每次输出的 token ID 均一致。TPOT 按第一个和最后一个生成 token 的客户端到达时间差除以 31 计算，TTFT 包含 prefill。
 
@@ -189,3 +189,23 @@ vllm serve "$MODEL_PATH" \
 在 16 卡 A3 的 TP4 / DP4 / EP16 配置上，开启 `enable_dsa_cp` 和 `enable_shared_expert_dp`，关闭显式 `enable_flashcomm1`。DSA-CP 仍会启用序列并行。配合 DSpark5、前缀缓存、32K 上下文、每个 DP 最多 8 条序列，以及 FULL_DECODE_ONLY 图尺寸 24、48，设置 `--max-num-batched-tokens 8192` 后实测每个 DP 的调度上限为 8160。
 
 大批量 eager prefill 将 MoE 已聚合的专家输入、DSA 查询打分和输出投影输入量化分块计算。四个 DP 各报告 11.14 GiB 可用 KV、33,920 个缓存 token。每个 DP 同时接收一条 8,208-token 合成输入，冷缓存下均跨越调度步，并生成相同的 3 个 token。另一次全局 32 路短请求验证中，四个 DP 均实际重放了 48 行 FULL decode 图。33,920 是每个 DP 全部在途请求共用的 token 容量。
+
+### 150,000-token 上下文与 128-token 缓存页
+
+在 16 卡 A3 的 TP4 / DP4 / EP16 混部服务中，可使用以下启动参数。上下文上限包含提示和生成的全部 token。
+
+```bash
+vllm serve "$MODEL_PATH" \
+    --tensor-parallel-size 4 --data-parallel-size 4 --enable-expert-parallel \
+    --max-model-len 150000 --block-size 128 \
+    --max-num-batched-tokens 8192 --max-num-seqs 8 \
+    --limit-mm-per-prompt '{"image":1}' \
+    --enable-prefix-caching --enable-prompt-tokens-details \
+    --additional-config '{"enable_dsa_cp":true,"enable_flashcomm1":false,"enable_shared_expert_dp":true}' \
+    --speculative-config '{"method":"dspark","num_speculative_tokens":5}' \
+    --compilation-config '{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[24,48]}'
+```
+
+缓存按层分配。每层保留完整历史的 BF16 注意力 KV，压缩源层另存潜变量及 DSA 索引；压缩器中间状态和 Engram token 历史保留 FP32 精度。40 个目标层加 3 个草稿层合计 61,596 字节/token/rank。150,000 token 占 1,172 个逻辑页，连同一个保留空页约需 8.61 GiB/rank。DSpark5 预留后每步调度上限为 8,160 token。
+
+jcz-dsv41 各 DP 的实测容量为 194,027–194,155 token。向 DP0 提交 149,887 个原始输入 token 并要求生成 113 个 token，逐项核对回传输入，缓存命中为 0，总长为 150,000。该请求耗时 621 秒，DP0 的 KV 峰值为 77.31%，decode 跨过位置 149,888 的页界并实际重放 FULL24。32 路短请求另在每个 DP 重放 FULL48。两个有 256-token 公共前缀的短请求分别命中 0 和 128 个 token，符合投机算法重算最后一块的行为。容量由同一 DP 的请求共享；每个 DP 可同时容纳一条满长请求。

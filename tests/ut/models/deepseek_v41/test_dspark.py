@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from safetensors.torch import save_file
 from torch import nn
 
+from tests.ut.models.deepseek_v41 import paged_cache
 from vllm_ascend.models.deepseek_v41 import dspark, moe
 from vllm_ascend.models.deepseek_v41.attention import DeepseekV41Metadata, RequestSpan
 from vllm_ascend.models.deepseek_v41.attention_ops import fp8_quant_dequant
@@ -143,7 +144,7 @@ def draft(monkeypatch, tmp_path):
             else:
                 value.copy_(torch.randn(value.shape, generator=generator) * 0.15)
     for stage in model.mtp:
-        stage.attn.cache.kv_cache = torch.zeros(2, 8, 4, 1, stage.attn.cache.width)
+        paged_cache.allocate(stage.attn.cache, 8, 4)
     return model
 
 
@@ -167,14 +168,14 @@ def test_three_stages_paged_context_and_markov_outputs_are_request_local(draft):
     draft.precompute_and_store_context_kv(context, pos, [slots] * 3)
     for stage in draft.mtp:
         projected = stage.attn.project_kv(context, pos)
-        torch.testing.assert_close(stage.attn.cache.pages()[0][slots, :32], projected.float(), rtol=0, atol=0)
+        torch.testing.assert_close(stage.attn.cache.pages()[0][slots, :32], projected, rtol=0, atol=0)
     ids = [2, 15, 15, 15, 15, 7, 15, 15, 15, 15]
-    snapshots = [s.attn.cache.kv_cache.clone() for s in draft.mtp]
+    snapshots = [paged_cache.snapshot(s.attn.cache) for s in draft.mtp]
     packed = run_block(draft, ids, [6, 3], [[3, 6, 0], [1, 5, 0]])
     independent = torch.cat((run_block(draft, ids[:5], [6], [[3, 6, 0]]), run_block(draft, ids[5:], [3], [[1, 5, 0]])))
     torch.testing.assert_close(packed, independent, rtol=0, atol=0)
     for stage, previous in zip(draft.mtp, snapshots):
-        torch.testing.assert_close(stage.attn.cache.kv_cache, previous, rtol=0, atol=0)
+        torch.testing.assert_close(paged_cache.bits(stage.attn.cache), previous, rtol=0, atol=0)
     logits = draft.compute_logits(packed)
     expected = F.linear(draft.mtp[-1].norm(packed).float(), draft.mtp[-1].head.weight.float())
     torch.testing.assert_close(logits, expected)
@@ -321,12 +322,13 @@ def test_idle_draft_warmup_preserves_cache_and_real_proposal_requires_metadata(d
     originals = []
     for stage in draft.mtp:
         stage.attn.cache.metadata = lambda: None
-        stage.attn.cache.kv_cache.fill_(7)
-        originals.append(stage.attn.cache.kv_cache.clone())
+        for bank in stage.attn.cache.kv_cache:
+            bank.fill_(7)
+        originals.append(paged_cache.snapshot(stage.attn.cache))
     draft.precompute_and_store_context_kv(torch.zeros(5, 32, dtype=torch.bfloat16), torch.arange(5))
     draft(torch.tensor([2, 15, 15, 15, 15]), torch.arange(5))
     for stage, previous in zip(draft.mtp, originals):
-        torch.testing.assert_close(stage.attn.cache.kv_cache, previous, rtol=0, atol=0)
+        torch.testing.assert_close(paged_cache.bits(stage.attn.cache), previous, rtol=0, atol=0)
     ctx.draft_attn_metadatas = None
     with pytest.raises(RuntimeError, match="Missing cache slots"):
         draft.precompute_and_store_context_kv(torch.zeros(5, 32, dtype=torch.bfloat16), torch.arange(5))

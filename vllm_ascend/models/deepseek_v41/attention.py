@@ -2,7 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Paged V4.1 latent attention with eager prefill and uniform graph decode.
 
-Cache values retain the official quantize/dequantize results in FP32 pages.
+Paged raw and compressed keys retain the official BF16 quantize/dequantize
+results. The pre-normalization compressor inputs and gates retain FP32.
 The A3 BF16 shared-KV operator consumes the selected latent vectors. Decode
 replay updates positions, slots and live-row masks at fixed addresses.
 """
@@ -49,6 +50,9 @@ from .native_attention import DeepseekV41NativeAttention
 _INDEX_SCORE_TILE_BYTES = 32 * 1024 * 1024
 # At TP4 this bounds each WO quantizer's temporary FP32 tensor to 8 MiB.
 _OUTPUT_QDQ_TILE_ROWS = 256
+# A FULL graph uses a static context width even when only a few pages are live.
+# Tile the key axis; candidate-block and top-k selection still see all scores.
+_DECODE_INDEX_TILE_KEYS = 8192
 
 
 def _quantize_projection_input(output):
@@ -242,12 +246,24 @@ class DeepseekV41Backend(AttentionBackend):
 class DeepseekV41Cache(nn.Module, AttentionLayerBase):
     supports_dcp = False
 
-    def __init__(self, config, vllm_config, prefix):
+    def __init__(self, config, vllm_config, prefix, *, source_ratio=0, token_history=False):
         super().__init__()
         self.prefix = prefix
         self.dim = config.head_dim
         self.index_dim = config.index_head_dim
-        self.width = max(2 * self.dim, self.dim + self.index_dim + 1)
+        self.source_ratio = source_ratio
+        self.token_history = token_history
+        # Both banks are allocated by the ordinary vLLM page manager. Use
+        # power-of-two bank widths so Ascend's K/V split factors are exact.
+        # Every layer retains its BF16 raw latent at every physical slot.
+        key_words = self.dim + (self.index_dim + 2 * token_history if source_ratio > 1 else 0)
+        self.key_width = 1 << (key_words - 1).bit_length()
+        if source_ratio > 1:
+            self.value_width = 4 * self.dim  # Two FP32 vectors per slot.
+        elif source_ratio == 1:
+            self.value_width = 1 << (self.dim + self.index_dim + 2 * token_history - 1).bit_length()
+        else:
+            self.value_width = 2  # FP32 token history; the runner requires a positive V width.
         self.block_size = vllm_config.cache_config.block_size
         self.kv_cache = None
         self.native_layout = None
@@ -263,8 +279,9 @@ class DeepseekV41Cache(nn.Module, AttentionLayerBase):
         return FullAttentionSpec(
             block_size=self.block_size,
             num_kv_heads=1,
-            head_size=self.width,
-            dtype=torch.float32,
+            head_size=self.key_width,
+            head_size_v=self.value_width,
+            dtype=torch.bfloat16,
         )
 
     def metadata(self):
@@ -277,7 +294,27 @@ class DeepseekV41Cache(nn.Module, AttentionLayerBase):
         if self.kv_cache is None:
             raise RuntimeError("V4.1 cache was not bound by the model runner")
         key, value = self.kv_cache
-        return key.reshape(-1, self.width), value.reshape(-1, self.width)
+        return key.reshape(-1, key.shape[-1]), value.reshape(-1, value.shape[-1])
+
+    def field(self, bank, offset, width):
+        """Address a logical state field within the physical pages for this layer."""
+        key, value = self.pages()
+        if bank == 0 and 0 <= offset < self.dim and offset + width <= self.dim:
+            return key[:, offset : offset + width]
+        if bank == 0 and offset == self.dim and self.source_ratio:
+            values = value.view(torch.float32) if self.source_ratio > 1 else value
+            return values[:, :width]
+        if bank == 1 and offset == 0 and self.source_ratio > 1:
+            return value.view(torch.float32)[:, self.dim : self.dim + width]
+        if bank == 1 and offset == self.dim and self.source_ratio:
+            keys = key if self.source_ratio > 1 else value
+            return keys[:, self.dim : self.dim + width]
+        if bank == 1 and offset == self.dim + self.index_dim and width == 1 and self.token_history:
+            if self.source_ratio:
+                storage = key if self.source_ratio > 1 else value
+                return storage[:, offset : offset + 2].view(torch.float32)
+            return value[:, :2].view(torch.float32)
+        raise ValueError(f"Unallocated V4.1 cache field: bank={bank}, offset={offset}, width={width}")
 
     def slots(self, metadata, request_idx, positions):
         blocks = metadata.block_table_tensor[request_idx]
@@ -285,28 +322,33 @@ class DeepseekV41Cache(nn.Module, AttentionLayerBase):
 
     def read(self, metadata, request_idx, positions, bank, offset, width):
         slots = self.slots(metadata, request_idx, positions)
-        return self.pages()[bank][slots, offset : offset + width]
+        return self.field(bank, offset, width)[slots]
+
+    def write_slots(self, slots, values, bank, offset):
+        page = self.field(bank, offset, values.shape[-1])
+        page.index_copy_(0, slots.long(), values.to(page.dtype))
 
     def write(self, metadata, values, bank, offset):
         slots = metadata.slot_mapping[: values.shape[0]].long()
-        self.pages()[bank][slots, offset : offset + values.shape[-1]] = values.float()
+        self.write_slots(slots, values, bank, offset)
 
     def decode_read(self, md, positions, bank, offset, width):
         """Read fixed-shape logical positions, zeroing dead rows and future slots."""
         pos = positions.clamp(0, md.max_model_len - 1)
         blocks = md.block_table_tensor.gather(1, pos // self.block_size).long()
         slots = blocks * self.block_size + pos % self.block_size
-        pages = self.pages()[bank]
+        pages = self.field(bank, offset, width)
         valid = md.active[:, None] & (positions >= 0) & (positions < md.seq_lens[:, None])
         valid = valid & (slots >= 0) & (slots < pages.shape[0])
         safe = torch.where(valid, slots, 0)
-        values = pages[:, offset : offset + width].index_select(0, safe.flatten())
+        values = pages.index_select(0, safe.flatten())
         values = values.reshape(*positions.shape, width)
         return torch.where(valid[..., None], values, 0)
 
     def decode_write(self, md, values, bank, offset, enabled):
         """Preserve cache bits for inactive rows, including a live write to slot zero."""
-        page = self.pages()[bank][:, offset : offset + values.shape[-1]]
+        page = self.field(bank, offset, values.shape[-1])
+        values = values.to(page.dtype)
         valid = enabled & md.active & (md.slot_mapping >= 0) & (md.slot_mapping < page.shape[0])
         slots = torch.where(valid, md.slot_mapping, 0)
         if md.query_width > 1:
@@ -315,8 +357,8 @@ class DeepseekV41Cache(nn.Module, AttentionLayerBase):
             # bits before the write, so every alias writes the same value.
             zero_is_live = valid & (slots == 0)
             zero_row = zero_is_live.long().argmax().reshape(1)
-            zero_value = torch.where(zero_is_live.any(), values.index_select(0, zero_row).float(), page[:1])
-            updates = torch.where(slots[:, None] == 0, zero_value, values.float())
+            zero_value = torch.where(zero_is_live.any(), values.index_select(0, zero_row), page[:1])
+            updates = torch.where(slots[:, None] == 0, zero_value, values)
             page.index_copy_(0, slots, updates)
             return
         # Unroll the fixed bucket on the capture stream. A masked row that
@@ -325,7 +367,7 @@ class DeepseekV41Cache(nn.Module, AttentionLayerBase):
         for row in range(values.shape[0]):
             slot = slots[row : row + 1]
             old = page.index_select(0, slot)
-            value = torch.where(valid[row : row + 1, None], values[row : row + 1].float(), old)
+            value = torch.where(valid[row : row + 1, None], values[row : row + 1], old)
             page.index_copy_(0, slot, value)
 
 
@@ -524,7 +566,13 @@ class DeepseekV41Attention(nn.Module):
             if self.owns_index
             else None
         )
-        self.cache = DeepseekV41Cache(config, vllm_config, f"{prefix}.cache")
+        self.cache = DeepseekV41Cache(
+            config,
+            vllm_config,
+            f"{prefix}.cache",
+            source_ratio=self.ratio if self.owns_kv else 0,
+            token_history=layer_id == 0,
+        )
         self.register_buffer(
             "frequencies", rotary_frequencies(config, self.ratio > 0).to(self.attn_sink.device), persistent=False
         )
@@ -554,10 +602,9 @@ class DeepseekV41Attention(nn.Module):
             group_scores = scores[: completed.numel() * ratio] if scores is not None else None
         else:
             slots = self.cache.slots(metadata, request_idx, positions)
-            key_page, value_page = self.cache.pages()
-            key_page[slots, dim : 2 * dim] = raw.float()
+            self.cache.write_slots(slots, raw, 0, dim)
             if scores is not None:
-                value_page[slots, :dim] = scores
+                self.cache.write_slots(slots, scores, 1, 0)
             group_positions = (completed.unsqueeze(-1) - torch.arange(ratio - 1, -1, -1, device=x.device)).flatten()
             group_kv = self.cache.read(metadata, request_idx, group_positions, 0, dim, dim)
             group_scores = (
@@ -580,8 +627,8 @@ class DeepseekV41Attention(nn.Module):
             latent = fp4_quant_dequant(latent, 16, scale_format="e4m3")
             if metadata is not None:
                 slots = self.cache.slots(metadata, request_idx, completed)
-                key_page[slots, dim : 2 * dim] = latent.float()
-                value_page[slots, dim : dim + self.config.index_head_dim] = keys.float()
+                self.cache.write_slots(slots, latent, 0, dim)
+                self.cache.write_slots(slots, keys, 1, dim)
         else:
             latent = x.new_empty((0, dim))
             keys = x.new_empty((0, self.config.index_head_dim))
@@ -681,16 +728,19 @@ class DeepseekV41Attention(nn.Module):
             return
         groups = torch.arange(capacity, device=x.device).unsqueeze(0)
         ends = ((groups + 1) * self.ratio - 1).expand(x.shape[0], -1)
-        keys = runtime.source_cache.decode_read(
-            runtime.source_decode, ends, 1, self.dim, self.config.index_head_dim
-        ).to(x.dtype)
         indexer = self.indexer
         q = indexer.wq_b(qr)[0].view(-1, self.index_heads, self.config.index_head_dim)
         self.rotate(q.unsqueeze(0), pos)
         q = fp4_quant_dequant(q, 32, scale_format="e8m0")
         weights = indexer.weights_proj(x)[0] * (self.config.index_head_dim**-0.5 * self.config.index_n_heads**-0.5)
-        scores = torch.einsum("bhd,btd->bht", q, keys)
-        scores = (scores.relu_() * weights.unsqueeze(-1)).sum(1)
+        parts = []
+        for tile in ends.split(_DECODE_INDEX_TILE_KEYS, dim=-1):
+            keys = runtime.source_cache.decode_read(
+                runtime.source_decode, tile, 1, self.dim, self.config.index_head_dim
+            )
+            per_head = torch.einsum("bhd,btd->bht", q, keys.to(x.dtype))
+            parts.append((per_head.relu_() * weights.unsqueeze(-1)).sum(1))
+        scores = parts[0] if len(parts) == 1 else torch.cat(parts, dim=-1)
         if self.tp > 1 and not self.dsa_cp:
             scores = tensor_model_parallel_all_reduce(scores)
         lengths = torch.where(md.active, md.seq_lens // self.ratio, 0)[:, None]
@@ -806,7 +856,7 @@ class DeepseekV41Attention(nn.Module):
             first = max(0, request.start_pos - self.config.sliding_window + 1)
             if metadata is not None:
                 slots = self.cache.slots(metadata, request_idx, positions)
-                self.cache.pages()[0][slots, : self.dim] = kv.float()
+                self.cache.write_slots(slots, kv, 0, 0)
                 history = torch.arange(first, request.seq_len, device=hidden_states.device)
                 kv = self.cache.read(metadata, request_idx, history, 0, 0, self.dim).to(kv.dtype)
             if self.ratio:

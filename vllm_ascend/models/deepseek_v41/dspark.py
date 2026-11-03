@@ -162,8 +162,7 @@ class DSparkAttention(DeepseekV41Attention):
             raise ValueError("DSpark context positions, cache slots and hidden rows must align")
         # Slots for discarded / padded context tokens must never change slot 0.
         active = (slots >= 0).nonzero().flatten()
-        page = self.cache.pages()[0][:, : self.dim]
-        page.index_copy_(0, slots.index_select(0, active).long(), kv.index_select(0, active).float())
+        self.cache.write_slots(slots.index_select(0, active), kv.index_select(0, active), 0, 0)
 
     def forward(self, hidden, positions):
         positions = positions.reshape(-1)

@@ -15,6 +15,7 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 
+from tests.ut.models.deepseek_v41 import paged_cache
 from vllm_ascend.models.deepseek_v41 import model as model_module
 from vllm_ascend.models.deepseek_v41.attention import (
     DeepseekV41Cache,
@@ -189,8 +190,8 @@ def paged_hash_model():
         cache_config=SimpleNamespace(block_size=2),
         compilation_config=SimpleNamespace(static_forward_context={}),
     )
-    cache = DeepseekV41Cache(config, vllm_config, "hash-test.cache")
-    cache.kv_cache = torch.zeros(2, 20, 2, 1, cache.width, dtype=torch.float32)
+    cache = DeepseekV41Cache(config, vllm_config, "hash-test.cache", token_history=True)
+    paged_cache.allocate(cache, 20, 2)
     model = unloaded_module(model_module.DeepseekV41ForCausalLM)
     model.sequence_parallel = False
     model.config = config
@@ -255,13 +256,14 @@ def test_model_hash_restores_bounded_raw_history_across_pages_and_reordered_batc
     # Physically move both requests' pages, then poison obsolete slots. The
     # restored state must use the current request table rather than batch index.
     for source, destination in ((5, 13), (2, 10), (7, 15), (0, 12), (4, 14), (8, 16)):
-        cache.kv_cache[:, destination].copy_(cache.kv_cache[:, source])
-        cache.kv_cache[:, source].fill_(999)
+        for bank in cache.kv_cache:
+            bank[destination].copy_(bank[source])
+            bank[source].fill_(999)
     # Earlier tokens are deliberately unreadable: only the last three raw IDs
     # may be needed to resume 4-gram hashing.
-    cache.kv_cache[1, 13, :, 0, history_column] = 999
-    cache.kv_cache[1, 10, 0, 0, history_column] = 999
-    cache.kv_cache[1, 12, :, 0, history_column] = 999
+    cache.field(1, history_column, 1).reshape(-1, 2)[13] = 999
+    cache.field(1, history_column, 1).reshape(-1, 2)[10, 0] = 999
+    cache.field(1, history_column, 1).reshape(-1, 2)[12] = 999
     third, metadata = hash_batch(
         model,
         torch.cat((a[6:], b[5:])),
@@ -274,7 +276,7 @@ def test_model_hash_restores_bounded_raw_history_across_pages_and_reordered_batc
         (1, [2, 3, 4], 1, history_column, 1),
     ]
     # The metadata slot mapping stores raw IDs, not compressed vocabulary IDs.
-    stored = cache.pages()[1][metadata.slot_mapping.long(), history_column]
+    stored = cache.field(1, history_column, 1)[metadata.slot_mapping.long(), 0]
     torch.testing.assert_close(stored, torch.cat((a[6:], b[5:])).float())
 
 
@@ -399,12 +401,12 @@ def test_graph_engram_refreshes_paged_history_and_preserves_idle_cache(staged_ha
         if position == 3:
             address = model._decode_engram_values[1, 0].data_ptr()
         assert address == model._decode_engram_values[1, 0].data_ptr()
-    before = cache.kv_cache.clone()
+    before = paged_cache.snapshot(cache)
     md.decode.active.zero_()
     md.slot_mapping.fill_(-1)
     assert model.prepare_decode_graph_inputs(torch.tensor([0]), torch.tensor([0])) == 0
     assert model._decode_engram_values[1, 0].count_nonzero() == 0
-    torch.testing.assert_close(cache.kv_cache, before)
+    torch.testing.assert_close(paged_cache.bits(cache), before)
 
 
 @pytest.mark.parametrize("sizes", [[1], [1, 2, 4, 8], list(range(1, 9)), [3, 7]])
@@ -454,7 +456,7 @@ def test_multirow_engram_keeps_per_bucket_storage_and_request_owned_history(stag
         decode = DeepseekV41DecodeMetadata(lengths, slots, block_table, live, 8)
         metadata = DeepseekV41Metadata([], block_table, slots, int(live.sum()), decode)
         cache.metadata = lambda current=metadata: current
-        expected_cache = cache.kv_cache.clone()
+        expected_cache = paged_cache.snapshot(cache)
         assert model.prepare_decode_graph_inputs(torch.tensor(tokens), torch.tensor(positions)) == int(live.sum())
         for row, (request, token) in enumerate(zip(assignments, tokens)):
             if request is None:
@@ -465,10 +467,10 @@ def test_multirow_engram_keeps_per_bucket_storage_and_request_owned_history(stag
             expected = model.engram_hasher.hash_tokens(
                 histories[request], model.engram_hasher.new_state(), start_position=0
             )[-1]
-            expected_cache[1].reshape(-1, cache.width)[slots[row], cache.dim + cache.index_dim] = token
+            expected_cache[1].view(torch.float32).reshape(-1)[slots[row]] = token
             for layer in model.engram_layer_ids:
                 torch.testing.assert_close(model._decode_engram_values[bucket, layer][row], expected[layer])
-        torch.testing.assert_close(cache.kv_cache, expected_cache)
+        torch.testing.assert_close(paged_cache.bits(cache), expected_cache)
         for key, value in model._decode_engram_values.items():
             assert addresses.setdefault(key, value.data_ptr()) == value.data_ptr()
         for key, old in previous_buckets.items():
@@ -484,9 +486,9 @@ def test_graph_reports_live_rows_without_engram(staged_hash_model):
     live = torch.tensor([True, False, True, False])
     decode = DeepseekV41DecodeMetadata(torch.tensor([1, 0, 1, 0]), slots, table, live, 4)
     cache.metadata = lambda: DeepseekV41Metadata([], table, slots, 2, decode)
-    before = cache.kv_cache.clone()
+    before = paged_cache.snapshot(cache)
     assert model.prepare_decode_graph_inputs(torch.zeros(4, dtype=torch.long), torch.zeros(4, dtype=torch.long)) == 2
-    torch.testing.assert_close(cache.kv_cache, before)
+    torch.testing.assert_close(paged_cache.bits(cache), before)
 
 
 def test_sequence_parallel_hc_keeps_local_rows_and_gathers_only_unpadded_tokens(paged_hash_model, monkeypatch):

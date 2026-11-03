@@ -14,7 +14,7 @@ from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec
 from vllm.v1.request import Request
 
-from tests.ut.models.deepseek_v41 import test_attention, test_dspark, test_model
+from tests.ut.models.deepseek_v41 import paged_cache, test_attention, test_dspark, test_model
 from tests.ut.models.deepseek_v41.test_attention import hidden_tokens, run_batch
 from tests.ut.models.deepseek_v41.test_dspark import run_block
 from tests.ut.models.deepseek_v41.test_model import hash_batch
@@ -33,7 +33,7 @@ def test_two_suffixes_share_read_only_prefix_pages(make_layer, ratio):
     prefix, a, b = hidden_tokens(4), hidden_tokens(3, 45), hidden_tokens(2, 78)
     layer = make_layer(ratio)
     run_batch(layer, prefix, [RequestSpan(0, 4, 4)], [[5, 1]])
-    shared = layer.cache.kv_cache[:, 5].clone()
+    shared = paged_cache.snapshot(layer.cache, 5)
     cold = []
     for suffix in (b, a):
         combined = torch.cat((prefix, suffix))
@@ -46,7 +46,7 @@ def test_two_suffixes_share_read_only_prefix_pages(make_layer, ratio):
         [[5, 3], [5, 8]],
     )
     torch.testing.assert_close(resumed, torch.cat(cold), atol=0, rtol=0)
-    torch.testing.assert_close(layer.cache.kv_cache[:, 5], shared, atol=0, rtol=0)
+    torch.testing.assert_close(paged_cache.bits(layer.cache, 5), shared, atol=0, rtol=0)
 
 
 def test_engram_branches_restore_raw_history_from_the_same_prefix(paged_hash_model):
@@ -54,7 +54,7 @@ def test_engram_branches_restore_raw_history_from_the_same_prefix(paged_hash_mod
     prefix, branches = [2, 4, 6, 8], ([3, 5], [9, 1, 7])
     hash_batch(model, torch.tensor(prefix), [RequestSpan(0, 4, 4)], [[4, 7]])
     cache = model.layers[0].attn.cache
-    pages = cache.kv_cache[:, [4, 7]].clone()
+    pages = paged_cache.snapshot(cache, [4, 7])
     actual, _ = hash_batch(
         model,
         torch.tensor(branches[0] + branches[1]),
@@ -70,7 +70,7 @@ def test_engram_branches_restore_raw_history_from_the_same_prefix(paged_hash_mod
         ]
     )
     torch.testing.assert_close(actual, expected)
-    torch.testing.assert_close(cache.kv_cache[:, [4, 7]], pages)
+    torch.testing.assert_close(paged_cache.bits(cache, [4, 7]), pages)
 
 
 @torch.inference_mode()
@@ -90,21 +90,23 @@ def test_skipped_draft_populates_reusable_context_and_preserves_old_pages(draft)
     for stage, gid in zip(draft.mtp, proposer._layer_group_idx):
         page = stage.attn.cache.pages()[0]
         expected = stage.attn.project_kv(context, positions)
-        torch.testing.assert_close(page.index_select(0, groups[gid][:5])[:, :32], expected[:5].float(), rtol=0, atol=0)
+        torch.testing.assert_close(page.index_select(0, groups[gid][:5])[:, :32], expected[:5], rtol=0, atol=0)
         assert torch.count_nonzero(page[0]) == 0 and torch.count_nonzero(page[-1]) == 0
 
     # Recompute into the same stage tables from scratch as an independent
     # cold reference; the warm proposal consumes no target states for its hit.
-    saved = [s.attn.cache.kv_cache.clone() for s in draft.mtp]
+    saved = [paged_cache.snapshot(s.attn.cache) for s in draft.mtp]
     # Runner can use a different group mapping at each stage. Use one table
     # for this cold/warm block comparison after verifying grouped writes above.
     for stage, gid in zip(draft.mtp, proposer._layer_group_idx):
         block = int(groups[gid][0]) // 4
-        stage.attn.cache.kv_cache[:, 3].copy_(stage.attn.cache.kv_cache[:, block])
+        for bank in stage.attn.cache.kv_cache:
+            bank[3].copy_(bank[block])
     ids = [2, 15, 15, 15, 15]
     warm = run_block(draft, ids, [4], [[3, 6, 0]])
     for stage, previous in zip(draft.mtp, saved):
-        stage.attn.cache.kv_cache.copy_(previous)
+        for bank, old in zip(paged_cache.bits(stage.attn.cache), previous):
+            bank.copy_(old)
     draft.precompute_and_store_context_kv(context[:4], positions[:4], [torch.arange(12, 16)] * 3)
     cold = run_block(draft, ids, [4], [[3, 6, 0]])
     torch.testing.assert_close(warm, cold, rtol=0, atol=0)

@@ -481,7 +481,7 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsMultiModal):
             else:
                 rows = torch.tensor(live, dtype=torch.long, device=input_ids.device)
                 slots = decode.slot_mapping.index_select(0, rows).long()
-                cache.pages()[1][slots, history_column] = input_ids.index_select(0, rows).float()
+                cache.write_slots(slots, input_ids.index_select(0, rows).unsqueeze(-1), 1, history_column)
         return len(live)
 
     def _start_hc(self, embedded):
