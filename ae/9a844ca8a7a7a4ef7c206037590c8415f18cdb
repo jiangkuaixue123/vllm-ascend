@@ -1,0 +1,19 @@
+session-traces/dsv41.jsonl
+  s_8138fe57f47c15::t_18952d15df7cc7 1-21570
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "ae9a844ca8a7a7a4ef7c206037590c8415f18cdb",
+  "prompts": {},
+  "sessions": {
+    "s_8138fe57f47c15": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1a142-8777-7b60-81df-8609bcf31dbc",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "jiangkuaixue123 <jiangxiaozhou111@163.com>"
+    }
+  }
+}
