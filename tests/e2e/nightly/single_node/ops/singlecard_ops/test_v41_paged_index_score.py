@@ -146,13 +146,21 @@ def test_paged_decode_dispatch_matches_reference(tensor_device):
     )
 
     def run():
-        attention.DeepseekV41Attention._decode_index(layer, q, q, md.seq_lens - 1, md, runtime)
-        return runtime.decode_topk, runtime.decode_candidates
+        outputs = []
+        for layer_id in (0, 4, 8, 12, 16):
+            layer.layer_id = layer_id
+            layer_query = q.roll(layer_id // 4, dims=0)
+            attention.DeepseekV41Attention._decode_index(layer, layer_query, layer_query, md.seq_lens - 1, md, runtime)
+            if layer_id == 0:
+                assert runtime.decode_candidate_width == md.max_model_len // layer.ratio
+                outputs.append(runtime.decode_candidate_blocks)
+            outputs.append(runtime.decode_topk)
+        return outputs
 
     with patch.object(attention, "paged_index_scores", None):
         expected = run()
     with patch.object(attention, "paged_index_scores", wraps=attention.paged_index_scores) as fused:
         actual = run()
-        assert fused.call_count == int(tensor_device == "npu")
+        assert fused.call_count == 5 * int(tensor_device == "npu")
     for found, wanted in zip(actual, expected):
         assert torch.equal(found, wanted)

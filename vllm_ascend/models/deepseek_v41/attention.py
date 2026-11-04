@@ -440,7 +440,7 @@ def topk_columns(scores, k):
     return torch.where(at_cutoff, first.gather(-1, ordinal.clamp_min(0)).long(), top.indices)
 
 
-def select_candidate_blocks(logits, compress_lens, topk_blocks, block_size):
+def select_candidate_blocks(logits, compress_lens, topk_blocks, block_size, *, per_token=True):
     width = logits.shape[-1]
     if width == 0:
         return torch.zeros_like(logits, dtype=torch.bool)
@@ -451,7 +451,23 @@ def select_candidate_blocks(logits, compress_lens, topk_blocks, block_size):
     scores = scores.masked_fill(blocks == last, torch.inf)
     top = topk_columns(scores, min(topk_blocks, scores.shape[-1]))
     keep = torch.zeros_like(scores, dtype=torch.bool).scatter_(-1, top, scores.gather(-1, top) > -torch.inf)
-    return keep.repeat_interleave(block_size, -1)[..., :width]
+    if per_token:
+        return keep.repeat_interleave(block_size, -1)[..., :width]
+    return keep
+
+
+def mask_candidate_columns_(scores, keep, block_size, source_width):
+    """Broadcast one decision per block, including a partial final block."""
+    if source_width != scores.shape[-1]:
+        # Preserve the original dense broadcasting contract for unequal compression widths.
+        scores.masked_fill_(~keep.repeat_interleave(block_size, -1)[..., :source_width], -torch.inf)
+        return
+    blocks, tail = divmod(scores.shape[-1], block_size)
+    end = blocks * block_size
+    if blocks:
+        scores[..., :end].unflatten(-1, (blocks, block_size)).masked_fill_(~keep[..., :blocks, None], -torch.inf)
+    if tail:
+        scores[..., end:].masked_fill_(~keep[..., blocks : blocks + 1], -torch.inf)
 
 
 @dataclass
@@ -470,7 +486,8 @@ class DeepseekV41Runtime:
     source_cache: DeepseekV41Cache | None = None
     source_decode: DeepseekV41DecodeMetadata | None = None
     decode_topk: torch.Tensor | None = None
-    decode_candidates: torch.Tensor | None = None
+    decode_candidate_blocks: torch.Tensor | None = None
+    decode_candidate_width: int = 0
 
     @classmethod
     def for_decode(cls, metadata: DeepseekV41Metadata):
@@ -792,14 +809,29 @@ class DeepseekV41Attention(nn.Module):
         scores.masked_fill_(groups >= lengths, -torch.inf)
         source = self.config.candidate_source_layer_id
         if self.layer_id == source:
-            runtime.decode_candidates = select_candidate_blocks(
+            runtime.decode_candidate_width = capacity
+            runtime.decode_candidate_blocks = select_candidate_blocks(
                 scores,
                 lengths,
                 self.config.candidate_topk_blocks,
                 self.config.candidate_block_size,
+                per_token=False,
             )
+            if scores.device.type == "npu":
+                logger.info_once(
+                    "V4.1 decode candidate mask rows=%d columns=%d blocks=%d",
+                    scores.shape[0],
+                    capacity,
+                    runtime.decode_candidate_blocks.shape[-1],
+                    scope="process",
+                )
         elif 0 <= source < self.layer_id:
-            scores.masked_fill_(~runtime.decode_candidates, -torch.inf)
+            mask_candidate_columns_(
+                scores,
+                runtime.decode_candidate_blocks,
+                self.config.candidate_block_size,
+                runtime.decode_candidate_width,
+            )
         indices = topk_columns(scores, min(self.config.index_topk, capacity)).sort(-1).values
         runtime.decode_topk = torch.where(indices < lengths, indices, -1)
 
