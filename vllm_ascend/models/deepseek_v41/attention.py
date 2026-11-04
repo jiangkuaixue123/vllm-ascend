@@ -16,12 +16,13 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 from vllm import envs
+from vllm.config import CUDAGraphMode
 from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     get_tp_group,
     tensor_model_parallel_all_reduce,
 )
-from vllm.forward_context import get_forward_context
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.linear import (
@@ -263,6 +264,63 @@ class DeepseekV41Backend(AttentionBackend):
         return (2, num_blocks, block_size, num_kv_heads, head_size)
 
 
+# The largest validated dense temporary is 379.25 MiB. Bound the allocation
+# separately for each field width and element size before recording a graph.
+_MAX_DECODE_SCATTER_BYTES = 384 * 1024 * 1024
+
+
+def _supports_decode_scatter(page, slots, updates, md, source_ratio):
+    if not (
+        page.device.type == "npu"
+        and source_ratio in (1, 2)
+        and page.ndim == 2
+        and page.shape[1] in (128, 512)
+        and page.stride() == (1024, 1)
+        and not page.is_contiguous()
+        and page.dtype in (torch.bfloat16, torch.float32)
+        and not page.requires_grad
+        and page.shape[0] > 0
+        and page.numel() * page.element_size() <= _MAX_DECODE_SCATTER_BYTES
+        and page.storage_offset() + (page.shape[0] - 1) * page.stride(0) + page.shape[1] - 1
+        <= torch.iinfo(torch.int32).max
+        and isinstance(md, DeepseekV41DecodeMetadata)
+        and md.query_width == 6
+        and md.grouped_row_start == 0
+        and slots.device == updates.device == page.device
+        and slots.dtype == torch.int64
+        and slots.ndim == 1
+        and slots.numel() in (6, 24, 48)
+        and slots.is_contiguous()
+        and updates.dtype == page.dtype
+        and updates.shape == (slots.numel(), page.shape[1])
+        and updates.is_contiguous()
+        and not updates.requires_grad
+        and torch.is_inference_mode_enabled()
+        and not envs.VLLM_BATCH_INVARIANT
+        and not torch.compiler.is_compiling()
+        and is_forward_context_available()
+        and (context := get_forward_context()).cudagraph_runtime_mode == CUDAGraphMode.FULL
+        and getattr(context, "is_draft_model", True) is False
+        and get_ascend_device_type() == AscendDeviceType.A3
+        and enable_custom_op()
+        and hasattr(torch.ops._C_ascend, "npu_scatter_nd_update_v2")
+    ):
+        return False
+    import torch_npu
+
+    return all(int(torch_npu.get_npu_format(t)) == int(torch_npu.Format.ND) for t in (page, slots, updates))
+
+
+def _scatter_decode_field(page, slots, updates):
+    # Keep the original floating-point index_copy_ shape and dtype so its stock
+    # kernel selects the same NaN treatment. Only rows it overwrote are read.
+    dense = torch.empty(page.shape, device=page.device, dtype=page.dtype)
+    dense.index_copy_(0, slots, updates)
+    integer = torch.int32 if page.dtype == torch.float32 else torch.int16
+    written = dense.view(integer).index_select(0, slots).view(page.dtype)
+    torch.ops._C_ascend.npu_scatter_nd_update_v2(page, slots.int()[:, None], written)
+
+
 class DeepseekV41Cache(nn.Module, AttentionLayerBase):
     supports_dcp = False
 
@@ -380,6 +438,7 @@ class DeepseekV41Cache(nn.Module, AttentionLayerBase):
     def decode_write(self, md, values, bank, offset, enabled):
         """Preserve cache bits for inactive rows, including a live write to slot zero."""
         page = self.field(bank, offset, values.shape[-1])
+        input_dtype = values.dtype
         values = values.to(page.dtype)
         valid = enabled & md.active & (md.slot_mapping >= 0) & (md.slot_mapping < page.shape[0])
         slots = torch.where(valid, md.slot_mapping, 0)
@@ -391,7 +450,26 @@ class DeepseekV41Cache(nn.Module, AttentionLayerBase):
             zero_row = zero_is_live.long().argmax().reshape(1)
             zero_value = torch.where(zero_is_live.any(), values.index_select(0, zero_row), page[:1])
             updates = torch.where(slots[:, None] == 0, zero_value, values)
-            page.index_copy_(0, slots, updates)
+            if _supports_decode_scatter(page, slots, updates, md, self.source_ratio):
+                _scatter_decode_field(page, slots, updates)
+                if torch.npu.is_current_stream_capturing():
+                    logger.info(
+                        "V4.1 stock cache scatter capture cache=%s ratio=%d bank=%d offset=%d rows=%d "
+                        "physical_rows=%d width=%d dtype=%s input_dtype=%s storage_offset=%d row_stride=%d",
+                        self.prefix,
+                        self.source_ratio,
+                        bank,
+                        offset,
+                        slots.numel(),
+                        page.shape[0],
+                        page.shape[1],
+                        page.dtype,
+                        input_dtype,
+                        page.storage_offset(),
+                        page.stride(0),
+                    )
+            else:
+                page.index_copy_(0, slots, updates)
             return
         # Unroll the fixed bucket on the capture stream. A masked row that
         # aliases slot zero reads its latest value, after any earlier live row.
