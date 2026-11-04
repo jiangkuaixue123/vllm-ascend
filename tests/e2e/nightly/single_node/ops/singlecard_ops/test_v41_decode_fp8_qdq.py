@@ -18,7 +18,11 @@ def test_decode_fp8_entry_graph_replay(shape, inplace):
     words = torch.zeros(32 + math.prod(shape), dtype=torch.int16, device="npu")
     x = words[32:].view(torch.bfloat16).reshape(shape)
     prefix = words[:32].clone()
-    with patch.object(ops, "_decode_fp8_qdq", wraps=ops._decode_fp8_qdq) as selected:
+    # Retain coverage of the Q implementation when the single-pass layout or hardware is unavailable.
+    with (
+        patch.object(ops, "_try_decode_fp8_aiv", return_value=None),
+        patch.object(ops, "_decode_fp8_qdq", wraps=ops._decode_fp8_qdq) as selected,
+    ):
         ops.fp8_quant_dequant(x, inplace=inplace)
         torch.npu.synchronize()
         graph = torch.npu.NPUGraph()

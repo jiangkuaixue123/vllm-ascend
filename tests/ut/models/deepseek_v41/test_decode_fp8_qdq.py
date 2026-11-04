@@ -40,6 +40,7 @@ def test_fp8_fallback_keeps_view_and_storage(dtype, block):
     "x,block,error",
     [
         (torch.empty(1, 31), 32, ValueError),
+        (torch.empty((24, 512), dtype=torch.bfloat16), 32.0, TypeError),
         (torch.empty(()), 32, ValueError),
         (torch.empty(1, 32), 0, ValueError),
         (torch.empty((1, 32), dtype=torch.int32), 32, TypeError),
@@ -51,3 +52,22 @@ def test_fp8_validation_precedes_dispatch(x, block, error):
         pytest.raises(error),
     ):
         ops.fp8_quant_dequant(x, block)
+
+
+@pytest.mark.parametrize("inplace", [False, True])
+def test_single_pass_precedes_fp32_conversion(inplace):
+    x = torch.zeros((24, 512), dtype=torch.bfloat16)
+    result = x if inplace else torch.empty_like(x)
+    with (
+        patch.object(ops, "_use_decode_fp8_qdq", return_value=True),
+        patch.object(ops, "_try_decode_fp8_aiv", return_value=result) as fused,
+        patch.object(torch.Tensor, "float", side_effect=AssertionError("materialized FP32")),
+    ):
+        assert ops.fp8_quant_dequant(x, inplace=inplace) is result
+    fused.assert_called_once_with(x, inplace)
+
+
+def test_ineligible_cpu_shape_does_not_import_or_call_aiv():
+    x = torch.ones((48, 512), dtype=torch.bfloat16)
+    with patch.object(ops, "_try_decode_fp8_aiv", side_effect=AssertionError("CPU reached device dispatch")):
+        assert torch.equal(ops.fp8_quant_dequant(x), x)

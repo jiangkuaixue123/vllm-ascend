@@ -84,12 +84,14 @@ def round_e2m1(x: torch.Tensor) -> torch.Tensor:
     return _round_binary_float(source, mantissa_bits=1, minimum_exponent=0)
 
 
-def _group_input(x: torch.Tensor, block_size: int) -> torch.Tensor:
+def _group_shape(x: torch.Tensor, block_size: int) -> tuple[int, ...]:
     if x.ndim == 0 or block_size <= 0 or x.shape[-1] % block_size:
         raise ValueError("Last dimension must be divisible by a positive block size")
     if x.dtype not in (torch.bfloat16, torch.float16, torch.float32):
         raise TypeError("Quantization input must use BF16, FP16 or FP32")
-    return x.float().reshape(*x.shape[:-1], x.shape[-1] // block_size, block_size)
+    shape = (*x.shape[:-1], x.shape[-1] // block_size, block_size)
+    # Preserve native reshape validation for scalar integers and non-integral sizes.
+    return shape if type(block_size) is int else x.reshape(*shape).shape
 
 
 def _use_decode_fp8_qdq(x: torch.Tensor, block_size: int) -> bool:
@@ -110,6 +112,40 @@ def _use_decode_fp8_qdq(x: torch.Tensor, block_size: int) -> bool:
             logger.info_once("Ascend V4.1 E4M3 decode QDQ shape=%s", tuple(x.shape), scope="process")
             return True
     return False
+
+
+def _try_decode_fp8_aiv(x: torch.Tensor, inplace: bool):
+    # A raw pointer sees physical storage. Keep symbolic, negative-view and
+    # unaligned cases on the existing Q implementation.
+    if (
+        x.device.type != "npu"
+        or x.layout != torch.strided
+        or x.is_neg()
+        or torch.compiler.is_compiling()
+        or x.storage_offset() % _FP8_DECODE_GROUP_SIZE
+        or x.data_ptr() % (_FP8_DECODE_GROUP_SIZE * x.element_size())
+    ):
+        return None
+
+    from vllm.triton_utils import HAS_TRITON
+
+    from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
+
+    if not HAS_TRITON or get_ascend_device_type() != AscendDeviceType.A3:
+        return None
+
+    import torch_npu
+    from vllm.logger import logger
+
+    if int(torch_npu.get_npu_format(x)) != int(torch_npu.Format.ND):
+        return None
+
+    from vllm_ascend.ops.triton.deepseek_v41_fp8_qdq import decode_fp8_qdq
+
+    result = decode_fp8_qdq(x, inplace)
+    if result is not None:
+        logger.info_once("Ascend V4.1 single-pass E4M3 decode QDQ shape=%s", tuple(x.shape), scope="process")
+    return result
 
 
 def _decode_fp8_qdq(grouped: torch.Tensor) -> torch.Tensor:
@@ -139,8 +175,14 @@ def fp8_quant_dequant(x: torch.Tensor, block_size: int = 32, *, inplace: bool = 
     FP32 amax is clamped to 1e-4. Return dtype matches the input, including the
     final BF16 rounding used by the official in-place activation kernel.
     """
-    grouped = _group_input(x, block_size)
-    if _use_decode_fp8_qdq(x, block_size):
+    shape = _group_shape(x, block_size)
+    decode = _use_decode_fp8_qdq(x, block_size)
+    if decode:
+        fused = _try_decode_fp8_aiv(x, inplace)
+        if fused is not None:
+            return fused
+    grouped = x.float().reshape(shape)
+    if decode:
         result = _decode_fp8_qdq(grouped.view(-1, block_size))
     else:
         amax = grouped.abs().amax(dim=-1, keepdim=True).clamp_min(FP8_AMAX_MIN)
@@ -166,7 +208,8 @@ def fp4_quant_dequant(
     6*2**-126. E4M3 scales use nearest-even conversion of max(amax, 6*2**-9)/6.
     Neither rule may be replaced with BF16-only cache storage.
     """
-    grouped = _group_input(x, block_size)
+    shape = _group_shape(x, block_size)
+    grouped = x.float().reshape(shape)
     amax = grouped.abs().amax(dim=-1, keepdim=True)
     if scale_format == "e8m0":
         scale = _round_scale_up(amax.clamp_min(FP4_E8M0_AMAX_MIN), 1.0 / FP4_MAX)
