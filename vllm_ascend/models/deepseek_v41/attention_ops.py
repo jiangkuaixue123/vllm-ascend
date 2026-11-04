@@ -21,6 +21,11 @@ FLOAT32_EXPONENT_MASK = 0xFF * FLOAT32_EXPONENT_UNIT
 FLOAT32_MANTISSA_MASK = (1 << FLOAT32_MANTISSA_BITS) - 1
 FLOAT32_SIGN_MASK = -(1 << 31)
 FLOAT32_MAGNITUDE_MASK = (1 << 31) - 1
+_FP8_DECODE_GROUP_SIZE = 32
+_FP8_DECODE_SHAPES = ((24, 512), (48, 512), (24, 2, 4096), (48, 2, 4096))
+# E4M3's minimum normal exponent is -6, and each normal value retains three fraction bits.
+_FP8_MIN_NORMAL_FIELD = (FLOAT32_EXPONENT_BIAS - 6) * FLOAT32_EXPONENT_UNIT
+_FP8_ROUND_BIAS_OFFSET = (FLOAT32_MANTISSA_BITS - 3) * FLOAT32_EXPONENT_UNIT
 ATTENTION_BLOCK_SIZE = 64
 ATTENTION_QUERY_CHUNK_SIZE = 16
 ATTENTION_INITIAL_MAX = -1e30
@@ -87,6 +92,46 @@ def _group_input(x: torch.Tensor, block_size: int) -> torch.Tensor:
     return x.float().reshape(*x.shape[:-1], x.shape[-1] // block_size, block_size)
 
 
+def _use_decode_fp8_qdq(x: torch.Tensor, block_size: int) -> bool:
+    if (
+        x.device.type == "npu"
+        and x.dtype == torch.bfloat16
+        and block_size == _FP8_DECODE_GROUP_SIZE
+        and x.shape in _FP8_DECODE_SHAPES
+        and x.is_contiguous()
+        and not x.requires_grad
+        and torch.is_inference_mode_enabled()
+    ):
+        # Keep the standalone CPU reference importable without vLLM.
+        from vllm import envs
+        from vllm.logger import logger
+
+        if not envs.VLLM_BATCH_INVARIANT:
+            logger.info_once("Ascend V4.1 E4M3 decode QDQ shape=%s", tuple(x.shape), scope="process")
+            return True
+    return False
+
+
+def _decode_fp8_qdq(grouped: torch.Tensor) -> torch.Tensor:
+    """Round FP32 groups from BF16 decode inputs on the exact E4M3 grid."""
+    scaled_max = grouped.abs().amax(-1, keepdim=True).clamp_min(FP8_AMAX_MIN) * (1.0 / FP8_MAX)
+    # Adding an all-ones fraction carries iff the original fraction was nonzero.
+    # This also preserves the reference's special scales for Inf and NaN groups.
+    bits = scaled_max.contiguous().view(torch.int32) & FLOAT32_MAGNITUDE_MASK
+    scale = ((bits + FLOAT32_MANTISSA_MASK) & ~FLOAT32_MANTISSA_MASK).view(torch.float32)
+    limit = int(FP8_MAX)
+    scaled = (grouped / scale).clamp(-limit, limit)
+    magnitude = scaled.abs()
+    exponent = magnitude.contiguous().view(torch.int32) & FLOAT32_EXPONENT_MASK
+    # The ULP of bias equals the E4M3 quantum, including subnormals. The FP32
+    # addition rounds a halfway magnitude to even before subtracting the bias.
+    bias = (exponent.clamp_min(_FP8_MIN_NORMAL_FIELD) + _FP8_ROUND_BIAS_OFFSET).view(torch.float32)
+    rounded = (bias + magnitude) - bias
+    sign = scaled.contiguous().view(torch.int32) & FLOAT32_SIGN_MASK
+    bits = (rounded.contiguous().view(torch.int32) & FLOAT32_MAGNITUDE_MASK) | sign
+    return bits.view(torch.float32) * scale
+
+
 def fp8_quant_dequant(x: torch.Tensor, block_size: int = 32, *, inplace: bool = False) -> torch.Tensor:
     """Official E4M3 window/output QDQ with upward-rounded E8M0 scales.
 
@@ -95,9 +140,12 @@ def fp8_quant_dequant(x: torch.Tensor, block_size: int = 32, *, inplace: bool = 
     final BF16 rounding used by the official in-place activation kernel.
     """
     grouped = _group_input(x, block_size)
-    amax = grouped.abs().amax(dim=-1, keepdim=True).clamp_min(FP8_AMAX_MIN)
-    scale = _round_scale_up(amax, 1.0 / FP8_MAX)
-    result = round_e4m3(grouped / scale, saturate=True) * scale
+    if _use_decode_fp8_qdq(x, block_size):
+        result = _decode_fp8_qdq(grouped.view(-1, block_size))
+    else:
+        amax = grouped.abs().amax(dim=-1, keepdim=True).clamp_min(FP8_AMAX_MIN)
+        scale = _round_scale_up(amax, 1.0 / FP8_MAX)
+        result = round_e4m3(grouped / scale, saturate=True) * scale
     result = result.reshape(x.shape).to(x.dtype)
     if inplace:
         x.copy_(result)
