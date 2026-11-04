@@ -15,6 +15,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
+from vllm import envs
 from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     get_tp_group,
@@ -28,6 +29,7 @@ from vllm.model_executor.layers.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
+from vllm.triton_utils import HAS_TRITON
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -45,6 +47,11 @@ from .attention_ops import (
 )
 from .core import rms_norm
 from .native_attention import DeepseekV41NativeAttention
+
+if HAS_TRITON and not envs.VLLM_BATCH_INVARIANT:
+    from vllm_ascend.ops.triton.deepseek_v41_paged_read import read_strided_cache_field
+else:
+    read_strided_cache_field = None
 
 # Bound the per-head score tensor for eager prefill; cached candidates span the whole request.
 _INDEX_SCORE_TILE_BYTES = 32 * 1024 * 1024
@@ -340,6 +347,18 @@ class DeepseekV41Cache(nn.Module, AttentionLayerBase):
         pages = self.field(bank, offset, width)
         valid = md.active[:, None] & (positions >= 0) & (positions < md.seq_lens[:, None])
         valid = valid & (slots >= 0) & (slots < pages.shape[0])
+        # On the A3, index_select on a narrowed field first materializes all physical cache rows.
+        if (
+            read_strided_cache_field is not None
+            and pages.device.type == "npu"
+            and width in (128, 512)
+            and pages.dtype in (torch.bfloat16, torch.float32)
+            and pages.stride(1) == 1
+            and not pages.is_contiguous()
+            and not pages.requires_grad
+            and enable_custom_op()
+        ):
+            return read_strided_cache_field(pages, slots, valid)
         safe = torch.where(valid, slots, 0)
         values = pages.index_select(0, safe.flatten())
         values = values.reshape(*positions.shape, width)
