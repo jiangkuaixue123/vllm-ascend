@@ -14,6 +14,9 @@ import torch.nn.functional as F
 from torch import nn
 
 ROUTER_NORMALIZATION_EPS = 1e-20
+_FUSED_HC_WIDTH = 4
+_FUSED_HC_ROUNDS = 20
+_FUSED_HC_EPS = 1e-6
 
 
 def rms_norm(hidden_states: torch.Tensor, weight: torch.Tensor, eps: float = 1e-20) -> torch.Tensor:
@@ -43,6 +46,20 @@ def hc_split_sinkhorn(
     pre = torch.sigmoid(mixes[..., :hc_mult] * scale[0] + base[:hc_mult]) + eps
     post = 2 * torch.sigmoid(mixes[..., hc_mult : 2 * hc_mult] * scale[1] + base[hc_mult : 2 * hc_mult])
     comb = (mixes[..., 2 * hc_mult :] * scale[2] + base[2 * hc_mult :]).unflatten(-1, (hc_mult, hc_mult))
+    if (
+        comb.device.type == "npu"
+        and hc_mult == _FUSED_HC_WIDTH
+        and sinkhorn_iters == _FUSED_HC_ROUNDS
+        and eps == _FUSED_HC_EPS
+        and torch.is_inference_mode_enabled()
+        and comb.is_contiguous()
+    ):
+        # Defer Triton driver discovery until an NPU worker needs it. CPU and autograd use the reference below.
+        from vllm_ascend.ops.triton.hc_sinkhorn import hc_sinkhorn4
+
+        if hc_sinkhorn4 is not None:
+            return pre, post, hc_sinkhorn4(comb)
+
     comb = comb.softmax(-1) + eps
     comb = comb / (comb.sum(-2, keepdim=True) + eps)
     for _ in range(sinkhorn_iters - 1):

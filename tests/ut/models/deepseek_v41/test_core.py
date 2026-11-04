@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import math
+import sys
 
 import pytest
 import torch
@@ -54,6 +55,23 @@ def test_hc_projection_normalizes_jointly_over_all_residual_copies():
     # Joint RMS is sqrt((9 + 16) / 4) = 2.5, not sqrt(12.5).
     expected = torch.tensor([[1 / (1 + math.exp(-2.4)), 0.5]])
     torch.testing.assert_close(pre, expected)
+
+
+def test_four_stream_hc_on_cpu_preserves_reference_and_autograd(monkeypatch):
+    # The CPU primitives also work when the optional Triton implementation cannot be imported.
+    monkeypatch.setitem(sys.modules, "vllm_ascend.ops.triton.hc_sinkhorn", None)
+    gen = torch.Generator().manual_seed(42)
+    mixes = torch.randn(3, 24, generator=gen, requires_grad=True)
+    scale = torch.tensor([0.5, 1.5, -1.0])
+    base = torch.randn(24, generator=gen)
+    pre, post, comb = hc_split_sinkhorn(mixes, scale, base, 4)
+    (pre[:, 0] + post[:, 1] + comb[:, 1, 2]).sum().backward()
+    assert torch.isfinite(mixes.grad).all()
+    assert (mixes.grad[:, 8:].abs().sum(-1) > 0).all()
+    with torch.inference_mode():
+        inferred = hc_split_sinkhorn(mixes, scale, base, 4)
+    for actual, expected in zip(inferred, (pre, post, comb)):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 def test_hc_post_uses_comb_input_to_output_direction():
