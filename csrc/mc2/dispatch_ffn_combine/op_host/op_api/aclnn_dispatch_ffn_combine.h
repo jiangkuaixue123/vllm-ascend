@@ -46,6 +46,13 @@ __attribute__((visibility("default"))) aclnnStatus aclnnDispatchFFNCombineGetWor
                                                                                         const aclTensor* out, const aclTensor* expertTokenNums,
                                                                                         uint64_t* workspaceSize, aclOpExecutor** executor);
 
+__attribute__((visibility("default"))) aclnnStatus aclnnDispatchFFNCombineRouteBeforeDownGetWorkspaceSize(const aclTensor* x, const aclTensorList* weight1, const aclTensorList* weight2,
+                                                                                        const aclTensor* expertId, const aclTensorList* scale1, const aclTensorList* scale2,
+                                                                                        const aclTensor* probs, const aclTensor* xActiveMask,
+                                                                                        const char* group, int64_t maxOutputSize, double swigluLimit,
+                                                                                        const aclTensor* out, const aclTensor* expertTokenNums,
+                                                                                        uint64_t* workspaceSize, aclOpExecutor** executor);
+
 /**
  * @brief Second-stage interface of aclnnDispatchFFNCombine to execute computation.
  * @param [in] workspace: workspace memory address allocated on the NPU device side.
@@ -56,6 +63,9 @@ __attribute__((visibility("default"))) aclnnStatus aclnnDispatchFFNCombineGetWor
  */
 __attribute__((visibility("default"))) aclnnStatus aclnnDispatchFFNCombine(void* workspace, uint64_t workspaceSize, aclOpExecutor* executor,
                                            aclrtStream stream);
+
+__attribute__((visibility("default"))) aclnnStatus aclnnDispatchFFNCombineRouteBeforeDown(
+    void* workspace, uint64_t workspaceSize, aclOpExecutor* executor, aclrtStream stream);
 
 #ifdef __cplusplus
 }

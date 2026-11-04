@@ -32,12 +32,26 @@ std::tuple<at::Tensor&, at::Tensor&> dispatch_ffn_combine(
     at::Tensor& out,
     at::Tensor& expert_token_nums,
     const c10::optional<at::Tensor>& x_active_mask,
-    double swiglu_limit
+    double swiglu_limit,
+    bool route_before_down
 ) {
     char *group_ep_ptr = const_cast<char *>(group.data());
     bool is_int8 = weight1[0].dtype() == at::kChar;
     bool is_int4 = weight1[0].dtype() == at::kInt;
-    if (is_int8) {
+    if (route_before_down) {
+        TORCH_CHECK(is_int8 && x.scalar_type() == at::kBFloat16 && out.scalar_type() == at::kFloat,
+                    "route_before_down requires BF16 input, W8A8 weights, and FP32 output");
+        TORCH_CHECK(expert_idx.scalar_type() == at::kInt && probs.scalar_type() == at::kFloat,
+                    "route_before_down requires INT32 expert IDs and FP32 route weights");
+        TORCH_CHECK(weight1.size() == 1 && weight2.size() == 1 &&
+                    scale1.size() == 1 && scale2.size() == 1 &&
+                    scale1[0].scalar_type() == at::kFloat && scale2[0].scalar_type() == at::kFloat,
+                    "route_before_down requires stacked experts and FP32 channel scales");
+        EXEC_NPU_CMD(aclnnDispatchFFNCombineRouteBeforeDown,
+                     x, weight1, weight2, expert_idx, scale1, scale2, probs,
+                     x_active_mask.has_value() ? x_active_mask.value() : at::Tensor(),
+                     group_ep_ptr, max_output_size, swiglu_limit, out, expert_token_nums);
+    } else if (is_int8) {
         EXEC_NPU_CMD(aclnnDispatchFFNCombine,
                  x,
                  weight1,

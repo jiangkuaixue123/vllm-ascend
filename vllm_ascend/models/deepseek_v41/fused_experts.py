@@ -11,10 +11,11 @@ from vllm.distributed import get_ep_group
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import logger
 
-from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
 from vllm_ascend.models.deepseek_v41.core import clipped_swiglu
 from vllm_ascend.ops.fused_moe.dataclass.fused_experts import build_fused_experts_input
-from vllm_ascend.ops.fused_moe.moe_comm_method import AllGatherCommImpl
+from vllm_ascend.ops.fused_moe.moe_comm_method import AllGatherCommImpl, FusedExpertsResult, FusedMC2CommImpl
 from vllm_ascend.ops.fused_moe.prepare_finalize import PrepareAndFinalizeWithAllGather
 from vllm_ascend.ops.fused_moe.routed_experts import AscendRoutedExperts, AscendUnquantizedFusedMoEMethod
 from vllm_ascend.ops.fused_moe.token_dispatcher import TokenDispatcherWithAllGather
@@ -192,6 +193,59 @@ class DeepseekV41AllGatherComm(AllGatherCommImpl):
         return output, before_gmm2
 
 
+class DeepseekV41FusedMC2Comm(FusedMC2CommImpl):
+    """Grouped W8A8 with the route factor before W2 quantization.
+
+    Each runner owns its communication/shape state: the target and DSpark
+    draft have different local expert counts and top-k widths.
+    """
+
+    def fused_experts(self, fused_experts_input):
+        inputs = fused_experts_input
+        if inputs.quant.quant_type != QuantType.W8A8 or inputs.hidden_states.dtype != torch.bfloat16:
+            raise ValueError("V4.1 fused MC2 requires grouped W8A8 with BF16 input")
+        if inputs.topk_weights.dtype != torch.float32:
+            raise ValueError("V4.1 fused MC2 requires FP32 router weights")
+        weights = inputs.weights
+        if any(weight.dtype != torch.int8 or weight.ndim != 3 for weight in (weights.w1, weights.w2)):
+            raise ValueError("V4.1 fused MC2 requires stacked INT8 expert weights")
+        if any(scale.dtype != torch.float32 for scale in (weights.w1_scale, weights.w2_scale)):
+            raise ValueError("V4.1 fused MC2 requires FP32 channel scales")
+        # Uniform MC2 padding makes this conservative bound identical across
+        # EP ranks, including repeated expert IDs, and prevents the fused
+        # kernel's capacity truncation from dropping any route.
+        capacity = inputs.hidden_states.shape[0] * self.moe_config.ep_size * self.moe_config.experts_per_token
+        if not 0 < capacity <= get_ascend_config().mega_moe_max_tokens:
+            raise ValueError("V4.1 fused MC2 route capacity exceeds the configured workspace")
+        out = torch.empty_like(inputs.hidden_states, dtype=torch.float32)
+        torch.ops._C_ascend.dispatch_ffn_combine(
+            x=inputs.hidden_states,
+            weight1=[weights.w1],
+            weight2=[weights.w2],
+            expert_idx=inputs.topk_ids.to(torch.int32),
+            scale1=[weights.w1_scale],
+            scale2=[weights.w2_scale],
+            bias1=[],
+            bias2=[],
+            probs=inputs.topk_weights,
+            group=self.token_dispatcher.moe_all_to_all_group_name,
+            max_output_size=capacity,
+            swiglu_limit=self.swiglu_limit,
+            x_active_mask=inputs.routing.mc2_mask,
+            out=out,
+            expert_token_nums=self.expert_token_nums,
+            route_before_down=True,
+        )
+        logger.info_once(
+            "V4.1 fused MC2 W8A8 executed: experts=%d top_k=%d ep_rank=%d route_before_down=1",
+            self.moe_config.num_experts,
+            self.moe_config.experts_per_token,
+            self.moe_config.ep_group.rank_in_group,
+            scope="process",
+        )
+        return FusedExpertsResult(routed_out=out, expert_tokens=self.expert_token_nums)
+
+
 class _RouteBeforeDown:
     def apply(self, layer, x, topk_weights, topk_ids, shared_experts, shared_experts_input):
         if topk_weights.dtype != torch.float32:
@@ -201,7 +255,10 @@ class _RouteBeforeDown:
         if quant == QuantType.W8A8:
             # A8W8 grouped matmul with BF16 output requires BF16 channel
             # scales. The FP32 view injected for fused SwiGLU kernels is distinct.
-            weights = dict(w1_scale=layer.w13_weight_scale, w2_scale=layer.w2_weight_scale)
+            if _EXTRA_CTX.moe_comm_type == MoECommType.FUSED_MC2:
+                weights = dict(w1_scale=layer.w13_weight_scale_fp32, w2_scale=layer.v41_w2_scale_fp32)
+            else:
+                weights = dict(w1_scale=layer.w13_weight_scale, w2_scale=layer.w2_weight_scale)
         elif quant != QuantType.NONE:
             raise ValueError(f"Unsupported V4.1 grouped expert quantization: {quant}")
         return _EXTRA_CTX.moe_comm_method.fused_experts(
@@ -215,13 +272,19 @@ class _RouteBeforeDown:
                 dynamic_eplb=False,
                 expert_map=layer.ascend_expert_map,
                 pertoken_scale=layer.ascend_pertoken_scale,
+                mc2_mask=layer.ascend_mc2_mask,
                 **weights,
             )
         )
 
 
 class _V41W8A8Method(_RouteBeforeDown, AscendFusedMoEMethod):
-    pass
+    def process_weights_after_loading(self, layer):
+        super().process_weights_after_loading(layer)
+        if get_ascend_config().enable_fused_mc2 == 1:
+            # Match the existing BF16 channel values exactly; materialize the
+            # FP32 view once, outside graph capture and the decode hot path.
+            layer.v41_w2_scale_fp32 = layer.w2_weight_scale.float()
 
 
 class _V41BF16Method(_RouteBeforeDown, AscendUnquantizedFusedMoEMethod):

@@ -16,6 +16,7 @@
 #include "tiling/tiling_api.h"
 #include "tiling_base/error_log.h"
 #include "hcom_topo_info.h"
+#include "tiling_args.h"
 #include "register/op_def_registry.h"
 #include "../op_kernel/dispatch_ffn_combine_tiling.h"
 #include <vector>
@@ -36,6 +37,7 @@ namespace {
     constexpr uint32_t ATTR_IS_TRANS_B = 2;
     constexpr uint32_t ATTR_WEIGHT_NZ = 3;
     constexpr uint32_t ATTR_SWIGLU_LIMIT = 4;
+    constexpr uint32_t ATTR_ROUTE_BEFORE_DOWN = 5;
     constexpr uint64_t INIT_TILINGKEY = 1000000;
     constexpr uint64_t TILINGKEY_TRANS_B = 1U;
     constexpr uint64_t TILINGKEY_WEIGHT_NZ = 10;
@@ -107,6 +109,8 @@ static ge::graphStatus DispatchFFNCombineCheckAttrAndSetTiling(gert::TilingConte
     info.isTransposeB = *is_trans_b;
     info.isWeightNz = *weight_nz;
     info.swigluLimit = swiglu_limit != nullptr ? *swiglu_limit : 0.0f;
+    auto route_before_down = attrs->GetAttrPointer<bool>(ATTR_ROUTE_BEFORE_DOWN);
+    info.routeBeforeDown = route_before_down != nullptr && *route_before_down;
 
     int64_t rankSize;
     (void)ge::HcomTopoInfo::Instance().GetGroupRankSize(groupPtr, rankSize);
@@ -152,6 +156,18 @@ static ge::graphStatus DispatchFFNCombineCheckShapeAndSetTiling(gert::TilingCont
     info.expertPerRank = expertPerRank;
     info.topK = topK;
     info.listLen = listLen;
+    const auto outputType = context->GetOutputDesc(0)->GetDataType();
+    OP_TILING_CHECK((outputType == ge::DT_FLOAT) != static_cast<bool>(info.routeBeforeDown),
+        OP_LOGE(K_INNER_DEBUG, "FP32 output and routeBeforeDown must be enabled together."), return GRAPH_FAILED);
+    if (info.routeBeforeDown) {
+        // The raw-accumulator specialization uses a K-wide workspace and
+        // full-row epilogues. Bound their UB footprint and reject truncation.
+        OP_TILING_CHECK(listLen != 1 || K > 5120 || N > K || K % 32 || N % 64 ||
+                        M == 0 || M > 64 || info.worldSize > 32 || expertPerRank < 2 || topK == 0 || topK > 8 ||
+                        info.maxOutputSize < static_cast<uint64_t>(M) * info.worldSize * topK,
+            OP_LOGE(K_INNER_DEBUG, "Unsupported routeBeforeDown geometry or insufficient route capacity."),
+            return GRAPH_FAILED);
+    }
     OP_LOGD(K_INNER_DEBUG, "M=%d ", info.M);
     OP_LOGD(K_INNER_DEBUG, "K=%d ", info.K);
     OP_LOGD(K_INNER_DEBUG, "N=%d ", info.N);
@@ -267,9 +283,14 @@ static ge::graphStatus DispatchFFNCombineTilingFuncImpl(gert::TilingContext *con
      bool expertTokensBeforeCapacityFlag = false;
      int64_t quantMode = 1;
      uint32_t aivNumInitRouting = 2 * BLOCK_NUM;
-    moeInitRoutingQuantV2TilingBase.DoTiling(info.M, info.K, info.topK, expertCapacity, expertNum, activeNum, dropPadMode, 
+    const bool initRoutingTilingSucceeded = moeInitRoutingQuantV2TilingBase.DoTiling(
+        info.M, info.K, info.topK, expertCapacity, expertNum, activeNum, dropPadMode,
         expertTokensCountOrCumsumFlag, expertTokensBeforeCapacityFlag, inuptXDtypeSize, quantMode, scaleDim0, aivNumInitRouting, ubSize);
     uint64_t initRoutingQuantTilingKey = moeInitRoutingQuantV2TilingBase.tilingKey_;
+    OP_TILING_CHECK(!Moe::IsRouteBeforeDownRoutingSupported(
+                        info.routeBeforeDown, initRoutingTilingSucceeded, initRoutingQuantTilingKey),
+        OP_LOGE(K_INNER_DEBUG, "Unsupported routeBeforeDown routing: successful full-load dynamic tiling is required."),
+        return GRAPH_FAILED);
     size_t initRoutingWorkspace = moeInitRoutingQuantV2TilingBase.workspaceSize_;
 
     tilingData->cocTiling.moeInitRoutingQuantV2TilingData = moeInitRoutingQuantV2TilingBase.quantTilingData;
@@ -299,8 +320,8 @@ static ge::graphStatus DispatchFFNCombineTilingFuncImpl(gert::TilingContext *con
 
     uint64_t cocWorkspace = (info.M + 256 - 1) / 256 * 256 * info.topK *sizeof(int32_t) +
                             info.worldSize * info.worldSize * info.expertPerRank * sizeof(int32_t) * 2 +
-                            info.maxOutputSize * sizeof(float) * 2 +
-                            info.maxOutputSize * n2 * sizeof(int16_t) +
+                            info.maxOutputSize * sizeof(float) * (info.routeBeforeDown ? 3 : 2) +
+                            info.maxOutputSize * n2 * (info.routeBeforeDown ? sizeof(int32_t) : sizeof(int16_t)) +
                             info.maxOutputSize * info.K * sizeof(int8_t) +
                             info.worldSize  * sizeof(int32_t) * 16 +
                             (info.expertPerRank + info.worldSize) * sizeof(int32_t) * 16;

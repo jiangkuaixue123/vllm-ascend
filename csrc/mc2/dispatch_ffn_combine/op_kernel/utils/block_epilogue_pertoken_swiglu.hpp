@@ -18,6 +18,7 @@
 #include "catlass/matrix_coord.hpp"
 #include "catlass/layout/layout.hpp"
 #include "catlass/detail/callback.hpp"
+#include "route_before_down_quant.hpp"
 
 namespace Catlass::Epilogue::Block {
 
@@ -53,7 +54,7 @@ public:
 
     // Check data infos
     static_assert(
-        std::is_same_v<ElementC, half> && (std::is_same_v<ElementD, float> || std::is_same_v<ElementD, int8_t>),
+        (std::is_same_v<ElementC, half> || std::is_same_v<ElementC, int32_t>) && (std::is_same_v<ElementD, float> || std::is_same_v<ElementD, int8_t>),
         "The element type template parameters of BlockEpilogue are wrong"
     );
     static_assert(
@@ -118,6 +119,10 @@ public:
             AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(eventUbCVMTE2List[i]);
             AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(eventUbDMTE3VList[i]);  
         }
+        if constexpr (std::is_same_v<ElementC, int32_t>) {
+            ubChannelScale = resource.ubBuf.template GetBufferByByte<float>(ubOffset);
+            ubOffset += blockN * sizeof(float);
+        }
         ubPerTokenScaleOutput = resource.ubBuf.template GetBufferByByte<float>(ubOffset);
     }
     CATLASS_DEVICE
@@ -138,6 +143,13 @@ public:
     {
         params = params_;
     }
+    CATLASS_DEVICE
+    void SetRoutedScales(__gm__ float *scales, GM_ADDR counts, GM_ADDR routes, uint32_t experts, uint32_t ep) {
+        channelScales.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(scales));
+        expertCounts.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(counts) + (ep - 1) * experts);
+        routeScales.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(routes));
+        localExperts = experts;
+    }
     // Each tile is 1x7168, and each block covers all tokens for one expert = [group[i], 7168]
     CATLASS_DEVICE
     void operator() (
@@ -151,6 +163,7 @@ public:
         uint32_t epilogueCoreNum = 40,
         float swigluLimit = 0.0f,
         uint32_t blockK = 1,
+        uint32_t rowStart = 0,
         Callback &&callback = Callback{}
     )
     {
@@ -212,7 +225,21 @@ public:
             // Cast C to FP32 in UB
             AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(eventUbCMTE2VList[ubListId]);
             AscendC::Cast(ubCFp32, ubC, AscendC::RoundMode::CAST_NONE, blockN);
-            AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(eventUbCVMTE2List[ubListId]);
+            if constexpr (std::is_same_v<ElementC, int32_t>) {
+                uint32_t expert = 0;
+                uint32_t stop = expertCounts.GetValue(0);
+                while (expert + 1 < localExperts && rowStart + loopIdx >= stop) {
+                    stop += expertCounts.GetValue(++expert);
+                }
+                AscendC::DataCopy(ubChannelScale, channelScales[expert * blockN], blockN);
+                AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID2);
+                AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID2);
+                AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Mul(ubCFp32, ubCFp32, ubChannelScale, blockN);
+            }
+            if constexpr (!std::is_same_v<ElementC, int32_t>) {
+                AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(eventUbCVMTE2List[ubListId]);
+            }
 
             // Get per-token scale from row loopIdx of gmPerTokenScale
             ElementPerTokenScale perTokenScale = gmPerTokenScale1(loopIdx);
@@ -224,6 +251,13 @@ public:
             AscendC::Muls(ubCFp32, ubCFp32, perTokenScale, blockN);
             AscendC::PipeBarrier<PIPE_V>();
 
+            if constexpr (std::is_same_v<ElementC, int32_t>) {
+                auto rounded = ubC.template ReinterpretCast<bfloat16_t>();
+                AscendC::Cast(rounded, ubCFp32, AscendC::RoundMode::CAST_RINT, blockN);
+                AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Cast(ubCFp32, rounded, AscendC::RoundMode::CAST_NONE, blockN);
+                AscendC::PipeBarrier<PIPE_V>();
+            }
             // swiglu limit clamp
             if (swigluLimit > 0.0f) {
                 AscendC::ClampMax(ubCFp32, ubCFp32, sharedTmpBuffer, swigluLimit, blockN);
@@ -245,6 +279,22 @@ public:
             AscendC::PipeBarrier<PIPE_V>();
             AscendC::Mul(ubCFp32ChunkN, ubCFp32ChunkN, ubCFp32[ChunkTileLen], ChunkTileLen);
             
+            if constexpr (std::is_same_v<ElementC, int32_t>) {
+                const float route = routeScales.GetValue(rowStart + loopIdx);
+                AscendC::SetFlag<AscendC::HardEvent::S_V>(EVENT_ID0);
+                AscendC::WaitFlag<AscendC::HardEvent::S_V>(EVENT_ID0);
+                AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Muls(ubCFp32ChunkN, ubCFp32ChunkN, route, ChunkTileLen);
+                AscendC::PipeBarrier<PIPE_V>();
+                auto rounded = ubC.template ReinterpretCast<bfloat16_t>();
+                AscendC::Cast(rounded, ubCFp32ChunkN, AscendC::RoundMode::CAST_RINT, ChunkTileLen);
+                AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Cast(ubCFp32ChunkN, rounded, AscendC::RoundMode::CAST_NONE, ChunkTileLen);
+            }
+            if constexpr (std::is_same_v<ElementC, int32_t>) {
+                // ubC was reused for the two BF16 rounding boundaries.
+                AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(eventUbCVMTE2List[ubListId]);
+            }
             // Quantization process; difference between the two approaches
             AscendC::PipeBarrier<PIPE_V>();
             AscendC::Abs(ubAbs, ubCFp32ChunkN, ChunkTileLen);
@@ -253,29 +303,36 @@ public:
             AscendC::ReduceMax<float>(ubReduceMax, ubAbs, sharedUbTmpBuffer, ChunkTileLen, false);
             AscendC::PipeBarrier<PIPE_V>();
             
-            AscendC::SetFlag<AscendC::HardEvent::V_S>(0);
-            AscendC::WaitFlag<AscendC::HardEvent::V_S>(0);
+            if constexpr (std::is_same_v<ElementC, int32_t>) {
+                AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(eventUbDVMTE3List[ubListId]);
+                const float scale = VllmAscend::QuantizeRouteBeforeDown(
+                    ubCFp32ChunkN, ubAbs, ubReduceMax, ubD, ChunkTileLen);
+                ubPerTokenScaleOutput.SetValue(loopIdx - loopStartIdx, scale);
+            } else {
+                AscendC::SetFlag<AscendC::HardEvent::V_S>(0);
+                AscendC::WaitFlag<AscendC::HardEvent::V_S>(0);
 
-            // TODO: compare the efficiency of the two calculation methods
-            ElementPerTokenScale GMubDequantScale = ubReduceMax.GetValue(0);
-            AscendC::SetFlag<AscendC::HardEvent::S_V>(0);
+                // TODO: compare the efficiency of the two calculation methods
+                ElementPerTokenScale GMubDequantScale = ubReduceMax.GetValue(0);
+                AscendC::SetFlag<AscendC::HardEvent::S_V>(0);
 
-            auto ubPerTokenScaleOutputOffset = loopIdx - loopStartIdx;
-            ubPerTokenScaleOutput.SetValue(ubPerTokenScaleOutputOffset, GMubDequantScale / 127.f);
+                auto ubPerTokenScaleOutputOffset = loopIdx - loopStartIdx;
+                ubPerTokenScaleOutput.SetValue(ubPerTokenScaleOutputOffset, GMubDequantScale / 127.f);
 
-            AscendC::WaitFlag<AscendC::HardEvent::S_V>(0);
-            AscendC::Muls(ubOutputTmp, ubCFp32ChunkN, 127.f / GMubDequantScale, ChunkTileLen);
-            AscendC::PipeBarrier<PIPE_V>();
+                AscendC::WaitFlag<AscendC::HardEvent::S_V>(0);
+                AscendC::Muls(ubOutputTmp, ubCFp32ChunkN, 127.f / GMubDequantScale, ChunkTileLen);
+                AscendC::PipeBarrier<PIPE_V>();
 
-            AscendC::Cast(ubQuantS32, ubOutputTmp, AscendC::RoundMode::CAST_RINT, ChunkTileLen);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::SetDeqScale(static_cast<half>(1.0));
-            AscendC::Cast(ubQuantF16, ubQuantS32, AscendC::RoundMode::CAST_RINT, ChunkTileLen);
-            AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Cast(ubQuantS32, ubOutputTmp, AscendC::RoundMode::CAST_RINT, ChunkTileLen);
+                AscendC::PipeBarrier<PIPE_V>();
+                AscendC::SetDeqScale(static_cast<half>(1.0));
+                AscendC::Cast(ubQuantF16, ubQuantS32, AscendC::RoundMode::CAST_RINT, ChunkTileLen);
+                AscendC::PipeBarrier<PIPE_V>();
 
-            AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(eventUbDVMTE3List[ubListId]);
-            AscendC::Cast(ubD, ubQuantF16, AscendC::RoundMode::CAST_RINT, ChunkTileLen);
-            // AscendC::Muls(ubD, ubCFp32ChunkN, 127.f / GMubDequantScale, ChunkTileLen);
+                AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(eventUbDVMTE3List[ubListId]);
+                AscendC::Cast(ubD, ubQuantF16, AscendC::RoundMode::CAST_RINT, ChunkTileLen);
+                // AscendC::Muls(ubD, ubCFp32ChunkN, 127.f / GMubDequantScale, ChunkTileLen);
+            }
             AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(eventUbDMTE3VList[ubListId]);         
 
             LayoutD layoutUbD{1, ChunkTileLen};
@@ -299,6 +356,10 @@ public:
 
 private:
     Params params;
+    AscendC::GlobalTensor<float> channelScales, routeScales;
+    AscendC::GlobalTensor<int32_t> expertCounts;
+    AscendC::LocalTensor<float> ubChannelScale;
+    uint32_t localExperts = 0;
 
     AscendC::LocalTensor<ElementC> ubCList[UB_STAGES];
     AscendC::LocalTensor<ElementD> ubDList[UB_STAGES];

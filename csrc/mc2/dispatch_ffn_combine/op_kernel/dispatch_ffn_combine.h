@@ -215,11 +215,13 @@ __aicore__ inline void DispatchFFNCombine<TemplateMMA2ACFunc>::Process()
     using L0TileShape = GemmShape<128, 256, 128>;
     using AType = Gemm::GemmType<int8_t, layout::RowMajor>;
     using BType = Gemm::GemmType<int8_t, LayoutB>;
-    using CType = Gemm::GemmType<float16_t, layout::RowMajor>;
+    static constexpr bool ROUTE_BEFORE_DOWN = std::is_same_v<CType_, float>;
+    using AccumOutput = typename std::conditional<ROUTE_BEFORE_DOWN, int32_t, float16_t>::type;
+    using CType = Gemm::GemmType<AccumOutput, layout::RowMajor>;
     using D1Type = Gemm::GemmType<int8_t, layout::RowMajor>;
 
     using D2Type = typename std::conditional<
-        std::is_same_v<CType_, bfloat16_t>, 
+        std::is_same_v<CType_, bfloat16_t> || ROUTE_BEFORE_DOWN,
         Gemm::GemmType<bfloat16_t, layout::RowMajor>,
         Gemm::GemmType<CType_, layout::RowMajor>
         >::type;

@@ -20,6 +20,31 @@
 #include "dispatch_policy_custom.hpp"
 
 
+namespace Catlass::Gemm::Tile {
+    template <bool ReluEnable_>
+    struct CopyL0CToGm<Catlass::Arch::AtlasA2, int32_t,
+                     Gemm::GemmType<int32_t, layout::RowMajor>,
+                     ScaleGranularity::PER_CHANNEL, ReluEnable_> {
+        CATLASS_DEVICE
+        void operator()(AscendC::GlobalTensor<int32_t> const &dst,
+                        AscendC::LocalTensor<int32_t> const &src,
+                        AscendC::LocalTensor<uint64_t>,
+                        layout::RowMajor const &dstLayout, layout::zN const &srcLayout,
+                        uint8_t unitFlag = 0) {
+            AscendC::FixpipeParamsV220 params;
+            params.nSize = dstLayout.shape(1);
+            params.mSize = dstLayout.shape(0);
+            params.srcStride = srcLayout.stride(3) / srcLayout.stride(0);
+            params.dstStride = dstLayout.stride(0);
+            params.quantPre = QuantMode_t::NoQuant;
+            params.reluEn = false;
+            params.unitFlag = unitFlag;
+            AscendC::Fixpipe<int32_t, int32_t, AscendC::CFG_ROW_MAJOR>(dst, src, params);
+        }
+    };
+
+}
+
 namespace Catlass::Gemm::Block {
 
 template<AscendC::HardEvent event>
@@ -469,7 +494,7 @@ private:
 
         if (params.isKLoopLast) {
             auto layoutCInGm = params.layoutCInGm;
-            if constexpr (std::is_same_v<ElementA, int8_t>) {
+            if constexpr (std::is_same_v<ElementA, int8_t> && !std::is_same_v<ElementC, int32_t>) {
                 auto layoutScale = params.layoutScale;
                 auto layoutTileS = layoutScale.GetTileLayout(MakeCoord(layoutCInGm.shape(1)));
                 AscendC::WaitFlag<AscendC::HardEvent::FIX_MTE2>(0);

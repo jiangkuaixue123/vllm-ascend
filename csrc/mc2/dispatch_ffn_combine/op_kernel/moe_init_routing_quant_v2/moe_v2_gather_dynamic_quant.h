@@ -17,10 +17,12 @@
 
 #include "moe_v2_common.h"
 
+#include "../utils/route_before_down_quant.hpp"
+
 namespace MoeInitRoutingQuantV2 {
 using namespace AscendC;
 using namespace optiling;
-template <typename T>
+template <typename T, bool STRICT_QUANT = false>
 class MoeV2GatherDynamicQuant {
  public:
   __aicore__ inline MoeV2GatherDynamicQuant(){};
@@ -90,8 +92,8 @@ class MoeV2GatherDynamicQuant {
   int64_t outOffset;
 };
 
-template <typename T>
-__aicore__ inline void MoeV2GatherDynamicQuant<T>::CopyInExpandedRowIdx(int64_t progress) {
+template <typename T, bool STRICT_QUANT>
+__aicore__ inline void MoeV2GatherDynamicQuant<T, STRICT_QUANT>::CopyInExpandedRowIdx(int64_t progress) {
   this->indicesOffset = progress * this->perLoopRows;
   LocalTensor<int32_t> indicesLocal = expandRowIdxInQueue.AllocTensor<int32_t>();
   DataCopyExtParams dataCopyParams{1, static_cast<uint32_t>(this->currentLoopRows * sizeof(int32_t)), 0, 0, 0};
@@ -100,8 +102,8 @@ __aicore__ inline void MoeV2GatherDynamicQuant<T>::CopyInExpandedRowIdx(int64_t 
   expandRowIdxInQueue.EnQue<int32_t>(indicesLocal);
 }
 
-template <typename T>
-__aicore__ inline void MoeV2GatherDynamicQuant<T>::CopyInExpandedExpertIdx(int64_t progress) {
+template <typename T, bool STRICT_QUANT>
+__aicore__ inline void MoeV2GatherDynamicQuant<T, STRICT_QUANT>::CopyInExpandedExpertIdx(int64_t progress) {
   this->indicesOffset = progress * this->perLoopRows;
   LocalTensor<int32_t> indicesLocal = expandRowIdxInQueue.AllocTensor<int32_t>();
   DataCopyExtParams dataCopyParams{1, static_cast<uint32_t>(this->currentLoopRows * sizeof(int32_t)), 0, 0, 0};
@@ -112,8 +114,8 @@ __aicore__ inline void MoeV2GatherDynamicQuant<T>::CopyInExpandedExpertIdx(int64
   expandRowIdxInQueue.EnQue<int32_t>(indicesLocal);
 }
 
-template <typename T>
-__aicore__ inline void MoeV2GatherDynamicQuant<T>::Compute(LocalTensor<float>& smoothLocal) {
+template <typename T, bool STRICT_QUANT>
+__aicore__ inline void MoeV2GatherDynamicQuant<T, STRICT_QUANT>::Compute(LocalTensor<float>& smoothLocal) {
   LocalTensor<float> inLocal = inputXInQueue.DeQue<float>();
 
   LocalTensor<float> tempLocal = calcQueue.AllocTensor<float>();
@@ -136,26 +138,27 @@ __aicore__ inline void MoeV2GatherDynamicQuant<T>::Compute(LocalTensor<float>& s
   ReduceMax(dynamicQuantLocal, tempLocal, tempLocal, this->cols);
   AscendC::PipeBarrier<PIPE_V>();
 
-  float maxValue = dynamicQuantLocal.GetValue(0) / 127.0f;
+  if constexpr (STRICT_QUANT) {
+    VllmAscend::QuantizeRouteBeforeDown(inLocal, tempLocal, dynamicQuantLocal, outLocal, this->cols);
+  } else {
+    float maxValue = dynamicQuantLocal.GetValue(0) / 127.0f;
+    Duplicate<float>(dynamicQuantLocal, maxValue, 8);
+    Duplicate<float>(tempLocal, maxValue, this->cols);
+    AscendC::PipeBarrier<PIPE_V>();
 
-  Duplicate<float>(dynamicQuantLocal, maxValue, 8);
-  Duplicate<float>(tempLocal, maxValue, this->cols);
-  AscendC::PipeBarrier<PIPE_V>();
-
-  Div(tempLocal, inLocal, tempLocal, this->cols);
-  AscendC::PipeBarrier<PIPE_V>();
-
-  Cast(tempLocal.ReinterpretCast<half>(), tempLocal, RoundMode::CAST_TRUNC, this->cols);
-  AscendC::PipeBarrier<PIPE_V>();
-
-  Cast(outLocal, tempLocal.ReinterpretCast<half>(), RoundMode::CAST_ROUND, this->cols);
+    Div(tempLocal, inLocal, tempLocal, this->cols);
+    AscendC::PipeBarrier<PIPE_V>();
+    Cast(tempLocal.ReinterpretCast<half>(), tempLocal, RoundMode::CAST_TRUNC, this->cols);
+    AscendC::PipeBarrier<PIPE_V>();
+    Cast(outLocal, tempLocal.ReinterpretCast<half>(), RoundMode::CAST_ROUND, this->cols);
+  }
 
   calcQueue.FreeTensor(tempLocal);
   inputXOutQueue.EnQue(outLocal);
 }
 
-template <typename T>
-__aicore__ inline void MoeV2GatherDynamicQuant<T>::CopyOutXQuant1H(int64_t progress) {
+template <typename T, bool STRICT_QUANT>
+__aicore__ inline void MoeV2GatherDynamicQuant<T, STRICT_QUANT>::CopyOutXQuant1H(int64_t progress) {
   LocalTensor<int32_t> indicesLocal = expandRowIdxInQueue.DeQue<int32_t>();
 
   int64_t initialRow = this->gatherOutTilingData->perCoreRows * this->blockIdx + this->perLoopRows * progress;
@@ -205,8 +208,8 @@ __aicore__ inline void MoeV2GatherDynamicQuant<T>::CopyOutXQuant1H(int64_t progr
   expandRowIdxInQueue.FreeTensor(indicesLocal);
 }
 
-template <typename T>
-__aicore__ inline void MoeV2GatherDynamicQuant<T>::CopyOutXQuantEH(int64_t progress) {
+template <typename T, bool STRICT_QUANT>
+__aicore__ inline void MoeV2GatherDynamicQuant<T, STRICT_QUANT>::CopyOutXQuantEH(int64_t progress) {
   LocalTensor<int32_t> indicesLocal = expandRowIdxInQueue.DeQue<int32_t>();
   SetWaitFlag<HardEvent::MTE2_S>(HardEvent::MTE2_S);
 
@@ -256,8 +259,8 @@ __aicore__ inline void MoeV2GatherDynamicQuant<T>::CopyOutXQuantEH(int64_t progr
   expandRowIdxInQueue.FreeTensor(indicesLocal);
 }
 
-template <typename T>
-__aicore__ inline float MoeV2GatherDynamicQuant<T>::ComputeMax(LocalTensor<float>& inLocal,
+template <typename T, bool STRICT_QUANT>
+__aicore__ inline float MoeV2GatherDynamicQuant<T, STRICT_QUANT>::ComputeMax(LocalTensor<float>& inLocal,
                                                                LocalTensor<float>& tempLocal,
                                                                LocalTensor<float>& dynamicQuantLocal, int32_t srcIdx,
                                                                int32_t expertIdx, int64_t j) {
@@ -305,8 +308,8 @@ __aicore__ inline float MoeV2GatherDynamicQuant<T>::ComputeMax(LocalTensor<float
   return dynamicQuantLocal.GetValue(8);
 }
 
-template <typename T>
-__aicore__ inline void MoeV2GatherDynamicQuant<T>::ComputeScale(LocalTensor<float>& inLocal,
+template <typename T, bool STRICT_QUANT>
+__aicore__ inline void MoeV2GatherDynamicQuant<T, STRICT_QUANT>::ComputeScale(LocalTensor<float>& inLocal,
                                                                 LocalTensor<float>& tempLocal, float scaleTemp,
                                                                 int64_t dstIndex, int64_t j) {
   DataCopyExtParams copyInParams{1, static_cast<uint32_t>(colsTileLength * sizeof(float)), 0, 0, 0};
@@ -324,10 +327,22 @@ __aicore__ inline void MoeV2GatherDynamicQuant<T>::ComputeScale(LocalTensor<floa
   Div(tempLocal, inLocal, tempLocal, colsTileLength);
   AscendC::PipeBarrier<PIPE_V>();
 
+  if constexpr (STRICT_QUANT) {
+    // Round FP32 values to integers before narrowing. An intermediate FP16
+    // truncation can move a value across a half-integer rounding boundary.
+    auto rounded = tempLocal.ReinterpretCast<int32_t>();
+    Cast(rounded, tempLocal, RoundMode::CAST_RINT, colsTileLength);
+    AscendC::PipeBarrier<PIPE_V>();
+    SetDeqScale(static_cast<half>(1.0));
+    Cast(tempLocal.ReinterpretCast<half>(), rounded, RoundMode::CAST_RINT, colsTileLength);
+    AscendC::PipeBarrier<PIPE_V>();
+    Cast(outLocal, tempLocal.ReinterpretCast<half>(), RoundMode::CAST_RINT, colsTileLength);
+  } else {
   Cast(tempLocal.ReinterpretCast<half>(), tempLocal, RoundMode::CAST_TRUNC, colsTileLength);
   AscendC::PipeBarrier<PIPE_V>();
 
   Cast(outLocal, tempLocal.ReinterpretCast<half>(), RoundMode::CAST_ROUND, colsTileLength);
+  }
 
   inputXOutQueue.EnQue(outLocal);
   outLocal = inputXOutQueue.DeQue<int8_t>();
@@ -337,8 +352,8 @@ __aicore__ inline void MoeV2GatherDynamicQuant<T>::ComputeScale(LocalTensor<floa
   SetWaitFlag<HardEvent::MTE3_MTE2>(HardEvent::MTE3_MTE2);
 }
 
-template <typename T>
-__aicore__ inline void MoeV2GatherDynamicQuant<T>::CopyOutPartialXQuantEH(int64_t progress) {
+template <typename T, bool STRICT_QUANT>
+__aicore__ inline void MoeV2GatherDynamicQuant<T, STRICT_QUANT>::CopyOutPartialXQuantEH(int64_t progress) {
   LocalTensor<int32_t> indicesLocal = expandRowIdxInQueue.DeQue<int32_t>();
   SetWaitFlag<HardEvent::MTE2_S>(HardEvent::MTE2_S);
 
@@ -366,6 +381,9 @@ __aicore__ inline void MoeV2GatherDynamicQuant<T>::CopyOutPartialXQuantEH(int64_
     }
 
     float scaleTemp = reduceMax / 127.0f;
+    if constexpr (STRICT_QUANT) {
+      if (scaleTemp == 0.0f) scaleTemp = 1.0f;
+    }
     Duplicate<float>(quantScaleLocal, scaleTemp, 8);
     scaleOutQueue.EnQue(quantScaleLocal);
     quantScaleLocal = scaleOutQueue.DeQue<float>();
@@ -389,8 +407,8 @@ __aicore__ inline void MoeV2GatherDynamicQuant<T>::CopyOutPartialXQuantEH(int64_
   expandRowIdxInQueue.FreeTensor(indicesLocal);
 }
 
-template <typename T>
-__aicore__ inline void MoeV2GatherDynamicQuant<T>::CopyOutPartialXQuant1H(int64_t progress) {
+template <typename T, bool STRICT_QUANT>
+__aicore__ inline void MoeV2GatherDynamicQuant<T, STRICT_QUANT>::CopyOutPartialXQuant1H(int64_t progress) {
   LocalTensor<int32_t> indicesLocal = expandRowIdxInQueue.DeQue<int32_t>();
 
   int64_t initialRow = this->gatherOutTilingData->perCoreRows * this->blockIdx + this->perLoopRows * progress;
@@ -417,6 +435,9 @@ __aicore__ inline void MoeV2GatherDynamicQuant<T>::CopyOutPartialXQuant1H(int64_
     }
 
     float scaleTemp = reduceMax / 127.0f;
+    if constexpr (STRICT_QUANT) {
+      if (scaleTemp == 0.0f) scaleTemp = 1.0f;
+    }
     Duplicate<float>(quantScaleLocal, scaleTemp, 8);
     scaleOutQueue.EnQue(quantScaleLocal);
     quantScaleLocal = scaleOutQueue.DeQue<float>();
@@ -446,8 +467,8 @@ __aicore__ inline void MoeV2GatherDynamicQuant<T>::CopyOutPartialXQuant1H(int64_
   expandRowIdxInQueue.FreeTensor(indicesLocal);
 }
 
-template <typename T>
-__aicore__ inline void MoeV2GatherDynamicQuant<T>::Init(GM_ADDR inputX, GM_ADDR quantSmooth, GM_ADDR expandedRowIdx,
+template <typename T, bool STRICT_QUANT>
+__aicore__ inline void MoeV2GatherDynamicQuant<T, STRICT_QUANT>::Init(GM_ADDR inputX, GM_ADDR quantSmooth, GM_ADDR expandedRowIdx,
                                                         GM_ADDR expandedX, GM_ADDR dynamicQuantScale, GM_ADDR workspace,
                                                         const MoeInitRoutingQuantV2TilingData* tilingData,
                                                         TPipe* tPipe) {
@@ -516,8 +537,8 @@ __aicore__ inline void MoeV2GatherDynamicQuant<T>::Init(GM_ADDR inputX, GM_ADDR 
   pipe->InitBuffer(inputXOutQueue, 1, AlignBytes(this->perLoopCols, sizeof(int8_t)));
 }
 
-template <typename T>
-__aicore__ inline void MoeV2GatherDynamicQuant<T>::Process() {
+template <typename T, bool STRICT_QUANT>
+__aicore__ inline void MoeV2GatherDynamicQuant<T, STRICT_QUANT>::Process() {
   if (this->blockIdx < this->needCoreNum) {
     currentLoopRows = perLoopRows;
       if (colLoops > 1) {  // Cannot fit all data in one row, workspace is required

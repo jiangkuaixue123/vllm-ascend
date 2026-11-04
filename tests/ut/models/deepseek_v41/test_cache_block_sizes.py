@@ -17,7 +17,7 @@ from vllm.v1.request import Request
 from vllm_ascend.models.deepseek_v41.attention import DeepseekV41Backend, DeepseekV41Cache, DeepseekV41MetadataBuilder
 from vllm_ascend.utils import refresh_block_size
 
-MAX_MODEL_LEN = 150_000
+MAX_MODEL_LEN = 150 * 1024
 
 
 @pytest.mark.parametrize(

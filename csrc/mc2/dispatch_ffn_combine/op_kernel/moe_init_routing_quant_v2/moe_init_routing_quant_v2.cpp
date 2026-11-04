@@ -29,7 +29,7 @@ using namespace AscendC;
 using namespace MoeInitRoutingQuantV2;
 using namespace optiling;
 
-template <class DTYPE_X = bfloat16_t>
+template <class DTYPE_X = bfloat16_t, bool STRICT_QUANT = false>
 __aicore__ inline  void moe_init_routing_quant_v2(
     GM_ADDR x, GM_ADDR expertIdx, GM_ADDR scale, GM_ADDR offset, GM_ADDR expandedX, GM_ADDR expandedRowIdx,
     GM_ADDR expertTokensCountOrCumsum, GM_ADDR expertTokensBeforeCapacity, GM_ADDR dynamicQuantScale, GM_ADDR workspace,
@@ -55,7 +55,7 @@ __aicore__ inline  void moe_init_routing_quant_v2(
   
   else if (tilingKey == 21000) {  // dynamic quant full load
     TPipe sortPipe;
-    MoeV2FullLoadDynamicQuant<DTYPE_X> op;
+    MoeV2FullLoadDynamicQuant<DTYPE_X, STRICT_QUANT> op;
     op.Init(x, expertIdx, expandedX, expandedRowIdx, expertTokensCountOrCumsum, scale, dynamicQuantScale, workspace, tilingData,
             &sortPipe);
     op.Process();
@@ -125,7 +125,7 @@ __aicore__ inline  void moe_init_routing_quant_v2(
     gatherPipe.Destroy();
   } else if (tilingKey  == 11000 || tilingKey == 11010) {
     TPipe gatherPipe;
-    MoeV2GatherDynamicQuant<DTYPE_X> gatherDynamicQuantOp;
+    MoeV2GatherDynamicQuant<DTYPE_X, STRICT_QUANT> gatherDynamicQuantOp;
     gatherDynamicQuantOp.Init(x, scale, expandedRowIdx, expandedX, dynamicQuantScale, workspace, tilingData, &gatherPipe);
     gatherDynamicQuantOp.Process();
     gatherPipe.Destroy();

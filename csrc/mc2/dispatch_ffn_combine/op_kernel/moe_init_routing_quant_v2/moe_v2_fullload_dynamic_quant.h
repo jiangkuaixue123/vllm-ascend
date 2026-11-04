@@ -17,10 +17,12 @@
 
 #include "moe_v2_mrgsort.h"
 #include "moe_v2_sort_base.h"
+#include "../utils/route_before_down_quant.hpp"
+
 namespace MoeInitRoutingQuantV2 {
 using namespace AscendC;
 using namespace optiling;
-template <typename T>
+template <typename T, bool STRICT_QUANT = false>
 class MoeV2FullLoadDynamicQuant : public MoeV2SortBase {
  public:
   __aicore__ inline MoeV2FullLoadDynamicQuant(){};
@@ -82,8 +84,8 @@ class MoeV2FullLoadDynamicQuant : public MoeV2SortBase {
   LocalTensor<int32_t> expandedExpertIdxLocal;
 };
 
-template <typename T>
-__aicore__ inline void MoeV2FullLoadDynamicQuant<T>::CopyIn() {
+template <typename T, bool STRICT_QUANT>
+__aicore__ inline void MoeV2FullLoadDynamicQuant<T, STRICT_QUANT>::CopyIn() {
   LocalTensor<int32_t> inLocal = sortDataCopyInQueue.AllocTensor<int32_t>();
   DataCopyExtParams dataCopyParams{static_cast<uint16_t>(1), static_cast<uint32_t>(this->totalLength * sizeof(int32_t)),
                                    0, 0, 0};
@@ -93,8 +95,8 @@ __aicore__ inline void MoeV2FullLoadDynamicQuant<T>::CopyIn() {
   sortDataCopyInQueue.EnQue(inLocal);
 }
 
-template <typename T>
-__aicore__ inline void MoeV2FullLoadDynamicQuant<T>::SortCompute() {
+template <typename T, bool STRICT_QUANT>
+__aicore__ inline void MoeV2FullLoadDynamicQuant<T, STRICT_QUANT>::SortCompute() {
   LocalTensor<int32_t> inLocal = sortDataCopyInQueue.DeQue<int32_t>();
   LocalTensor<int32_t> expertIdxLocal = inLocal[0];
   LocalTensor<float> expertIdxLocalFp32 = expertIdxLocal.ReinterpretCast<float>();
@@ -161,8 +163,8 @@ __aicore__ inline void MoeV2FullLoadDynamicQuant<T>::SortCompute() {
   sortDataCopyInQueue.FreeTensor(inLocal);
 }
 
-template <typename T>
-__aicore__ inline void MoeV2FullLoadDynamicQuant<T>::CopyOutIdx() {
+template <typename T, bool STRICT_QUANT>
+__aicore__ inline void MoeV2FullLoadDynamicQuant<T, STRICT_QUANT>::CopyOutIdx() {
   LocalTensor<int32_t> expandedRowIdx = expandedRowIdxCopyOutQueue_.DeQue<int32_t>();
   DataCopyParams intriParams;
   intriParams.blockCount = 1;
@@ -171,8 +173,8 @@ __aicore__ inline void MoeV2FullLoadDynamicQuant<T>::CopyOutIdx() {
   expandedRowIdxCopyOutQueue_.EnQue(expandedRowIdx);
 }
 
-template <typename T>
-__aicore__ inline void MoeV2FullLoadDynamicQuant<T>::ComputeExpertTokenCountOrCumsum() {
+template <typename T, bool STRICT_QUANT>
+__aicore__ inline void MoeV2FullLoadDynamicQuant<T, STRICT_QUANT>::ComputeExpertTokenCountOrCumsum() {
   expandedExpertIdxLocal = expandedExpertIdxCopyOutQueue_.DeQue<int32_t>();
   LocalTensor<int32_t> expertTokensCount = expertTokensCopyOutQueue_.AllocTensor<int32_t>();
 
@@ -212,13 +214,13 @@ __aicore__ inline void MoeV2FullLoadDynamicQuant<T>::ComputeExpertTokenCountOrCu
 #endif
 }
 
-template <typename T>
-__aicore__ inline void MoeV2FullLoadDynamicQuant<T>::CopyOutEmpty() {
+template <typename T, bool STRICT_QUANT>
+__aicore__ inline void MoeV2FullLoadDynamicQuant<T, STRICT_QUANT>::CopyOutEmpty() {
   expandedExpertIdxLocal = expandedExpertIdxCopyOutQueue_.DeQue<int32_t>();
 }
 
-template <typename T>
-__aicore__ inline void MoeV2FullLoadDynamicQuant<T>::Compute(LocalTensor<float>& smoothLocal) {
+template <typename T, bool STRICT_QUANT>
+__aicore__ inline void MoeV2FullLoadDynamicQuant<T, STRICT_QUANT>::Compute(LocalTensor<float>& smoothLocal) {
   LocalTensor<float> inLocal = xCopyInQueue_.DeQue<float>();
 
   LocalTensor<float> tempLocal = calcQueue.AllocTensor<float>();
@@ -241,26 +243,27 @@ __aicore__ inline void MoeV2FullLoadDynamicQuant<T>::Compute(LocalTensor<float>&
   ReduceMax(dynamicQuantLocal, tempLocal, tempLocal, this->cols_);
   AscendC::PipeBarrier<PIPE_V>();
 
-  float maxValue = dynamicQuantLocal.GetValue(0) / 127.0f;
+  if constexpr (STRICT_QUANT) {
+    VllmAscend::QuantizeRouteBeforeDown(inLocal, tempLocal, dynamicQuantLocal, outLocal, this->cols_);
+  } else {
+    float maxValue = dynamicQuantLocal.GetValue(0) / 127.0f;
+    Duplicate<float>(dynamicQuantLocal, maxValue, 8);
+    Duplicate<float>(tempLocal, maxValue, this->cols_);
+    AscendC::PipeBarrier<PIPE_V>();
 
-  Duplicate<float>(dynamicQuantLocal, maxValue, 8);
-  Duplicate<float>(tempLocal, maxValue, this->cols_);
-  AscendC::PipeBarrier<PIPE_V>();
-
-  Div(tempLocal, inLocal, tempLocal, this->cols_);
-  AscendC::PipeBarrier<PIPE_V>();
-
-  Cast(tempLocal.ReinterpretCast<half>(), tempLocal, RoundMode::CAST_TRUNC, this->cols_);
-  AscendC::PipeBarrier<PIPE_V>();
-
-  Cast(outLocal, tempLocal.ReinterpretCast<half>(), RoundMode::CAST_ROUND, this->cols_);
+    Div(tempLocal, inLocal, tempLocal, this->cols_);
+    AscendC::PipeBarrier<PIPE_V>();
+    Cast(tempLocal.ReinterpretCast<half>(), tempLocal, RoundMode::CAST_TRUNC, this->cols_);
+    AscendC::PipeBarrier<PIPE_V>();
+    Cast(outLocal, tempLocal.ReinterpretCast<half>(), RoundMode::CAST_ROUND, this->cols_);
+  }
 
   calcQueue.FreeTensor(tempLocal);
   inputXOutQueue.EnQue(outLocal);
 }
 
-template <typename T>
-__aicore__ inline void MoeV2FullLoadDynamicQuant<T>::CopyOutXQuant1H() {
+template <typename T, bool STRICT_QUANT>
+__aicore__ inline void MoeV2FullLoadDynamicQuant<T, STRICT_QUANT>::CopyOutXQuant1H() {
   expandDstToSrcRowQueue_.FreeTensor(expandDstToSrcRowLocal);
   expandedExpertIdxCopyOutQueue_.FreeTensor(expandedExpertIdxLocal);
 
@@ -308,8 +311,8 @@ __aicore__ inline void MoeV2FullLoadDynamicQuant<T>::CopyOutXQuant1H() {
   expandedRowIdxCopyOutQueue_.FreeTensor(expandedRowIdx);
 }
 
-template <typename T>
-__aicore__ inline void MoeV2FullLoadDynamicQuant<T>::Init(GM_ADDR x, GM_ADDR expertIdx, GM_ADDR expandedX,
+template <typename T, bool STRICT_QUANT>
+__aicore__ inline void MoeV2FullLoadDynamicQuant<T, STRICT_QUANT>::Init(GM_ADDR x, GM_ADDR expertIdx, GM_ADDR expandedX,
                                                           GM_ADDR expandedRowIdx, GM_ADDR expertTokensCountOrCumsum,
                                                           GM_ADDR quantSmooth, GM_ADDR dynamicQuantScale,
                                                           GM_ADDR workspace,
@@ -378,8 +381,8 @@ __aicore__ inline void MoeV2FullLoadDynamicQuant<T>::Init(GM_ADDR x, GM_ADDR exp
   pipe->InitBuffer(inputXOutQueue, 1, AlignBytes(this->cols_scale_, sizeof(int8_t)));
 }
 
-template <typename T>
-__aicore__ inline void MoeV2FullLoadDynamicQuant<T>::Process() {
+template <typename T, bool STRICT_QUANT>
+__aicore__ inline void MoeV2FullLoadDynamicQuant<T, STRICT_QUANT>::Process() {
   if (this->blockIdx_ < this->needCoreNum_) {
     CopyIn();
     SortCompute();

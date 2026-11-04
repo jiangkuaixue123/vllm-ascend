@@ -52,7 +52,7 @@ public:
 
     // Check data infos
     static_assert(
-        std::is_same_v<ElementC, half> && (std::is_same_v<ElementD, half> || std::is_same_v<ElementD, bfloat16_t>),
+        (std::is_same_v<ElementC, half> || std::is_same_v<ElementC, int32_t>) && (std::is_same_v<ElementD, half> || std::is_same_v<ElementD, bfloat16_t>),
         "The element type template parameters of BlockEpilogue are wrong"
     );
     static_assert(
@@ -102,6 +102,10 @@ public:
 
             ubCFp32List[i] = resource.ubBuf.template GetBufferByByte<float>(ubOffset);
             ubOffset += blockN * sizeof(float);
+            if constexpr (std::is_same_v<ElementC, int32_t>) {
+                ubMulList[i] = resource.ubBuf.template GetBufferByByte<float>(ubOffset);
+                ubOffset += blockN * sizeof(float);
+            }
         }
     }
     CATLASS_DEVICE
@@ -134,6 +138,10 @@ public:
     }
 
     CATLASS_DEVICE
+    void SetChannelScale(__gm__ float *scale) {
+        channelScale.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(scale));
+    }
+    CATLASS_DEVICE
     void operator() (
         AscendC::GlobalTensor<ElementC> const &gmC,
         MatrixCoord const &shapeC,
@@ -163,6 +171,13 @@ public:
             // Cast C to FP32 in UB
             AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(eventUbCMTE2VList[ubListId]);
             AscendC::Cast(ubCFp32, ubC, AscendC::RoundMode::CAST_NONE, blockN);
+            if constexpr (std::is_same_v<ElementC, int32_t>) {
+                AscendC::DataCopy(ubMul, channelScale, blockN);
+                AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID2);
+                AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID2);
+                AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Mul(ubCFp32, ubCFp32, ubMul, blockN);
+            }
             AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(eventUbCVMTE2List[ubListId]);
 
             // Get per-token scale from row loopIdx of gmPerTokenScale
@@ -192,6 +207,7 @@ public:
 
 private:
     Params params;
+    AscendC::GlobalTensor<float> channelScale;
 
     AscendC::LocalTensor<ElementC> ubCList[UB_STAGES];
     AscendC::LocalTensor<ElementD> ubDList[UB_STAGES];
