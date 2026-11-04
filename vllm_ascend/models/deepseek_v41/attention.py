@@ -66,6 +66,9 @@ _OUTPUT_QDQ_TILE_ROWS = 256
 # A FULL graph uses a static context width even when only a few pages are live.
 # Tile the key axis; candidate-block and top-k selection still see all scores.
 _DECODE_INDEX_TILE_KEYS = 8192
+# Head widths and rotary tail supported by the V4.1 fused path.
+_PARTIAL_ROPE_HEAD_DIMS = (128, 512)
+_PARTIAL_ROPE_DIM = 64
 
 
 def _quantize_projection_input(output):
@@ -676,6 +679,34 @@ class DeepseekV41Attention(nn.Module):
 
     def rotate(self, x, positions, inverse=False):
         phases = positions.float().unsqueeze(-1) * self.frequencies
+        if (
+            x.device.type == "npu"
+            and x.dtype == torch.bfloat16
+            and x.ndim in (3, 4)
+            and x.shape[0] == 1
+            and x.numel() > 0
+            and x.shape[-1] in _PARTIAL_ROPE_HEAD_DIMS
+            and self.rope_dim == _PARTIAL_ROPE_DIM
+            and phases.shape == (x.shape[1], self.rope_dim // 2)
+            and phases.dtype == torch.float32
+            and x.is_contiguous()
+            and torch.is_inference_mode_enabled()
+            and enable_custom_op()
+            and hasattr(torch.ops._C_ascend, "inplace_partial_rotary_mul")
+        ):
+            # The interleaved kernel consumes one FP32 sine/cosine per channel.
+            # Adjacent channels in a rotary pair use the same phase.
+            phases = torch.stack((phases, phases), dim=-1).view(x.shape[1], 1, 1, self.rope_dim)
+            sine = phases.sin()
+            torch.ops._C_ascend.inplace_partial_rotary_mul(
+                x.view(x.shape[1], 1, -1, x.shape[-1]),
+                phases.cos(),
+                -sine if inverse else sine,
+                rotary_mode="interleave",
+                partial_slice=[x.shape[-1] - self.rope_dim, x.shape[-1]],
+            )
+            logger.info_once("V4.1 stock partial rotary head_dim=%d inverse=%s", x.shape[-1], inverse, scope="process")
+            return x
         apply_rotary_emb_real(x[..., -self.rope_dim :], phases.cos(), phases.sin(), inverse=inverse)
         return x
 
