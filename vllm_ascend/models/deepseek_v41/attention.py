@@ -51,9 +51,11 @@ from .native_attention import DeepseekV41NativeAttention
 if HAS_TRITON and not envs.VLLM_BATCH_INVARIANT:
     from vllm_ascend.ops.triton.deepseek_v41_paged_index_score import paged_index_scores, supports_paged_index_scores
     from vllm_ascend.ops.triton.deepseek_v41_paged_read import read_strided_cache_field
+    from vllm_ascend.ops.triton.deepseek_v41_selected_kv import try_prepare_selected_kv
 else:
     paged_index_scores = None
     read_strided_cache_field = None
+    try_prepare_selected_kv = None
 
 # Bound the per-head score tensor for eager prefill; cached candidates span the whole request.
 _INDEX_SCORE_TILE_BYTES = 32 * 1024 * 1024
@@ -818,29 +820,33 @@ class DeepseekV41Attention(nn.Module):
         )
         return gathered, group.rank_in_group * local_rows
 
-    def _decode_forward(self, local_states, runtime):
-        full_md = self.cache.metadata().decode
-        gathered, offset = self._sequence_inputs(local_states, "uniform_decode")
-        if full_md is None or gathered.shape[0] != full_md.active.shape[0]:
-            raise ValueError("V4.1 graph token rows must match the decode metadata bucket")
-        local_md = full_md.shard(offset, local_states.shape[0]) if self.sequence_group is not None else full_md
-        x, md = (local_states, local_md) if self.dsa_cp else (gathered, full_md)
-        full_pos = (full_md.seq_lens - 1).clamp_min(0)
-        pos = full_pos[offset : offset + x.shape[0]] if self.dsa_cp else full_pos
-        qr = self.q_norm(self.wq_a(x)[0])
-        q = self.wq_b(qr)[0].view(x.shape[0], self.heads, self.dim)
-        raw = self.kv_norm(self.wkv(gathered)[0])
-        self.rotate(q.unsqueeze(0), pos)
-        self.rotate(raw.unsqueeze(0), full_pos)
-        self.cache.decode_write(full_md, fp8_quant_dequant(raw, 32), 0, 0, full_md.active)
-        extra = 0
-        if self.ratio:
-            self._decode_compressed(gathered, full_pos, full_md, runtime)
-            if self.owns_kv:
-                runtime.source_decode = md
-            self._decode_index(x, qr, pos, md, runtime)
-            extra = runtime.decode_topk.shape[-1]
+    def _prepare_decode_kv(self, x, md, runtime, extra):
         window = self.config.sliding_window
+        if (
+            extra
+            and try_prepare_selected_kv is not None
+            and x.device.type == "npu"
+            and x.dtype == torch.bfloat16
+            and not torch.is_grad_enabled()
+            and enable_custom_op()
+        ):
+            source = runtime.source_cache
+            prepared = try_prepare_selected_kv(
+                self.cache.field(0, 0, self.dim),
+                source.field(0, self.dim, self.dim),
+                md,
+                runtime.source_decode,
+                runtime.decode_topk,
+                window,
+                self.ratio,
+                self.cache.block_size,
+                source.block_size,
+            )
+            if prepared is not None:
+                logger.info_once(
+                    "V4.1 joint selected KV rows=%d ratio=%d extra=%d", x.shape[0], self.ratio, extra, scope="process"
+                )
+                return prepared
         columns = torch.arange(min(window, md.max_model_len) + extra, device=x.device)[None, :]
         width = md.seq_lens.clamp(0, window)[:, None]
         raw_pos = (md.seq_lens - window).clamp_min(0)[:, None] + columns
@@ -864,6 +870,31 @@ class DeepseekV41Attention(nn.Module):
             selected = torch.where(compressed[..., None], comp, selected)
             valid = valid | (compressed & md.active[:, None])
         ids = torch.where(valid, columns, -1).to(torch.int32).unsqueeze(1)
+        return selected, ids
+
+    def _decode_forward(self, local_states, runtime):
+        full_md = self.cache.metadata().decode
+        gathered, offset = self._sequence_inputs(local_states, "uniform_decode")
+        if full_md is None or gathered.shape[0] != full_md.active.shape[0]:
+            raise ValueError("V4.1 graph token rows must match the decode metadata bucket")
+        local_md = full_md.shard(offset, local_states.shape[0]) if self.sequence_group is not None else full_md
+        x, md = (local_states, local_md) if self.dsa_cp else (gathered, full_md)
+        full_pos = (full_md.seq_lens - 1).clamp_min(0)
+        pos = full_pos[offset : offset + x.shape[0]] if self.dsa_cp else full_pos
+        qr = self.q_norm(self.wq_a(x)[0])
+        q = self.wq_b(qr)[0].view(x.shape[0], self.heads, self.dim)
+        raw = self.kv_norm(self.wkv(gathered)[0])
+        self.rotate(q.unsqueeze(0), pos)
+        self.rotate(raw.unsqueeze(0), full_pos)
+        self.cache.decode_write(full_md, fp8_quant_dequant(raw, 32), 0, 0, full_md.active)
+        extra = 0
+        if self.ratio:
+            self._decode_compressed(gathered, full_pos, full_md, runtime)
+            if self.owns_kv:
+                runtime.source_decode = md
+            self._decode_index(x, qr, pos, md, runtime)
+            extra = runtime.decode_topk.shape[-1]
+        selected, ids = self._prepare_decode_kv(x, md, runtime, extra)
         attended = self.attention_kernel(
             q.unsqueeze(1),
             selected.to(x.dtype),
