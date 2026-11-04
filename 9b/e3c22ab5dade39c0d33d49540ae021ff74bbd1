@@ -1,0 +1,98 @@
+csrc/mc2/dispatch_ffn_combine/op_host/tiling_args.h
+  s_a1887b15757e1f::t_a6de010d3469e4 8-16
+tests/ut/models/deepseek_v41/test_cache_block_sizes.py
+  s_a1887b15757e1f::t_4f5d3492571332 20
+csrc/mc2/dispatch_ffn_combine/op_kernel/utils/block_mmad_preload_async_fixpipe_quant.hpp
+  s_a1887b15757e1f::t_1c7ff397472465 23-47
+  s_a1887b15757e1f::t_8b90eb1566e4e6 497
+vllm_ascend/models/deepseek_v41/fused_experts.py
+  s_a1887b15757e1f::t_4f5d3492571332 14-15,18,196-213,218-224,226-248,258-261,275,282-287
+  s_a1887b15757e1f::t_e8b852a5002d35 214-217
+  s_a1887b15757e1f::t_b1614c8825b0cc 225
+csrc/mc2/dispatch_ffn_combine/op_kernel/unpermute/moe_token_unpermute.h
+  s_a1887b15757e1f::t_91c3026110c238 30,54-55,83,85,150,155,174-175,190-191,227-228,240,242,285-286,303-304,324-325,349-350,354-356,360-364,366-367,370-371,374,377
+  s_a1887b15757e1f::t_e8b852a5002d35 365
+tests/ut/models/deepseek_v41/test_fused_mc2.py
+  s_a1887b15757e1f::t_028a7ee60f3809 1-51,53-79,82-125
+  s_a1887b15757e1f::t_b1614c8825b0cc 52,80-81
+  s_a1887b15757e1f::t_74928e69b6dc76 126-152
+csrc/mc2/dispatch_ffn_combine/op_kernel/unpermute/moe_token_unpermute_tiling.h
+  s_a1887b15757e1f::t_e8b852a5002d35 32-38
+csrc/mc2/dispatch_ffn_combine/op_kernel/moe_init_routing_quant_v2/moe_v2_fullload_dynamic_quant.h
+  s_a1887b15757e1f::t_b9721bbe2fbcb6 20-21,247-252,254,256,258
+  s_a1887b15757e1f::t_b1614c8825b0cc 25,87-88,98-99,166-167,176-177,217-218,222-223,246,255,257,259,265-266,314-315,384-385
+tests/ut/ops/test_dispatch_ffn_dynamic_quant.py
+  s_a1887b15757e1f::t_f065e1a9f74656 1-149
+csrc/mc2/dispatch_ffn_combine/op_kernel/moe_init_routing_quant_v2/moe_init_routing_quant_v2.cpp
+  s_a1887b15757e1f::t_b1614c8825b0cc 32,58,128
+vllm_ascend/models/deepseek_v41/fused_moe.py
+  s_a1887b15757e1f::t_4f5d3492571332 5-8,11,14,16-32,43-50,61-74
+tests/ut/ops/test_dispatch_ffn_routing_boundary.py
+  s_a1887b15757e1f::t_a6de010d3469e4 1-56
+csrc/mc2/dispatch_ffn_combine/op_kernel/dispatch_ffn_combine_kernel.hpp
+  s_a1887b15757e1f::t_b7b820e62d4209 1080
+  s_a1887b15757e1f::t_b9721bbe2fbcb6 857
+  s_a1887b15757e1f::t_4b1a5374297237 247,358-367,369,865-868
+  s_a1887b15757e1f::t_91c3026110c238 255,321-322,353,355-357,368,370,377-412,920,978-981,994,1013,1038-1040,1078-1079,1081,1164,1192-1195,1250
+  s_a1887b15757e1f::t_4fe240b33c76d9 413
+csrc/mc2/dispatch_ffn_combine/dispatch_ffn_combine_torch_adpt.h
+  s_a1887b15757e1f::t_b1614c8825b0cc 44-45
+  s_a1887b15757e1f::t_fbe4ce0953e7db 35-36,41-43,46-54
+tests/e2e/nightly/single_node/ops/multicard_ops_a3/test_dispatch_ffn_route_before_down.py
+  s_a1887b15757e1f::t_112ec5a05a9139 1-21,25,27-38,40-43,45-51,53-89,91-97,99-100,104-115,117-118,124-138,141-181
+  s_a1887b15757e1f::t_3dad704d2b8227 22-24,26,39,44,52,98,101-103,116,119-123
+  s_a1887b15757e1f::t_55472c23be0b79 139-140
+  s_a1887b15757e1f::t_e8b852a5002d35 90
+csrc/mc2/dispatch_ffn_combine/op_host/dispatch_ffn_combine_tiling.cpp
+  s_a1887b15757e1f::t_4b1a5374297237 159-165,168-170
+  s_a1887b15757e1f::t_a6de010d3469e4 19,286-287,290-293
+  s_a1887b15757e1f::t_e8b852a5002d35 166-167
+csrc/mc2/dispatch_ffn_combine/op_kernel/utils/block_epilogue_pertoken_row.hpp
+  s_a1887b15757e1f::t_b7b820e62d4209 105-108,140-141
+  s_a1887b15757e1f::t_91c3026110c238 55,142-143,174-180,210
+csrc/mc2/dispatch_ffn_combine/op_kernel/moe_init_routing_quant_v2/moe_v2_gather_dynamic_quant.h
+  s_a1887b15757e1f::t_b1614c8825b0cc 25,95-96,105-106,117-118,141,150,152,154,160-161,211-212,262-263,311-312,330-340,345,355-356,410-411,470-471,540-541
+  s_a1887b15757e1f::t_298ebe6f198d0c 384-386,438-440
+  s_a1887b15757e1f::t_b9721bbe2fbcb6 20-21,142-147,149,151,153
+csrc/mc2/dispatch_ffn_combine/op_kernel/utils/route_before_down_quant.hpp
+  s_a1887b15757e1f::t_6933fc0b763f5c 1-33,38,49-73
+  s_a1887b15757e1f::t_c4b9c6d90e1ce3 34-37,39-48
+csrc/mc2/dispatch_ffn_combine/op_kernel/utils/block_epilogue_pertoken_swiglu.hpp
+  s_a1887b15757e1f::t_1c06b2cd7535b9 21,307-322,324,326-330,332-335
+  s_a1887b15757e1f::t_91c3026110c238 57,122-125,146,148-152,166,228-239,254-260,282-292,297,306,359-362
+  s_a1887b15757e1f::t_b1614c8825b0cc 323
+  s_a1887b15757e1f::t_b7b820e62d4209 147
+  s_a1887b15757e1f::t_4b1a5374297237 240-242,293-296
+csrc/mc2/dispatch_ffn_combine/op_host/dispatch_ffn_combine_def.cpp
+  s_a1887b15757e1f::t_873ee0eea7bbd7 23-25,28-30,34-36,40-42,45-47,50-52,55-57,60-62,67-69,72-74,81
+csrc/mc2/dispatch_ffn_combine/op_host/op_api/aclnn_dispatch_ffn_combine.cpp
+  s_a1887b15757e1f::t_f94393c7a2ae7c 48,68-84,97-102
+csrc/mc2/dispatch_ffn_combine/op_host/op_api/aclnn_dispatch_ffn_combine.h
+  s_a1887b15757e1f::t_95ac3e7766520d 49-55,67-69
+csrc/mc2/dispatch_ffn_combine/op_kernel/dispatch_ffn_combine.h
+  s_a1887b15757e1f::t_d99cfc14bd65a3 218-220,224
+csrc/mc2/dispatch_ffn_combine/op_kernel/dispatch_ffn_combine_tiling.h
+  s_a1887b15757e1f::t_b6a0ef623adbcb 35
+csrc/torch_binding.cpp
+  s_a1887b15757e1f::t_a27006d25ecee4 2289
+csrc/torch_binding_meta.cpp
+  s_a1887b15757e1f::t_dde743167f6cc3 205-206
+tests/ut/ops/test_dispatch_ffn_unpermute_tiling.py
+  s_a1887b15757e1f::t_d141f0d21a1bbd 1-45
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "9be3c22ab5dade39c0d33d49540ae021ff74bbd1",
+  "prompts": {},
+  "sessions": {
+    "s_a1887b15757e1f": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1a74b-d857-7e70-b563-bc2d4d34f06e",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "jiangkuaixue123 <jiangxiaozhou111@163.com>"
+    }
+  }
+}
