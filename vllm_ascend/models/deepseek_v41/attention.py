@@ -52,10 +52,12 @@ if HAS_TRITON and not envs.VLLM_BATCH_INVARIANT:
     from vllm_ascend.ops.triton.deepseek_v41_paged_index_score import paged_index_scores, supports_paged_index_scores
     from vllm_ascend.ops.triton.deepseek_v41_paged_read import read_strided_cache_field
     from vllm_ascend.ops.triton.deepseek_v41_selected_kv import try_prepare_selected_kv
+    from vllm_ascend.ops.triton.deepseek_v41_slot_arena import stage as stage_decode_arena
 else:
     paged_index_scores = None
     read_strided_cache_field = None
     try_prepare_selected_kv = None
+    stage_decode_arena = None
 
 # Bound the per-head score tensor for eager prefill; cached candidates span the whole request.
 _INDEX_SCORE_TILE_BYTES = 32 * 1024 * 1024
@@ -97,6 +99,8 @@ class DeepseekV41DecodeMetadata:
     max_model_len: int
 
     query_width: int = 1
+    # Only the uniform builder populates this witness, including for an idle capture.
+    grouped_row_start: int | None = None
 
     def shard(self, start, rows):
         local = slice(start, start + rows)
@@ -107,6 +111,7 @@ class DeepseekV41DecodeMetadata:
             self.active[local],
             self.max_model_len,
             self.query_width,
+            self.grouped_row_start + start if self.grouped_row_start is not None else None,
         )
 
 
@@ -172,6 +177,7 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
                 torch.zeros(rows, dtype=torch.bool, device=device),
                 self.max_model_len,
                 width_q,
+                0 if width_q == 6 and rows in (24, 48) else None,
             )
         decode = self.decode_buffers[rows]
         decode.block_table_tensor.zero_()
@@ -479,6 +485,49 @@ class SharedRequestAttention:
 
 
 @dataclass
+class DecodeSlotArena:
+    """Owned by one model forward; graph capture retains its activation addresses."""
+
+    values: torch.Tensor | None = None
+    stream: object | None = None
+    source_generation: int = 0
+    index_generation: int = 0
+    staged_generation: tuple[int, int, int] | None = None
+
+
+def _disjoint_cache_fields(raw, compressed):
+    # data_ptr and strides are host-side storage metadata. A conservative bound also
+    # rejects views whose address envelopes overlap only in unused columns.
+    def interval(field):
+        begin = field.data_ptr()
+        return begin, begin + ((field.shape[0] - 1) * field.stride(0) + field.shape[1]) * field.element_size()
+
+    raw_start, raw_end = interval(raw)
+    comp_start, comp_end = interval(compressed)
+    return raw_end <= comp_start or comp_end <= raw_start
+
+
+def _supports_arena_metadata(md, device, rows):
+    return (
+        isinstance(md, DeepseekV41DecodeMetadata)
+        and md.query_width == 6
+        and md.grouped_row_start is not None
+        and md.grouped_row_start in range(0, 4 * rows, rows)
+        and md.max_model_len == 16384
+        and md.seq_lens.device == md.active.device == md.block_table_tensor.device == device
+        and md.seq_lens.dtype == torch.int64
+        and md.active.dtype == torch.bool
+        and md.seq_lens.shape == md.active.shape == (rows,)
+        and md.seq_lens.stride() == md.active.stride() == (1,)
+        and md.block_table_tensor.dtype == torch.int32
+        and md.block_table_tensor.ndim == 2
+        and md.block_table_tensor.shape[0] == rows
+        and md.block_table_tensor.shape[1] >= 128
+        and md.block_table_tensor.stride(1) == 1
+    )
+
+
+@dataclass
 class DeepseekV41Runtime:
     requests: list[RequestSpan]
     shared: list[SharedRequestAttention] = field(default_factory=list)
@@ -488,12 +537,14 @@ class DeepseekV41Runtime:
     decode_topk: torch.Tensor | None = None
     decode_candidate_blocks: torch.Tensor | None = None
     decode_candidate_width: int = 0
+    slot_arena: DecodeSlotArena | None = None
 
     @classmethod
     def for_decode(cls, metadata: DeepseekV41Metadata):
         if metadata.decode is None:
             raise ValueError("Missing V4.1 graph decode metadata")
-        return cls([], decode=metadata.decode)
+        arena = DecodeSlotArena() if getattr(metadata.decode, "grouped_row_start", None) == 0 else None
+        return cls([], decode=metadata.decode, slot_arena=arena)
 
     def __post_init__(self):
         if not self.shared:
@@ -557,6 +608,7 @@ class DeepseekV41Attention(nn.Module):
         self.dim = config.head_dim
         self.rope_dim = config.qk_rope_head_dim
         self.attention_kernel = DeepseekV41NativeAttention()
+        self.uses_local_kv = getattr(vllm_config, "kv_transfer_config", None) is None
         self.owns_kv = layer_id in config.kv_source_layer_ids
         self.owns_index = layer_id in config.index_source_layer_ids
         quant_config = vllm_config.quant_config
@@ -756,6 +808,9 @@ class DeepseekV41Attention(nn.Module):
         self.cache.decode_write(md, keys, 1, dim, complete)
         runtime.source_cache = self.cache
         runtime.source_decode = md
+        if (arena := getattr(runtime, "slot_arena", None)) is not None:
+            # The compressed source was written by this layer, including the current proposals.
+            arena.source_generation += 1
 
     def _decode_index(self, x, qr, pos, md, runtime):
         if not self.owns_index:
@@ -834,6 +889,9 @@ class DeepseekV41Attention(nn.Module):
             )
         indices = topk_columns(scores, min(self.config.index_topk, capacity)).sort(-1).values
         runtime.decode_topk = torch.where(indices < lengths, indices, -1)
+        if (arena := getattr(runtime, "slot_arena", None)) is not None:
+            # Ascending nonnegative indices followed by -1. Generic external IDs get no witness.
+            arena.index_generation += 1
 
     def _sequence_inputs(self, hidden_states, phase):
         if self.sequence_group is None:
@@ -851,6 +909,78 @@ class DeepseekV41Attention(nn.Module):
             scope="process",
         )
         return gathered, group.rank_in_group * local_rows
+
+    def _try_decode_slot_arena(self, q, md, runtime, extra):
+        arena = getattr(runtime, "slot_arena", None)
+        if arena is None:
+            return None
+        previous = arena.staged_generation
+        # Any fallback layer may write a shared source; the next hit must refresh it.
+        arena.staged_generation = None
+        rows = q.shape[0]
+        if not (
+            q.device.type == "npu"
+            and extra == 512
+            and rows in (6, 12)
+            and q.shape == (rows, 64, 512)
+            and q.dtype == torch.bfloat16
+            and self.tp == 4
+            and self.dsa_cp
+            and self.uses_local_kv
+            and self.config.sliding_window == 128
+            and self.ratio in (1, 2)
+            and torch.is_inference_mode_enabled()
+            and not torch.compiler.is_compiling()
+            and stage_decode_arena is not None
+            and get_ascend_device_type() == AscendDeviceType.A3
+            and enable_custom_op()
+            and isinstance(self.attention_kernel, DeepseekV41NativeAttention)
+            and (q.device, 64, rows, 640) in self.attention_kernel.decode_plans
+            and runtime.decode.active.shape == (4 * rows,)
+            and arena.source_generation > 0
+            and arena.index_generation > 0
+        ):
+            return None
+        src = runtime.source_decode
+        topk = runtime.decode_topk
+        if not (
+            _supports_arena_metadata(md, q.device, rows)
+            and _supports_arena_metadata(src, q.device, rows)
+            and md.grouped_row_start == src.grouped_row_start
+            and topk.device == q.device
+            and topk.dtype == torch.int64
+            and topk.shape == (rows, 512)
+            and topk.stride(1) == 1
+            and self.cache.block_size == runtime.source_cache.block_size == 128
+            and runtime.source_cache.source_ratio == self.ratio
+        ):
+            return None
+        raw = self.cache.field(0, 0, 512)
+        comp = runtime.source_cache.field(0, 512, 512)
+        if not (
+            raw.device == comp.device == q.device
+            and raw.dtype == torch.bfloat16
+            and comp.dtype == (torch.float32 if self.ratio == 2 else torch.bfloat16)
+            and raw.ndim == comp.ndim == 2
+            and raw.shape[1] == comp.shape[1] == 512
+            and raw.shape[0] > 0
+            and comp.shape[0] > 0
+            and raw.stride() in ((512, 1), (1024, 1))
+            and comp.stride() == (1024, 1)
+            and _disjoint_cache_fields(raw, comp)
+        ):
+            return None
+        stream = torch.npu.current_stream(q.device)
+        if arena.values is None:
+            arena.values = q.new_empty((rows * 640, 512))
+            arena.stream = stream
+        elif arena.stream != stream or arena.values.shape != (rows * 640, 512) or arena.values.device != q.device:
+            return None
+        generation = (arena.source_generation, arena.index_generation, self.ratio)
+        refresh = previous != generation
+        ids = stage_decode_arena(arena.values, raw, comp, md, src, topk, self.ratio, refresh)
+        arena.staged_generation = generation
+        return arena.values.view(rows, 640, 512), ids, refresh
 
     def _prepare_decode_kv(self, x, md, runtime, extra):
         window = self.config.sliding_window
@@ -926,16 +1056,28 @@ class DeepseekV41Attention(nn.Module):
                 runtime.source_decode = md
             self._decode_index(x, qr, pos, md, runtime)
             extra = runtime.decode_topk.shape[-1]
-        selected, ids = self._prepare_decode_kv(x, md, runtime, extra)
-        attended = self.attention_kernel(
-            q.unsqueeze(1),
-            selected.to(x.dtype),
-            self.attn_sink,
-            ids,
-            self.dim**-0.5,
-            mode="DSA target indexed decode" if self.ratio else "SWA target indexed decode",
-            uniform_decode=True,
-        )[:, 0]
+        staged = self._try_decode_slot_arena(q, md, runtime, extra)
+        if staged is None:
+            selected, ids = self._prepare_decode_kv(x, md, runtime, extra)
+            attended = self.attention_kernel(
+                q.unsqueeze(1),
+                selected.to(x.dtype),
+                self.attn_sink,
+                ids,
+                self.dim**-0.5,
+                mode="DSA target indexed decode" if self.ratio else "SWA target indexed decode",
+                uniform_decode=True,
+            )[:, 0]
+        else:
+            pages, slots, refresh = staged
+            attended = self.attention_kernel.decode_with_physical_slots(
+                q.unsqueeze(1), pages, self.attn_sink, slots, self.dim**-0.5
+            )[:, 0]
+            logger.info_once(
+                f"V4.1 native slot arena layer={self.layer_id} rows={q.shape[0]} "
+                f"ratio={self.ratio} refresh={int(refresh)}",
+                scope="process",
+            )
         self.rotate(attended.unsqueeze(0), pos, inverse=True)
         output = self._project_output(attended, x.dtype)
         return torch.where(local_md.active[:, None], output, 0)

@@ -124,7 +124,11 @@ class DeepseekV41NativeAttention:
             raise RuntimeError("V4.1 attention requires Ascend's npu_sparse_attn_sharedkv custom operator")
         return self._native(q, kv, sink, indices, scale, mode, swa_window, uniform_decode)
 
-    def _native(self, q, kv, sink, indices, scale, mode, swa_window, uniform_decode=False):
+    def decode_with_physical_slots(self, q, kv, sink, slots, scale):
+        """Uniform target decode with absolute slots already packed in original logical order."""
+        return self._native(q, kv, sink, slots, scale, "DSA target indexed decode", None, True, physical_slots=True)
+
+    def _native(self, q, kv, sink, indices, scale, mode, swa_window, uniform_decode=False, *, physical_slots=False):
         batch, sequence, heads, dim = q.shape
         if dim != LATENT_DIM or heads % 4 or q.dtype != torch.bfloat16 or kv.dtype != torch.bfloat16:
             raise ValueError(
@@ -150,7 +154,7 @@ class DeepseekV41NativeAttention:
             sparse_width = aligned_length(indices.shape[-1], SPARSE_ALIGNMENT)
             if not 0 < sparse_width <= MAX_SPARSE_WIDTH:
                 raise ValueError("A3 sparse attention requires between 1 and 2048 selected slots")
-            slots = physical_indices(indices, stride, length, sparse_width)
+            slots = indices if physical_slots else physical_indices(indices, stride, length, sparse_width)
             # One native sequence per query: each local CP query can have a
             # different index list, including the noncausal DSpark block.
             if uniform_decode:
