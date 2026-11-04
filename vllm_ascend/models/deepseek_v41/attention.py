@@ -38,7 +38,7 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 
-from vllm_ascend.utils import enable_custom_op, enable_dsa_cp, enable_sp
+from vllm_ascend.utils import AscendDeviceType, enable_custom_op, enable_dsa_cp, enable_sp, get_ascend_device_type
 
 from .attention_ops import (
     apply_rotary_emb_real,
@@ -49,8 +49,10 @@ from .core import rms_norm
 from .native_attention import DeepseekV41NativeAttention
 
 if HAS_TRITON and not envs.VLLM_BATCH_INVARIANT:
+    from vllm_ascend.ops.triton.deepseek_v41_paged_index_score import paged_index_scores, supports_paged_index_scores
     from vllm_ascend.ops.triton.deepseek_v41_paged_read import read_strided_cache_field
 else:
+    paged_index_scores = None
     read_strided_cache_field = None
 
 # Bound the per-head score tensor for eager prefill; cached candidates span the whole request.
@@ -746,22 +748,44 @@ class DeepseekV41Attention(nn.Module):
             runtime.decode_topk = torch.empty((x.shape[0], 0), dtype=torch.int64, device=x.device)
             return
         groups = torch.arange(capacity, device=x.device).unsqueeze(0)
-        ends = ((groups + 1) * self.ratio - 1).expand(x.shape[0], -1)
         indexer = self.indexer
         q = indexer.wq_b(qr)[0].view(-1, self.index_heads, self.config.index_head_dim)
         self.rotate(q.unsqueeze(0), pos)
         q = fp4_quant_dequant(q, 32, scale_format="e8m0")
         weights = indexer.weights_proj(x)[0] * (self.config.index_head_dim**-0.5 * self.config.index_n_heads**-0.5)
-        parts = []
-        for tile in ends.split(_DECODE_INDEX_TILE_KEYS, dim=-1):
-            keys = runtime.source_cache.decode_read(
-                runtime.source_decode, tile, 1, self.dim, self.config.index_head_dim
-            )
-            per_head = torch.einsum("bhd,btd->bht", q, keys.to(x.dtype))
-            parts.append((per_head.relu_() * weights.unsqueeze(-1)).sum(1))
-        scores = parts[0] if len(parts) == 1 else torch.cat(parts, dim=-1)
-        if self.tp > 1 and not self.dsa_cp:
-            scores = tensor_model_parallel_all_reduce(scores)
+        scores = None
+        if (
+            q.device.type == "npu"
+            and self.tp == 4
+            and self.dsa_cp
+            and torch.is_inference_mode_enabled()
+            and paged_index_scores is not None
+            and get_ascend_device_type() == AscendDeviceType.A3
+            and enable_custom_op()
+        ):
+            cache = runtime.source_cache
+            field = cache.field(1, self.dim, self.config.index_head_dim)
+            if supports_paged_index_scores(q, field, weights, runtime.source_decode, md, self.ratio, cache.block_size):
+                scores = paged_index_scores(q, field, weights, runtime.source_decode, md, self.ratio, cache.block_size)
+                logger.info_once(
+                    "V4.1 paged decode index scores rows=%d capacity=%d ratio=%d",
+                    q.shape[0],
+                    capacity,
+                    self.ratio,
+                    scope="process",
+                )
+        if scores is None:
+            ends = ((groups + 1) * self.ratio - 1).expand(x.shape[0], -1)
+            parts = []
+            for tile in ends.split(_DECODE_INDEX_TILE_KEYS, dim=-1):
+                keys = runtime.source_cache.decode_read(
+                    runtime.source_decode, tile, 1, self.dim, self.config.index_head_dim
+                )
+                per_head = torch.einsum("bhd,btd->bht", q, keys.to(x.dtype))
+                parts.append((per_head.relu_() * weights.unsqueeze(-1)).sum(1))
+            scores = parts[0] if len(parts) == 1 else torch.cat(parts, dim=-1)
+            if self.tp > 1 and not self.dsa_cp:
+                scores = tensor_model_parallel_all_reduce(scores)
         lengths = torch.where(md.active, md.seq_lens // self.ratio, 0)[:, None]
         scores.masked_fill_(groups >= lengths, -torch.inf)
         source = self.config.candidate_source_layer_id

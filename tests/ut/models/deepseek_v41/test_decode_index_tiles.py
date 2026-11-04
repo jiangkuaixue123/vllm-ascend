@@ -65,3 +65,13 @@ def test_decode_index_selects_across_key_tiles(monkeypatch, ratio, tensor_device
     torch.testing.assert_close(runtime.decode_topk, torch.where(expected < lengths, expected, -1), rtol=0, atol=0)
     torch.testing.assert_close(runtime.decode_candidates, attention.select_candidate_blocks(scores, lengths, 2, 4))
     assert widths == [4, 4, 4, 4, 1]
+
+
+def test_decode_index_empty_capacity_does_not_access_pages():
+    layer = SimpleNamespace(owns_index=True, ratio=2)
+    queries = torch.zeros(3, 128, device="cpu")
+    metadata = SimpleNamespace(max_model_len=1)
+    runtime = SimpleNamespace()
+    attention.DeepseekV41Attention._decode_index(layer, queries, None, None, metadata, runtime)
+    assert runtime.decode_topk.shape == (3, 0)
+    assert runtime.decode_topk.dtype == torch.int64
