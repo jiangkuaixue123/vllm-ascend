@@ -10,6 +10,7 @@ import torch
 from torch import nn
 
 from vllm_ascend.models.deepseek_v41 import attention
+from vllm_ascend.models.deepseek_v41.config import DeepseekV41TextConfig
 from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
 
 LAYERS = (2, 3, 20, 21, 22, 24, 25)
@@ -17,9 +18,18 @@ PHYS = 4096
 
 
 class Fixture:
-    def __init__(self, rows, alias):
+    def __init__(self, rows, alias, max_model_len=16384, shard=1, module=attention):
         self.rows = rows
-        self.offset = rows  # Test TP rank 1; each full graph has four consecutive shards.
+        self.offset = rows * shard
+        self.max_model_len = max_model_len
+        self.module = module
+        self.current_layer = None
+        config = DeepseekV41TextConfig()
+        self.layer_ids = (
+            LAYERS
+            if max_model_len == 16384
+            else tuple(i for i in range(config.num_hidden_layers) if config.compress_ratios[i])
+        )
         full = rows * 4
         self.values = torch.empty(full, 512, device="npu", dtype=torch.bfloat16)
         self.layers = []
@@ -29,13 +39,13 @@ class Fixture:
         self.tables = {}
         source20 = None
         gen = torch.Generator().manual_seed(307)
-        for layer_id in LAYERS:
-            layer = attention.DeepseekV41Attention.__new__(attention.DeepseekV41Attention)
+        for layer_id in self.layer_ids:
+            layer = module.DeepseekV41Attention.__new__(module.DeepseekV41Attention)
             nn.Module.__init__(layer)
             layer.layer_id = layer_id
-            layer.owns_kv = layer_id in (2, 20)
-            layer.owns_index = layer_id in (2, 20, 24)
-            layer.ratio = 2 if layer_id < 20 else 1
+            layer.owns_kv = layer_id in config.kv_source_layer_ids
+            layer.owns_index = layer_id in config.index_source_layer_ids
+            layer.ratio = config.compress_ratios[layer_id]
             layer.tp, layer.dsa_cp, layer.uses_local_kv = 4, True, True
             layer.heads, layer.dim, layer.index_heads, layer.rope_dim = 64, 512, 32, 64
             layer.config = SimpleNamespace(
@@ -64,8 +74,8 @@ class Fixture:
             )
             layer._project_output = lambda output, dtype: output.flatten(1)
             layer.attn_sink = torch.linspace(-1, 1, 64, device="npu")
-            layer.attention_kernel = attention.DeepseekV41NativeAttention()
-            cache = attention.DeepseekV41Cache.__new__(attention.DeepseekV41Cache)
+            layer.attention_kernel = module.DeepseekV41NativeAttention()
+            cache = module.DeepseekV41Cache.__new__(module.DeepseekV41Cache)
             nn.Module.__init__(cache)
             cache.dim, cache.index_dim, cache.block_size, cache.source_ratio = (
                 512,
@@ -86,24 +96,26 @@ class Fixture:
             cache.kv_cache = (key, value)
             cache.native_layout = (layer.attention_kernel, 64, 4, 640)
             layer.cache = cache
-            builder = attention.DeepseekV41MetadataBuilder.__new__(attention.DeepseekV41MetadataBuilder)
+            builder = module.DeepseekV41MetadataBuilder.__new__(module.DeepseekV41MetadataBuilder)
             builder.decode_graph_enabled = True
             builder.capture_sizes = {full}
-            builder.max_model_len = 16384
+            builder.max_model_len = max_model_len
             builder.block_size = 128
             builder.query_width = 6
             builder.native_layers = [cache]
             builder.native_decode_plans = {}
             builder.decode_buffers = {}
             count = full // 6
-            table = (torch.arange(count)[:, None] * 3 + torch.arange(128) * 7 + layer_id) % (PHYS // 128)
+            table = (torch.arange(count)[:, None] * 3 + torch.arange(max_model_len // 128) * 7 + layer_id) % (
+                PHYS // 128
+            )
             self.tables[layer_id] = table.int()
             common = SimpleNamespace(
                 num_input_tokens=full,
                 num_actual_tokens=full,
                 num_reqs=count,
                 max_query_len=6,
-                max_seq_len=2050,
+                max_seq_len=max_model_len,
                 seq_lens=torch.zeros(count, dtype=torch.long, device="npu"),
                 slot_mapping=torch.full((full,), -1, dtype=torch.long, device="npu"),
                 block_table_tensor=table.int().npu(),
@@ -120,18 +132,21 @@ class Fixture:
         if step == 3:
             x.view(torch.int16)[self.offset + 1, :4] = torch.tensor([-32768, 0x7FC2, 0x7F80, 1], dtype=torch.int16)
         self.values.copy_(x)
-        for lid in LAYERS:
+        for lid in self.layer_ids:
             common = self.common[lid]
             groups = full // 6
-            end = torch.tensor([0, 3, 1029, 2050][step]).expand(groups).clone()
+            endpoints = (
+                (0, 3, 1029, 2050) if self.max_model_len == 16384 else (0, 3, 8192, 16384, 16385, 153599, 153600)
+            )
+            end = torch.full((groups,), endpoints[step], dtype=torch.long)
             if step > 1:
-                end += torch.arange(groups) % 3
+                end = (end + torch.arange(groups) % 3).clamp(max=self.max_model_len)
             table = self.tables[lid].roll(step, dims=1).clone()
             if step == 2:
                 table[:, 0] = -1
                 table[:, 2] = PHYS // 128
             positions = end[:, None] + torch.arange(6) - 6
-            safe = positions.clamp(0, 16383)
+            safe = positions.clamp(0, self.max_model_len - 1)
             block = table.gather(1, safe // 128).long()
             slots = (
                 (block * 128 + safe % 128)
@@ -151,59 +166,100 @@ class Fixture:
             )
 
     def run(self):
-        runtime = attention.DeepseekV41Runtime.for_decode(self.metadata[2])
+        runtime = self.module.DeepseekV41Runtime.for_decode(self.metadata[2])
         local = self.values[self.offset : self.offset + self.rows]
-        return tuple(layer(local, runtime) for layer in self.layers)
+        native = self.module.DeepseekV41NativeAttention
+        raw_outputs = []
+        self.physical_layers = []
+
+        def observe(method, physical):
+            def call(kernel, *args, **kwargs):
+                output = method(kernel, *args, **kwargs)
+                # The layer rotates this result in place after the native call.
+                raw_outputs.append(output.clone())
+                if physical:
+                    self.physical_layers.append(self.current_layer)
+                return output
+
+            return call
+
+        outputs = []
+        with (
+            patch.object(native, "__call__", observe(native.__call__, False)),
+            patch.object(native, "decode_with_physical_slots", observe(native.decode_with_physical_slots, True)),
+        ):
+            for layer in self.layers:
+                self.current_layer = layer.layer_id
+                outputs.append(layer(local, runtime))
+        assert len(raw_outputs) == len(outputs) == len(self.layer_ids)
+        return tuple(raw_outputs + outputs)
 
 
 def equal(left, right):
-    assert len(left) == len(right) == len(LAYERS)
+    assert len(left) == len(right)
     for a, b in zip(left, right):
         assert torch.equal(a.view(torch.int16), b.view(torch.int16))
 
 
-@pytest.mark.parametrize(("rows", "alias"), [(6, False), (12, False), (6, True)])
 @torch.inference_mode()
-def test_slot_arena_real_decode_graph(rows, alias):
-    if attention.stage_decode_arena is None or attention.get_ascend_device_type() != attention.AscendDeviceType.A3:
-        pytest.skip("A3 with standard Triton required")
+def check_graph_case(rows, alias, max_model_len, shard, reference=attention, observations=None):
     init_device_properties_triton()
     assert attention.enable_custom_op()
     # Eager parent/child and independently captured parent/child carry independent evolving K/V states.
-    engines = [Fixture(rows, alias) for _ in range(4)]
+    engines = [Fixture(rows, alias, max_model_len, shard, module) for module in (reference, attention) * 2]
     for f in engines:
         f.update(0)
     graphs = {}
-    original = attention.stage_decode_arena
-    native = attention.DeepseekV41NativeAttention.decode_with_physical_slots
-    expected = [True, False, True, False, False, True, False] if not alias else [True, False, True, True, True, False]
+    index_owners = {2, 8, 14, 20, 24, 28, 32, 36}
+    expected = [
+        (lid, lid in index_owners or (alias and lid == 22)) for lid in engines[1].layer_ids if not (alias and lid == 21)
+    ]
     for i, f in enumerate(engines):
         events = []
+        original = f.module.stage_decode_arena
+        # A separately supplied 9be3 parent makes its own long-context guard decision.
+        observe_real = bool(i % 2) or reference is not attention
 
-        def observe(*args, events=events):
-            events.append(args[-1])
-            return original(*args)
+        def observe(*args, events=events, fixture=f, stage=original):
+            events.append((fixture.current_layer, args[-1]))
+            return stage(*args)
 
-        with (
-            patch.object(attention, "stage_decode_arena", observe if i % 2 else None),
-            patch.object(
-                attention.DeepseekV41NativeAttention, "decode_with_physical_slots", autospec=True, side_effect=native
-            ) as address,
-        ):
+        with patch.object(f.module, "stage_decode_arena", observe if observe_real else None):
             f.run()
+            if observations is not None:
+                observations.append(
+                    {
+                        "engine": i,
+                        "capture": False,
+                        "staged": events.copy(),
+                        "physical_layers": f.physical_layers.copy(),
+                    }
+                )
             assert events == (expected if i % 2 else [])
-            assert address.call_count == len(events)
+            assert f.physical_layers == [lid for lid, _ in events]
             if i >= 2:
                 events.clear()
                 g = torch.npu.NPUGraph()
                 with torch.npu.graph(g):
                     output = f.run()
+                if observations is not None:
+                    observations.append(
+                        {
+                            "engine": i,
+                            "capture": True,
+                            "staged": events.copy(),
+                            "physical_layers": f.physical_layers.copy(),
+                        }
+                    )
                 assert events == (expected if i % 2 else [])
+                assert f.physical_layers == [lid for lid, _ in events]
                 graphs[i] = (g, output)
-    for step in (1, 2, 3, 0, 2):
+    steps = (1, 2, 3, 0, 2) if max_model_len == 16384 else (1, 2, 3, 4, 5, 6, 0) * 2
+    for step in steps:
         for f in engines:
             f.update(step)
-        with patch.object(attention, "stage_decode_arena", None):
+        stage = None if reference is attention else reference.stage_decode_arena
+        with patch.object(reference, "stage_decode_arena", stage):
             baseline = engines[0].run()
         equal(baseline, engines[1].run())
         for g, out in graphs.values():
@@ -214,3 +270,21 @@ def test_slot_arena_real_decode_graph(rows, alias):
             for ref, obs in zip(engines[0].layers, f.layers):
                 for a, b in zip(ref.cache.kv_cache, obs.cache.kv_cache):
                     assert torch.equal(a.view(torch.int16), b.view(torch.int16))
+        if observations is not None:
+            observations.append(
+                {
+                    "replay_step": step,
+                    "compared_layers": len(engines[0].layer_ids),
+                    "raw_native_post_and_cache_bits_equal": True,
+                }
+            )
+
+
+@pytest.mark.parametrize(
+    ("rows", "alias", "max_model_len", "shard"),
+    [(6, False, 16384, 1), (12, False, 16384, 1), (6, True, 16384, 1), (6, False, 153600, 0), (12, True, 153600, 3)],
+)
+def test_slot_arena_real_decode_graph(rows, alias, max_model_len, shard):
+    if attention.stage_decode_arena is None or attention.get_ascend_device_type() != attention.AscendDeviceType.A3:
+        pytest.skip("A3 with standard Triton required")
+    check_graph_case(rows, alias, max_model_len, shard)

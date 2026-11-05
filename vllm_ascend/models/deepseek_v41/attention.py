@@ -70,6 +70,9 @@ _DECODE_INDEX_TILE_KEYS = 8192
 # Head widths and rotary tail supported by the V4.1 fused path.
 _PARTIAL_ROPE_HEAD_DIMS = (128, 512)
 _PARTIAL_ROPE_DIM = 64
+_ARENA_BLOCK_SIZE = 128
+_ARENA_LEGACY_LENGTH = 16384
+_ARENA_LONG_LENGTH = 153600
 
 
 def _quantize_projection_input(output):
@@ -571,9 +574,25 @@ class DecodeSlotArena:
 
     values: torch.Tensor | None = None
     stream: object | None = None
+    grouped_row_start: int | None = None
     source_generation: int = 0
     index_generation: int = 0
     staged_generation: tuple[int, int, int] | None = None
+
+    def values_for_shard(self, q, stream, grouped_row_start):
+        shape = (q.shape[0] * 640, 512)
+        if self.values is None:
+            self.values = q.new_empty(shape)
+            self.stream = stream
+            self.grouped_row_start = grouped_row_start
+        elif (
+            self.stream != stream
+            or self.grouped_row_start != grouped_row_start
+            or self.values.shape != shape
+            or self.values.device != q.device
+        ):
+            return None
+        return self.values
 
 
 def _disjoint_cache_fields(raw, compressed):
@@ -589,22 +608,41 @@ def _disjoint_cache_fields(raw, compressed):
 
 
 def _supports_arena_metadata(md, device, rows):
-    return (
+    if not (
         isinstance(md, DeepseekV41DecodeMetadata)
-        and md.query_width == 6
-        and md.grouped_row_start is not None
+        and rows in (6, 12)
+        and type(md.max_model_len) is int
+        and md.max_model_len in (_ARENA_LEGACY_LENGTH, _ARENA_LONG_LENGTH)
+    ):
+        return False
+    pages = md.max_model_len // _ARENA_BLOCK_SIZE
+    table = md.block_table_tensor
+    return (
+        md.query_width == 6
+        and type(md.grouped_row_start) is int
         and md.grouped_row_start in range(0, 4 * rows, rows)
-        and md.max_model_len == 16384
-        and md.seq_lens.device == md.active.device == md.block_table_tensor.device == device
+        and md.seq_lens.device == md.active.device == table.device == device
         and md.seq_lens.dtype == torch.int64
         and md.active.dtype == torch.bool
         and md.seq_lens.shape == md.active.shape == (rows,)
         and md.seq_lens.stride() == md.active.stride() == (1,)
-        and md.block_table_tensor.dtype == torch.int32
-        and md.block_table_tensor.ndim == 2
-        and md.block_table_tensor.shape[0] == rows
-        and md.block_table_tensor.shape[1] >= 128
-        and md.block_table_tensor.stride(1) == 1
+        and table.dtype == torch.int32
+        and table.ndim == 2
+        and table.shape[0] == rows
+        and table.shape[1] >= pages
+        and table.stride(1) == 1
+        # The gather kernel indexes the table with a signed 32-bit row offset.
+        # Accept padded long tables, but only when all reachable columns fit.
+        and (md.max_model_len == _ARENA_LEGACY_LENGTH or pages <= table.stride(0) <= (2**31 - pages) // (rows - 1))
+    )
+
+
+def _supports_arena_pair(md, src, device, rows, max_model_len):
+    return (
+        _supports_arena_metadata(md, device, rows)
+        and _supports_arena_metadata(src, device, rows)
+        and md.max_model_len == src.max_model_len == max_model_len
+        and md.grouped_row_start == src.grouped_row_start
     )
 
 
@@ -1053,14 +1091,12 @@ class DeepseekV41Attention(nn.Module):
         src = runtime.source_decode
         topk = runtime.decode_topk
         if not (
-            _supports_arena_metadata(md, q.device, rows)
-            and _supports_arena_metadata(src, q.device, rows)
-            and md.grouped_row_start == src.grouped_row_start
+            _supports_arena_pair(md, src, q.device, rows, runtime.decode.max_model_len)
             and topk.device == q.device
             and topk.dtype == torch.int64
             and topk.shape == (rows, 512)
             and topk.stride(1) == 1
-            and self.cache.block_size == runtime.source_cache.block_size == 128
+            and self.cache.block_size == runtime.source_cache.block_size == _ARENA_BLOCK_SIZE
             and runtime.source_cache.source_ratio == self.ratio
         ):
             return None
@@ -1080,16 +1116,14 @@ class DeepseekV41Attention(nn.Module):
         ):
             return None
         stream = torch.npu.current_stream(q.device)
-        if arena.values is None:
-            arena.values = q.new_empty((rows * 640, 512))
-            arena.stream = stream
-        elif arena.stream != stream or arena.values.shape != (rows * 640, 512) or arena.values.device != q.device:
+        values = arena.values_for_shard(q, stream, md.grouped_row_start)
+        if values is None:
             return None
         generation = (arena.source_generation, arena.index_generation, self.ratio)
         refresh = previous != generation
-        ids = stage_decode_arena(arena.values, raw, comp, md, src, topk, self.ratio, refresh)
+        ids = stage_decode_arena(values, raw, comp, md, src, topk, self.ratio, refresh)
         arena.staged_generation = generation
-        return arena.values.view(rows, 640, 512), ids, refresh
+        return values.view(rows, 640, 512), ids, refresh
 
     def _prepare_decode_kv(self, x, md, runtime, extra):
         window = self.config.sliding_window
