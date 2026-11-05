@@ -1,0 +1,23 @@
+tests/e2e/nightly/single_node/ops/singlecard_ops/test_dspark_staging.py
+  s_aa5129df8f8fb8::t_966d2745dc732c 1-57
+tests/ut/models/deepseek_v41/test_dspark_staging.py
+  s_aa5129df8f8fb8::t_70d582e1e31ce5 1-179
+vllm_ascend/models/deepseek_v41/dspark.py
+  s_aa5129df8f8fb8::t_45f27957fc0f8e 36-40,103-164,246-254,261-276
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "debbb06527af0d7bb3522966661830dab33bce56",
+  "prompts": {},
+  "sessions": {
+    "s_aa5129df8f8fb8": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1aa11-94e0-7ac2-9269-45229d337fe1",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "jiangkuaixue123 <jiangxiaozhou111@163.com>"
+    }
+  }
+}
