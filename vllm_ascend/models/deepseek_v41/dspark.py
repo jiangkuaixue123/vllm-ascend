@@ -2,6 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """DeepSeek V4.1's three trained DSpark stages, stored under checkpoint mtp.*."""
 
+import hashlib
+import json
+import os
+import time
 from copy import copy
 from pathlib import Path
 
@@ -32,6 +36,12 @@ from .fused_weights import load_indexed_v41_weights
 from .model import DeepseekV41Block, read_parameter_slice
 from .moe import DeepseekV41MoE
 from .native_attention import DeepseekV41NativeAttention
+
+_STAGING_QUERY_ROWS = 5
+_STAGING_WINDOW = 128
+_STAGING_HEAD_DIM = 512
+_STAGING_MAX_REQUESTS = 8
+_WITNESS_BATCH_SIZE = 4
 
 
 class DSparkMetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
@@ -95,6 +105,68 @@ def block_attention(q, context_kv, query_kv, sink, scale, kernel=None):
     return kernel(q.unsqueeze(0), kv, sink, indices, scale, mode="SWA draft bidirectional")[0]
 
 
+def try_stage_block_inputs(q, query_kv, metadata, cache, *, window_size, block_size, dtype):
+    """Stage full rings together, retaining the original single-request kernel inputs.
+
+    Eligibility uses existing host metadata and tensor geometry only. In particular,
+    no device scalar is read to decide whether to take this eager-only path. Short,
+    padded or partial proposals keep the original per-request implementation.
+    """
+    batch = len(metadata.requests)
+    if not (
+        1 < batch <= _STAGING_MAX_REQUESTS
+        and block_size == _STAGING_QUERY_ROWS
+        and window_size == cache.block_size == _STAGING_WINDOW
+        and q.ndim == 3
+        and query_kv.ndim == 2
+        and q.shape[0] == query_kv.shape[0] == metadata.num_actual_tokens == batch * block_size
+        and q.shape[-1] == query_kv.shape[-1] == _STAGING_HEAD_DIM
+        and q.dtype == query_kv.dtype == dtype == torch.bfloat16
+        and q.device == query_kv.device
+        and q.is_contiguous()
+        and query_kv.is_contiguous()
+        and all(
+            span.begin == row * block_size and span.end == (row + 1) * block_size and span.start_pos >= window_size
+            for row, span in enumerate(metadata.requests)
+        )
+    ):
+        return None
+    table = metadata.block_table_tensor
+    if not (
+        table.ndim == 2
+        and table.shape[0] >= batch
+        and table.dtype in (torch.int32, torch.int64)
+        and table.device == q.device
+        and all((span.start_pos - 1) // cache.block_size < table.shape[1] for span in metadata.requests)
+    ):
+        return None
+    field = cache.field(0, 0, q.shape[-1])
+    if not (
+        field.ndim == 2
+        and field.shape[1] == q.shape[-1]
+        and field.device == q.device
+        and field.dtype == dtype
+        and field.stride(1) == 1
+        and field.stride(0) >= field.shape[1]
+    ):
+        return None
+
+    # The accepted history was already copied by DSparkMetadataBuilder. This one
+    # small H2D vector replaces per-request ring construction; include it in timing.
+    starts = torch.tensor([span.start_pos for span in metadata.requests], dtype=torch.long, device=q.device)
+    ring_slots = torch.arange(window_size, device=q.device)
+    history = starts[:, None] - 1 - (starts[:, None] - 1 - ring_slots).remainder(window_size)
+    pages = table[:batch].gather(1, history // cache.block_size).long()
+    slots = pages * cache.block_size + history % cache.block_size
+    # Match cache.read's advanced indexing, including its signed-index semantics.
+    # Do not use index_select: a narrowed cache field can materialize the full pool.
+    context = field[slots]
+    kv = torch.cat((context, query_kv.view(batch, block_size, q.shape[-1])), dim=1)
+    indices = torch.arange(window_size + block_size, dtype=torch.int32, device=q.device)
+    indices = indices.view(1, 1, -1).expand(1, block_size, -1)
+    return kv, indices
+
+
 def is_draft_dummy():
     ctx = get_forward_context()
     return getattr(ctx, "in_profile_run", False) or (
@@ -116,6 +188,7 @@ class DSparkAttention(DeepseekV41Attention):
         self.groups = config.o_groups // self.tp
         self.dsa_cp = False
         self.attention_kernel = DeepseekV41NativeAttention()
+        self._staging_b4_witness_pending = True
         self.sequence_group = None
         self.dim = config.head_dim
         self.rope_dim = config.qk_rope_head_dim
@@ -164,6 +237,44 @@ class DSparkAttention(DeepseekV41Attention):
         active = (slots >= 0).nonzero().flatten()
         self.cache.write_slots(slots.index_select(0, active), kv.index_select(0, active), 0, 0)
 
+    def _record_staging_b4_witness(self, q, query_kv, metadata, staged):
+        """Log one completed B4 invocation using host metadata only, then close."""
+        self._staging_b4_witness_pending = False
+
+        def geometry(tensor):
+            return {
+                "shape": list(tensor.shape),
+                "stride": list(tensor.stride()),
+                "dtype": str(tensor.dtype),
+                "device": str(tensor.device),
+            }
+
+        source = Path(__file__).resolve()
+        record = {
+            "schema": "dspark-staging-b4-witness-v1",
+            "pid": os.getpid(),
+            "host_monotonic_ns": time.monotonic_ns(),
+            "cache_prefix": self.cache.prefix,
+            "source_path": str(source),
+            "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+            "batch": len(metadata.requests),
+            "num_actual_tokens": metadata.num_actual_tokens,
+            "window_size": self.config.sliding_window,
+            "block_size": self.config.dspark_block_size,
+            "spans": [[span.begin, span.end, span.start_pos] for span in metadata.requests],
+            "q": geometry(q),
+            "query_kv": geometry(query_kv),
+            "block_table": geometry(metadata.block_table_tensor),
+            "staging_used": staged is not None,
+            # Reaching this point means every non-skipped original native call
+            # returned. A call error exits forward before this bounded record.
+            "completed_native_calls": sum(span.begin < metadata.num_actual_tokens for span in metadata.requests),
+            "staged_kv": None if staged is None else geometry(staged[0]),
+            "staged_indices": None if staged is None else geometry(staged[1]),
+            "witness_closed": not self._staging_b4_witness_pending,
+        }
+        logger.info("DSPARK_STAGING_B4_WITNESS %s", json.dumps(record, sort_keys=True, separators=(",", ":")))
+
     def forward(self, hidden, positions):
         positions = positions.reshape(-1)
         qr = self.q_norm(self.wq_a(hidden)[0])
@@ -176,17 +287,39 @@ class DSparkAttention(DeepseekV41Attention):
             if not is_draft_dummy():
                 raise RuntimeError("DSpark proposal requires the draft layer's paged metadata")
         else:
+            staged = try_stage_block_inputs(
+                q,
+                query_kv,
+                metadata,
+                self.cache,
+                window_size=self.config.sliding_window,
+                block_size=self.config.dspark_block_size,
+                dtype=hidden.dtype,
+            )
             for row, span in enumerate(metadata.requests):
                 if span.begin >= metadata.num_actual_tokens:
                     continue
                 if span.end - span.begin != self.config.dspark_block_size or span.start_pos < 0:
                     raise ValueError("DSpark requires a complete anchor-first query block per request")
-                history = ring_positions(span.start_pos, self.config.sliding_window, device=q.device)
-                context = self.cache.read(metadata, row, history, 0, 0, self.dim).to(hidden.dtype)
                 rows = slice(span.begin, span.end)
-                attended[rows] = block_attention(
-                    q[rows], context, query_kv[rows], self.attn_sink, self.dim**-0.5, self.attention_kernel
-                )
+                if staged is None:
+                    history = ring_positions(span.start_pos, self.config.sliding_window, device=q.device)
+                    context = self.cache.read(metadata, row, history, 0, 0, self.dim).to(hidden.dtype)
+                    attended[rows] = block_attention(
+                        q[rows], context, query_kv[rows], self.attn_sink, self.dim**-0.5, self.attention_kernel
+                    )
+                else:
+                    kv, indices = staged
+                    attended[rows] = self.attention_kernel(
+                        q[rows].unsqueeze(0),
+                        kv[row : row + 1],
+                        self.attn_sink,
+                        indices,
+                        self.dim**-0.5,
+                        mode="SWA draft bidirectional",
+                    )[0]
+            if self._staging_b4_witness_pending and len(metadata.requests) == _WITNESS_BATCH_SIZE:
+                self._record_staging_b4_witness(q, query_kv, metadata, staged)
         self.rotate(attended.unsqueeze(0), positions, inverse=True)
         return self._project_output(attended, hidden.dtype)
 
