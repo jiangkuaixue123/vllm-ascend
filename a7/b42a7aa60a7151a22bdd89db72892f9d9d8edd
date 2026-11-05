@@ -1,0 +1,28 @@
+vllm_ascend/ops/triton/deepseek_v41_ordered_index.py
+  s_6eab87361519a8::t_989e555673ae02 8-183
+  s_6eab87361519a8::t_07346740b1c654 5-7
+tests/e2e/nightly/one_card/test_ordered_index.py
+  s_6eab87361519a8::t_19294dc61a0583 1-108
+tests/ut/models/common/ops/test_ordered_index.py
+  s_6eab87361519a8::t_946bc5020c2cec 1-130
+vllm_ascend/models/common/ops/ordered_index.py
+  s_6eab87361519a8::t_48aca24a72e376 1-44
+vllm_ascend/models/deepseek_v41/attention.py
+  s_6eab87361519a8::t_8f8af24bc86043 42,519,534-538,933,1043
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "a7b42a7aa60a7151a22bdd89db72892f9d9d8edd",
+  "prompts": {},
+  "sessions": {
+    "s_6eab87361519a8": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1ac13-1fd0-7670-ae84-d58acaf2730c",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "jiangkuaixue123 <jiangxiaozhou111@163.com>"
+    }
+  }
+}
