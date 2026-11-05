@@ -1,0 +1,37 @@
+vllm_ascend/ops/triton/hc_post.py
+  s_6eab87361519a8::t_b0a6ffa775dc06 1-16,35,43-44,49-53,64-69
+  s_6eab87361519a8::t_119ffedfec68fd 27-32,39-42,45-46,48,54-55
+  s_6eab87361519a8::t_f880da864bb0ec 17,26,33-34,36-38,47
+  s_6eab87361519a8::t_2ea4545ba5aa15 18-25,56-63
+tests/ut/models/common/ops/test_hc_pre_delayed.py
+  s_6eab87361519a8::t_f880da864bb0ec 233,240,244
+  s_6eab87361519a8::t_2ea4545ba5aa15 238-239
+tests/e2e/nightly/one_card/test_hc_post_fused.py
+  s_6eab87361519a8::t_6698fefcd9cc1a 1-115
+vllm_ascend/models/common/ops/hc_post.py
+  s_6eab87361519a8::t_2ea4545ba5aa15 32
+  s_6eab87361519a8::t_b0a6ffa775dc06 1-31,33-47
+tests/ut/models/common/ops/test_hc_post.py
+  s_6eab87361519a8::t_f880da864bb0ec 1-14,25-45,53-57,64-73,93-137,142-145
+  s_6eab87361519a8::t_2ea4545ba5aa15 15-24,46-52,58-63,74-92,138-141
+  s_6eab87361519a8::t_6698fefcd9cc1a 146-147
+vllm_ascend/models/deepseek_v41/model.py
+  s_6eab87361519a8::t_b0a6ffa775dc06 40,191-194,198-200,209,218
+  s_6eab87361519a8::t_8cc85d959aa6f0 112,195-197
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "9f10df7a9db970b9464b640ea216738c82b3c2db",
+  "prompts": {},
+  "sessions": {
+    "s_6eab87361519a8": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1ac13-1fd0-7670-ae84-d58acaf2730c",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "jiangkuaixue123 <jiangxiaozhou111@163.com>"
+    }
+  }
+}
