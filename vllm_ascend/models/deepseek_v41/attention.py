@@ -1007,7 +1007,6 @@ class DeepseekV41Attention(nn.Module):
         if not capacity:
             runtime.decode_topk = torch.empty((x.shape[0], 0), dtype=torch.int64, device=x.device)
             return
-        groups = torch.arange(capacity, device=x.device).unsqueeze(0)
         indexer = self.indexer
         q = indexer.wq_b(qr)[0].view(-1, self.index_heads, self.config.index_head_dim)
         self.rotate(q.unsqueeze(0), pos)
@@ -1027,6 +1026,7 @@ class DeepseekV41Attention(nn.Module):
             field = cache.field(1, self.dim, self.config.index_head_dim)
             if supports_paged_index_scores(q, field, weights, runtime.source_decode, md, self.ratio, cache.block_size):
                 scores = paged_index_scores(q, field, weights, runtime.source_decode, md, self.ratio, cache.block_size)
+                logger.info_once("INDEX_QUERY_REUSE_RUNTIME pid=%d", os.getpid(), scope="process")
                 logger.info_once(
                     "V4.1 paged decode index scores rows=%d capacity=%d ratio=%d",
                     q.shape[0],
@@ -1034,7 +1034,9 @@ class DeepseekV41Attention(nn.Module):
                     self.ratio,
                     scope="process",
                 )
+        lengths = torch.where(md.active, md.seq_lens // self.ratio, 0)[:, None]
         if scores is None:
+            groups = torch.arange(capacity, device=x.device).unsqueeze(0)
             ends = ((groups + 1) * self.ratio - 1).expand(x.shape[0], -1)
             parts = []
             for tile in ends.split(_DECODE_INDEX_TILE_KEYS, dim=-1):
@@ -1046,8 +1048,11 @@ class DeepseekV41Attention(nn.Module):
             scores = parts[0] if len(parts) == 1 else torch.cat(parts, dim=-1)
             if self.tp > 1 and not self.dsa_cp:
                 scores = tensor_model_parallel_all_reduce(scores)
-        lengths = torch.where(md.active, md.seq_lens // self.ratio, 0)[:, None]
-        scores.masked_fill_(groups >= lengths, -torch.inf)
+            scores.masked_fill_(groups >= lengths, -torch.inf)
+        else:
+            # The paged producer fills all columns with -inf before writing only
+            # the active query prefix, including when a graph replay shrinks it.
+            logger.info_once("INDEX_MASK_ELIDED_RUNTIME pid=%d", os.getpid(), scope="process")
         source = self.config.candidate_source_layer_id
         if self.layer_id == source:
             runtime.decode_candidate_width = capacity

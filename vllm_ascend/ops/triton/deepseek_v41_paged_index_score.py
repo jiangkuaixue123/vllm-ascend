@@ -44,6 +44,9 @@ def _paged_index_score(
     live_source = tl.load(source_active + row) != 0
     heads = tl.arange(0, H)
     dims = tl.arange(0, D)
+    # Query and head weights are constant across this program's key tiles.
+    queries = tl.load(q + row * H * D + heads[:, None] * D + dims[None, :])
+    w = tl.load(weights + row * H + heads)
     # No Cube/field-read iterations for an idle row or for its padded 16K suffix.
     for start in range(lane * N, count, LANES * N):
         ids = start + tl.arange(0, N)
@@ -55,8 +58,6 @@ def _paged_index_score(
         valid = live_source & (ends < source_length) & (slots >= 0) & (slots < PHYSICAL_ROWS) & (ids < count)
         addresses = tl.where(valid, slots, 0) * ROW_STRIDE
         k = tl.load(keys + addresses[:, None] + dims[None, :], mask=valid[:, None], other=0)
-        queries = tl.load(q + row * H * D + heads[:, None] * D + dims[None, :])
-        w = tl.load(weights + row * H + heads)
         dots = tl.dot(queries, tl.trans(k), out_dtype=tl.float32)
         # C rounds the BF16 einsum result, then rounds the product of two BF16
         # operands before its head reduction; both conversion points are necessary.
