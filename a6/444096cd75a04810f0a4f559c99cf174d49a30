@@ -1,0 +1,21 @@
+vllm_ascend/models/deepseek_v41/attention.py
+  s_6eab87361519a8::t_b67f242f4f3e68 1036,1038,1050-1054
+tests/e2e/nightly/one_card/test_index_mask_elide.py
+  s_6eab87361519a8::t_074b984dbba059 1-119
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "a6444096cd75a04810f0a4f559c99cf174d49a30",
+  "prompts": {},
+  "sessions": {
+    "s_6eab87361519a8": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1ac13-1fd0-7670-ae84-d58acaf2730c",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "jiangkuaixue123 <jiangxiaozhou111@163.com>"
+    }
+  }
+}
