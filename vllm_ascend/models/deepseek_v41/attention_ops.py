@@ -181,6 +181,12 @@ def fp8_quant_dequant(x: torch.Tensor, block_size: int = 32, *, inplace: bool = 
         fused = _try_decode_fp8_aiv(x, inplace)
         if fused is not None:
             return fused
+    elif x.device.type == "npu":
+        from vllm_ascend.models.common.ops.fp8_dynamic import dynamic_fp8_fused
+
+        fused = dynamic_fp8_fused(x, block_size, inplace)
+        if fused is not None:
+            return fused
     grouped = x.float().reshape(shape)
     if decode:
         result = _decode_fp8_qdq(grouped.view(-1, block_size))

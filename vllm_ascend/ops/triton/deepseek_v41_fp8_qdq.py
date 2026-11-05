@@ -62,3 +62,28 @@ def decode_fp8_qdq(x: torch.Tensor, inplace: bool):
         # A raw Triton store bypasses the version change made by Tensor.copy_.
         torch.autograd.graph.increment_version(x)
     return out
+
+
+@triton.jit(do_not_specialize=["tiles"])
+def _dynamic_kernel(x, out, tiles, G: tl.constexpr):
+    for tile in range(tl.program_id(0), tiles, tl.num_programs(0)):
+        groups = tile * G + tl.arange(0, G)
+        ix = groups[:, None] * 32 + tl.arange(0, 32)[None, :]
+        src = tl.load(x + ix)
+        tl.store(out + ix, _bias_qdq(src))
+
+
+def dynamic_fp8_qdq(x: torch.Tensor, inplace: bool):
+    init_device_properties_triton()
+    cores = get_vectorcore_num()
+    if cores != _QUALIFIED_VECTOR_CORES:
+        return None
+    # Every supported row has 16 or 256 complete groups. Tile sizes divide
+    # those counts, so neither padding nor an extra tail kernel is needed.
+    groups = 16 if x.ndim == 2 else 64
+    tiles = x.numel() // (_GROUP_SIZE * groups)
+    out = x if inplace else torch.empty_like(x)
+    _dynamic_kernel[(min(cores, tiles),)](x, out, tiles, G=groups)
+    if inplace:
+        torch.autograd.graph.increment_version(x)
+    return out
