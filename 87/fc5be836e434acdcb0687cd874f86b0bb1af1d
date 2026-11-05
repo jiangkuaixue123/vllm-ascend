@@ -1,0 +1,73 @@
+tests/ut/models/common/ops/test_hc_pre_witness.py
+  s_aa5129df8f8fb8::t_fd50c4270ee48a 1-144
+vllm_ascend/models/deepseek_v41/model.py
+  s_aa5129df8f8fb8::t_a13933f8bf206f 166
+  s_aa5129df8f8fb8::t_b684fd2c43654d 11-12,23-24,40,109-110,142-165,167-188,195-196,198-199
+typos.toml
+  s_6eab87361519a8::t_9641d912b19c74 66-69
+csrc/torch_binding.cpp
+  s_aa5129df8f8fb8::t_87aa99565cbef8 33,1394-1412,2556-2559
+  s_aa5129df8f8fb8::t_4be555158815ea 2560
+tests/ut/models/common/ops/test_hc_pre_delayed.py
+  s_aa5129df8f8fb8::t_506cbeed594e23 1-329
+tests/ut/models/common/ops/test_hc_rsqrt_refinement.py
+  s_aa5129df8f8fb8::t_08e5159a95be5b 18-19,27-32,40,45-47,60-62,77-81,85-86,103-104,107-110,112-116,118-119,121-123,125,144-146
+  s_aa5129df8f8fb8::t_34e5d8aff6af50 1-10,12-17,20-26,33-39,41-44,48-59,63-76,82-84,87-102,126,128-137,141-143
+  s_aa5129df8f8fb8::t_2a7dfc0c1d0e22 11,138-140
+  s_aa5129df8f8fb8::t_5428fa44a3ac19 105-106,111,117,120,124,127
+csrc/moe/hc_pre/op_kernel/hc_pre_m_k_split_core.h
+  s_aa5129df8f8fb8::t_dbb9f219cca126 25,196,208,300-302,306-315,380-390,412-423,427-436,448,460-462,496-502,553-560,562-567,574-578,580-614,617-622,683
+  s_aa5129df8f8fb8::t_456e2cd40bf0ad 561,568-573,579
+csrc/build_aclnn.sh
+  s_aa5129df8f8fb8::t_b3aedb4f0c8348 172
+csrc/moe/hc_pre/op_host/hc_pre_tiling.h
+  s_aa5129df8f8fb8::t_4f4ee60fafa181 27
+csrc/moe/hc_pre/op_host/hc_pre_tiling_data.h
+  s_aa5129df8f8fb8::t_02a1d84bef1676 1-77
+csrc/moe/hc_pre/op_kernel/hc_pre_cube_compute.h
+  s_aa5129df8f8fb8::t_fa4d127b7149b4 48-49,51-53,426-429,469-476
+csrc/moe/hc_pre_delayed/CMakeLists.txt
+  s_aa5129df8f8fb8::t_6fb61ac5286f0a 1-19
+csrc/moe/hc_pre_delayed/hc_pre_delayed_torch_adpt.h
+  s_aa5129df8f8fb8::t_6fc47be4ec6a38 1-55
+csrc/moe/hc_pre_delayed/op_host/CMakeLists.txt
+  s_aa5129df8f8fb8::t_4e78e921141466 1-18
+csrc/moe/hc_pre_delayed/op_host/hc_pre_delayed_def.cpp
+  s_aa5129df8f8fb8::t_03e80d03c28fcf 1-40
+csrc/moe/hc_pre_delayed/op_host/hc_pre_delayed_tiling.cpp
+  s_aa5129df8f8fb8::t_8a3b0f0f76e42d 1-160
+csrc/moe/hc_pre_delayed/op_host/hc_pre_delayed_tiling.h
+  s_aa5129df8f8fb8::t_a37861978d1429 1-21
+csrc/moe/hc_pre_delayed/op_kernel/hc_pre_delayed.cpp
+  s_aa5129df8f8fb8::t_3be82344ff43b6 1-49
+csrc/torch_binding_meta.cpp
+  s_aa5129df8f8fb8::t_d7b5db97fc6463 8,1081-1088,2094
+tests/e2e/nightly/single_node/ops/singlecard_ops/test_hc_pre_delayed.py
+  s_6eab87361519a8::t_ba1fb10b8f250d 1-106
+vllm_ascend/models/common/ops/hc_pre.py
+  s_aa5129df8f8fb8::t_faf53896b04163 1-64
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "87fc5be836e434acdcb0687cd874f86b0bb1af1d",
+  "prompts": {},
+  "sessions": {
+    "s_6eab87361519a8": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1ac13-1fd0-7670-ae84-d58acaf2730c",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "jiangkuaixue123 <jiangxiaozhou111@163.com>"
+    },
+    "s_aa5129df8f8fb8": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1aa11-94e0-7ac2-9269-45229d337fe1",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "jiangkuaixue123 <jiangxiaozhou111@163.com>"
+    }
+  }
+}
