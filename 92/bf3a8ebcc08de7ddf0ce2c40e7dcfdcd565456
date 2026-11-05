@@ -1,0 +1,21 @@
+docs/zh/developer_guide/performance/dsv41-timing-20261105/candidate-timing-detail-sources-20261105.json
+  s_aa5129df8f8fb8::t_c89e300126146f 1-118
+docs/zh/developer_guide/performance/dsv41-timing-20261105/README.md
+  s_aa5129df8f8fb8::t_c89e300126146f 1-208
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "92bf3a8ebcc08de7ddf0ce2c40e7dcfdcd565456",
+  "prompts": {},
+  "sessions": {
+    "s_aa5129df8f8fb8": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1aa11-94e0-7ac2-9269-45229d337fe1",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "jiangkuaixue123 <jiangxiaozhou111@163.com>"
+    }
+  }
+}
