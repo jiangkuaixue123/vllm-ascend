@@ -9,6 +9,7 @@ replay updates positions, slots and live-row masks at fixed addresses.
 """
 
 import math
+import os
 from dataclasses import dataclass, field
 
 import torch
@@ -39,6 +40,7 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 
+from vllm_ascend.models.common.ops.rms_elementwise import rms_elementwise_fused
 from vllm_ascend.utils import AscendDeviceType, enable_custom_op, enable_dsa_cp, enable_sp, get_ascend_device_type
 
 from .attention_ops import (
@@ -489,8 +491,15 @@ class DeepseekV41RMSNorm(nn.Module):
         super().__init__()
         self.weight = nn.Parameter(torch.empty(dim))
         self.eps = eps
+        self._fused_witness_pending = False
 
     def forward(self, x):
+        fused = rms_elementwise_fused(x, self.weight, self.eps)
+        if fused is not None:
+            if self._fused_witness_pending:
+                logger.info("RMS_ELEMENTWISE_RUNTIME pid=%s rows=%s", os.getpid(), x.shape[0])
+                self._fused_witness_pending = False
+            return fused
         return rms_norm(x, self.weight, self.eps)
 
 

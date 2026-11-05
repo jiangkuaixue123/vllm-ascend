@@ -119,6 +119,7 @@ class DeepseekV41Block(nn.Module):
             vision_routing=getattr(vllm_config.model_config.hf_config, "vision_config", None) is not None,
         )
         self.attn_norm = DeepseekV41RMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.attn_norm._fused_witness_pending = layer_id == 0
         self.ffn_norm = DeepseekV41RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.engram = None
         width = (config.hc_mult + 2) * config.hc_mult
