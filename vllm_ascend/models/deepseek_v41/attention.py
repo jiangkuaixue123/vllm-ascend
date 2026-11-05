@@ -71,6 +71,7 @@ _DECODE_INDEX_TILE_KEYS = 8192
 _DECODE_INDEX_SORT_ROWS = (6, 12)
 _DECODE_INDEX_SORT_K = 512
 _DECODE_INDEX_SORT_MAX_WIDTH = 1 << 24
+_DECODE_INDEX_TIE_WIDTHS = (76800, 153600)
 # Head widths and rotary tail supported by the V4.1 fused path.
 _PARTIAL_ROPE_HEAD_DIMS = (128, 512)
 _PARTIAL_ROPE_DIM = 64
@@ -518,6 +519,17 @@ def rotary_frequencies(config, compressed):
     return frequencies
 
 
+def _use_float32_tie_columns(scores, k):
+    return (
+        scores.device.type == "npu"
+        and scores.ndim == 2
+        and scores.shape[0] in _DECODE_INDEX_SORT_ROWS
+        and scores.shape[-1] in _DECODE_INDEX_TIE_WIDTHS
+        and k == _DECODE_INDEX_SORT_K
+        and torch.is_inference_mode_enabled()
+    )
+
+
 def topk_columns(scores, k):
     """Keep the FP32 top-k, preferring the lower column only at a tied cutoff."""
     columns = torch.arange(scores.shape[-1], device=scores.device, dtype=torch.int32)
@@ -525,6 +537,11 @@ def topk_columns(scores, k):
         return columns[:k].long().expand(*scores.shape[:-1], k)
     top = scores.topk(k, dim=-1)
     cutoff = top.values[..., -1:]
+    if _use_float32_tie_columns(scores, k):
+        # Both column IDs and the out-of-range sentinel are exact FP32 integers.
+        # Keep the original score TopK and its NaN/non-cutoff selections intact.
+        columns = columns.float()
+        logger.info_once("INDEX_TIE_FP32_RUNTIME pid=%d", os.getpid(), scope="process")
     # topk may choose different equal items at different padded widths.
     # Retain all strictly higher scores; fill only the tied part by column.
     tied = torch.where(scores == cutoff, columns, scores.shape[-1])
