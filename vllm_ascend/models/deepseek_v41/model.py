@@ -37,6 +37,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.model_executor.models.interfaces import SupportsMultiModal
 from vllm.model_executor.models.utils import _merge_multimodal_embeddings
 
+from vllm_ascend.models.common.ops.hc_post import hc_post_fused
 from vllm_ascend.models.common.ops.hc_pre import hc_pre_delayed
 from vllm_ascend.models.common.ops.sequence_parallel import sp_all_gather, sp_shard
 from vllm_ascend.models.deepseek_v41.attention import (
@@ -108,6 +109,7 @@ class DeepseekV41Block(nn.Module):
         self.config = config
         # One instance owns the startup record; graph replay does not log again.
         self._hc_native_witness_pending = layer_id == 0
+        self._hc_post_fused_witness_pending = layer_id == 0
         prefix = f"layers.{layer_id}"
         self.attn = DeepseekV41Attention(config, vllm_config, layer_id, f"{prefix}.attn")
         self.ffn = DeepseekV41MoE(
@@ -186,6 +188,16 @@ class DeepseekV41Block(nn.Module):
         self._hc_native_witness_pending = False
         logger.info("HC_NATIVE_RUNTIME_WITNESS %s", json.dumps(record, sort_keys=True, separators=(",", ":")))
 
+    def post_residual(self, sublayer_output, residual, post, comb, runtime):
+        if getattr(runtime, "decode", None) is not None:
+            output = hc_post_fused(sublayer_output, residual, post, comb)
+            if output is not None:
+                if getattr(self, "_hc_post_fused_witness_pending", False):
+                    logger.info("HC_POST_FUSED_RUNTIME pid=%s rows=%s", os.getpid(), residual.shape[0])
+                    self._hc_post_fused_witness_pending = False
+                return output
+        return hc_post(sublayer_output, residual, post, comb)
+
     def forward(self, hidden_states, pre_mix, runtime, decode_mask=None, image_mask=None):
         if hidden_states.shape[0] == 0:
             # Other DP replicas can be active. Participate in every expert
@@ -194,7 +206,7 @@ class DeepseekV41Block(nn.Module):
             return hidden_states, pre_mix
         attn_input, attn_pre, post, comb = self.pre_and_mixes(hidden_states, pre_mix, "attn", runtime)
         attended = self.attn(self.attn_norm(attn_input), runtime)
-        hidden_states = hc_post(attended, hidden_states, post, comb)
+        hidden_states = self.post_residual(attended, hidden_states, post, comb, runtime)
         ffn_input, ffn_pre, post, comb = self.pre_and_mixes(hidden_states, attn_pre, "ffn", runtime)
         ffn_input = self.ffn_norm(ffn_input)
         if getattr(runtime, "decode", None) is not None:
@@ -203,7 +215,7 @@ class DeepseekV41Block(nn.Module):
             output = self.ffn(ffn_input, image_mask=image_mask)
         else:
             output = self.ffn(ffn_input)
-        return hc_post(output, hidden_states, post, comb), ffn_pre
+        return self.post_residual(output, hidden_states, post, comb, runtime), ffn_pre
 
 
 def read_parameter_slice(reader, key, parameter, module, tp_rank, tp_size):
