@@ -1,0 +1,27 @@
+tests/ut/models/common/ops/test_rms_native.py
+  s_6eab87361519a8::t_01dfaef7131ccc 73-75,84-104
+  s_6eab87361519a8::t_0b2e2fde8b4ec4 1-72,76-83,105-128
+vllm_ascend/models/common/ops/rms_native.py
+  s_6eab87361519a8::t_6229471e993a22 1-46
+tests/e2e/nightly/one_card/test_rms_native.py
+  s_6eab87361519a8::t_0b2e2fde8b4ec4 1-18,31-76,80-171,181
+  s_6eab87361519a8::t_01dfaef7131ccc 19-30,77-79,172-180
+vllm_ascend/models/deepseek_v41/attention.py
+  s_6eab87361519a8::t_0b2e2fde8b4ec4 43,500-503
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "857de91a69b42be4de5e0e16b584731d04e42412",
+  "prompts": {},
+  "sessions": {
+    "s_6eab87361519a8": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1ac13-1fd0-7670-ae84-d58acaf2730c",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "jiangkuaixue123 <jiangxiaozhou111@163.com>"
+    }
+  }
+}
