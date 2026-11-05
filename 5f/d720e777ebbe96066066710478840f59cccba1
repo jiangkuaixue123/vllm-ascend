@@ -1,0 +1,37 @@
+tests/ut/models/deepseek_v41/test_decode_slot_arena.py
+  s_a1887b15757e1f::t_e884f7d1013ee3 14,18,25,31,34,64-85,89-112,117-135,150
+  s_a1887b15757e1f::t_dc93b6ff6fd4fd 160-172
+  s_a1887b15757e1f::t_22dd5fc70130a1 222-238
+  s_a1887b15757e1f::t_95e14a223ad5db 86-88,113-115,158,173
+  s_a1887b15757e1f::t_f220b2e2419817 116
+  s_a1887b15757e1f::t_832d9affc4a3d9 136-138,147-149
+  s_a1887b15757e1f::t_9845fdb9b6d8c7 151-153,155-157
+  s_a1887b15757e1f::t_2df2138c469869 159
+  s_a1887b15757e1f::t_a4fe09a2ac61d3 174-176
+vllm_ascend/models/deepseek_v41/attention.py
+  s_a1887b15757e1f::t_a42eefca7f8169 73-75,611,613-616,618,622,636,1099
+  s_a1887b15757e1f::t_22dd5fc70130a1 582-595,1119-1120,1124,1126
+  s_a1887b15757e1f::t_10c86947b1d29c 577,617,619-621,624,629-635,637-645,1094
+  s_a1887b15757e1f::t_2fb85f50f3d68a 596
+tests/e2e/nightly/single_node/ops/singlecard_ops/test_v41_decode_slot_arena.py
+  s_a1887b15757e1f::t_5415c22c20f23f 223-225
+  s_a1887b15757e1f::t_dc93b6ff6fd4fd 230-237,246-253,274-280
+  s_a1887b15757e1f::t_95e14a223ad5db 13,21,23-32,42-43,46-48,77-78,99,102,109-111,118,135,138-141,143,149,169,171-195,199,209,213-216,219-221,227,239,255,257-258,261-262,281-290
+  s_a1887b15757e1f::t_243631c3f20930 205,229,245,273
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "5fd720e777ebbe96066066710478840f59cccba1",
+  "prompts": {},
+  "sessions": {
+    "s_a1887b15757e1f": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1a74b-d857-7e70-b563-bc2d4d34f06e",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "jiangkuaixue123 <jiangxiaozhou111@163.com>"
+    }
+  }
+}
