@@ -144,6 +144,29 @@ def test_native_uses_previous_pre_and_exposes_only_model_outputs(rows):
     assert calls[0][5] == args[5]
 
 
+@pytest.mark.parametrize("rows", [5, 10, 15, 20, 25, 30, 35, 40])
+def test_draft_contract_accepts_complete_query_blocks(rows):
+    env, calls, _ = load_dispatcher()
+    assert env["_supports_hc_pre"](*inputs(rows), env["_DRAFT_ROWS"])
+    assert not calls
+
+
+@pytest.mark.parametrize("rows", [0, 1, 6, 12, 19, 41, 45])
+def test_draft_incomplete_or_oversized_blocks_use_reference(rows):
+    env, calls, _ = load_dispatcher()
+    assert env["hc_pre_draft"](*inputs(rows)) is None
+    assert not calls
+
+
+@pytest.mark.parametrize("change", [{"device": "cpu"}, {"dtype": "fp32"}, {"contiguous": False}])
+def test_draft_unsupported_tensor_does_not_pad_or_dispatch(change):
+    env, calls, _ = load_dispatcher()
+    args = inputs(5)
+    args[0] = replace(args[0], **change)
+    assert env["hc_pre_draft"](*args) is None
+    assert not calls
+
+
 @pytest.mark.parametrize(
     "index,change",
     [

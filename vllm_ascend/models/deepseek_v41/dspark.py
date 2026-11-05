@@ -20,6 +20,8 @@ from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead, VocabParallelEmbedding
 from vllm.v1.attention.backend import AttentionCGSupport, AttentionMetadataBuilder
 
+from vllm_ascend.models.common.ops.hc_pre import hc_pre_draft
+
 from .attention import (
     DeepseekV41Attention,
     DeepseekV41Backend,
@@ -344,6 +346,22 @@ class DSparkMoE(DeepseekV41MoE):
 class DSparkStage(DeepseekV41Block):
     # The HC timing is exactly the target block's. Only its two sublayers,
     # checkpoint paths, and the number of routed experts differ.
+    def pre_and_mixes(self, x, previous_pre, name, runtime):
+        outputs = hc_pre_draft(
+            x,
+            getattr(self, f"hc_{name}_fn"),
+            getattr(self, f"hc_{name}_scale"),
+            getattr(self, f"hc_{name}_base"),
+            previous_pre,
+            self.config.rms_norm_eps,
+            self.config.hc_eps,
+            self.config.hc_sinkhorn_iters,
+        )
+        if outputs is not None:
+            logger.info_once("DSPARK_HC_PADDED_RUNTIME pid=%d rows=%d", os.getpid(), x.shape[0], scope="process")
+            return outputs
+        return super().pre_and_mixes(x, previous_pre, name, runtime)
+
     def __init__(self, config, vllm_config, stage):
         nn.Module.__init__(self)
         self.config = config
