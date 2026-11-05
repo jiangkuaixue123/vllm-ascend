@@ -7,6 +7,8 @@ are represented with ordinary FP32/BF16 tensors, so float8 device kernels are no
 required. This is a correctness path, not a packed-cache implementation.
 """
 
+import os
+
 import torch
 
 FP8_MAX = 448.0
@@ -29,6 +31,8 @@ _FP8_ROUND_BIAS_OFFSET = (FLOAT32_MANTISSA_BITS - 3) * FLOAT32_EXPONENT_UNIT
 ATTENTION_BLOCK_SIZE = 64
 ATTENTION_QUERY_CHUNK_SIZE = 16
 ATTENTION_INITIAL_MAX = -1e30
+_FP4_INDEX_DIM = 128
+_FP4_MAX_DECODE_ROWS = 48
 
 
 def _power_of_two(exponent: torch.Tensor) -> torch.Tensor:
@@ -195,6 +199,42 @@ def fp8_quant_dequant(x: torch.Tensor, block_size: int = 32, *, inplace: bool = 
     return result
 
 
+def _try_fp4_e8m0_aiv(x: torch.Tensor, block_size: int, scale_format: str, inplace: bool):
+    if (
+        x.device.type != "npu"
+        or x.dtype != torch.bfloat16
+        or x.ndim not in (2, 3)
+        or not 0 < x.shape[0] <= _FP4_MAX_DECODE_ROWS
+        or x.shape[-1] != _FP4_INDEX_DIM
+        or x.numel() == 0
+        or block_size != _FP8_DECODE_GROUP_SIZE
+        or scale_format != "e8m0"
+        or not x.is_contiguous()
+        or x.is_neg()
+        or x.is_conj()
+        or not torch.is_inference_mode_enabled()
+        or torch.compiler.is_compiling()
+    ):
+        return None
+    from vllm import envs
+    from vllm.triton_utils import HAS_TRITON
+
+    from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
+
+    if not HAS_TRITON or envs.VLLM_BATCH_INVARIANT or get_ascend_device_type() != AscendDeviceType.A3:
+        return None
+    import torch_npu
+    from vllm.logger import logger
+
+    if int(torch_npu.get_npu_format(x)) != int(torch_npu.Format.ND):
+        return None
+    from vllm_ascend.ops.triton.deepseek_v41_fp4_qdq import fp4_e8m0_qdq
+
+    output = fp4_e8m0_qdq(x, inplace)
+    logger.info_once("FP4_E8M0_RUNTIME pid=%s", os.getpid(), scope="process")
+    return output
+
+
 def fp4_quant_dequant(
     x: torch.Tensor,
     block_size: int = 32,
@@ -209,6 +249,9 @@ def fp4_quant_dequant(
     Neither rule may be replaced with BF16-only cache storage.
     """
     shape = _group_shape(x, block_size)
+    fused = _try_fp4_e8m0_aiv(x, block_size, scale_format, inplace)
+    if fused is not None:
+        return fused
     grouped = x.float().reshape(shape)
     amax = grouped.abs().amax(dim=-1, keepdim=True)
     if scale_format == "e8m0":
