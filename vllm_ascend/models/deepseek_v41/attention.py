@@ -39,6 +39,7 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 
+from vllm_ascend.models.common.ops.ordered_index import ordered_index_fused
 from vllm_ascend.utils import AscendDeviceType, enable_custom_op, enable_dsa_cp, enable_sp, get_ascend_device_type
 
 from .attention_ops import (
@@ -515,7 +516,7 @@ def rotary_frequencies(config, compressed):
 
 
 def topk_columns(scores, k):
-    """Keep the FP32 top-k, preferring the lower column only at a tied cutoff."""
+    """Keep the native top-k, preferring the lower column only at a tied cutoff."""
     columns = torch.arange(scores.shape[-1], device=scores.device, dtype=torch.int32)
     if k == 0 or k == scores.shape[-1]:
         return columns[:k].long().expand(*scores.shape[:-1], k)
@@ -528,6 +529,11 @@ def topk_columns(scores, k):
     at_cutoff = top.values == cutoff
     ordinal = at_cutoff.long().cumsum(-1) - 1
     return torch.where(at_cutoff, first.gather(-1, ordinal.clamp_min(0)).long(), top.indices)
+
+
+def ordered_topk_columns(scores, k):
+    output = ordered_index_fused(scores, k)
+    return topk_columns(scores, k).sort(-1).values if output is None else output
 
 
 def select_candidate_blocks(logits, compress_lens, topk_blocks, block_size, *, per_token=True):
@@ -924,7 +930,7 @@ class DeepseekV41Attention(nn.Module):
                 )
             elif 0 <= candidate_layer < self.layer_id:
                 scores.masked_fill_(~shared.candidates[rows], -torch.inf)
-            indices = topk_columns(scores, k).sort(-1).values
+            indices = ordered_topk_columns(scores, k)
             topk[rows] = torch.where(indices < lengths, indices, -1)
         shared.topk = topk
         return shared.topk
@@ -1034,7 +1040,7 @@ class DeepseekV41Attention(nn.Module):
                 self.config.candidate_block_size,
                 runtime.decode_candidate_width,
             )
-        indices = topk_columns(scores, min(self.config.index_topk, capacity)).sort(-1).values
+        indices = ordered_topk_columns(scores, min(self.config.index_topk, capacity))
         runtime.decode_topk = torch.where(indices < lengths, indices, -1)
         if (arena := getattr(runtime, "slot_arena", None)) is not None:
             # Ascending nonnegative indices followed by -1. Generic external IDs get no witness.
