@@ -40,6 +40,7 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 
+from vllm_ascend.models.common.ops.rms_native import native_rms_norm
 from vllm_ascend.utils import AscendDeviceType, enable_custom_op, enable_dsa_cp, enable_sp, get_ascend_device_type
 
 from .attention_ops import (
@@ -496,6 +497,10 @@ class DeepseekV41RMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x):
+        output = native_rms_norm(x, self.weight, self.eps)
+        if output is not None:
+            logger.info_once("RMS_NATIVE_RUNTIME pid=%d shape=%s", os.getpid(), tuple(x.shape), scope="process")
+            return output
         return rms_norm(x, self.weight, self.eps)
 
 
