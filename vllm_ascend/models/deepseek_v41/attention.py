@@ -9,6 +9,7 @@ replay updates positions, slots and live-row masks at fixed addresses.
 """
 
 import math
+import os
 from dataclasses import dataclass, field
 
 import torch
@@ -67,6 +68,9 @@ _OUTPUT_QDQ_TILE_ROWS = 256
 # A FULL graph uses a static context width even when only a few pages are live.
 # Tile the key axis; candidate-block and top-k selection still see all scores.
 _DECODE_INDEX_TILE_KEYS = 8192
+_DECODE_INDEX_SORT_ROWS = (6, 12)
+_DECODE_INDEX_SORT_K = 512
+_DECODE_INDEX_SORT_MAX_WIDTH = 1 << 24
 # Head widths and rotary tail supported by the V4.1 fused path.
 _PARTIAL_ROPE_HEAD_DIMS = (128, 512)
 _PARTIAL_ROPE_DIM = 64
@@ -528,6 +532,24 @@ def topk_columns(scores, k):
     at_cutoff = top.values == cutoff
     ordinal = at_cutoff.long().cumsum(-1) - 1
     return torch.where(at_cutoff, first.gather(-1, ordinal.clamp_min(0)).long(), top.indices)
+
+
+def sorted_topk_columns(scores, k):
+    indices = topk_columns(scores, k)
+    if (
+        scores.device.type == "npu"
+        and scores.ndim == 2
+        and scores.shape[0] in _DECODE_INDEX_SORT_ROWS
+        and k == _DECODE_INDEX_SORT_K
+        and k <= scores.shape[-1] <= _DECODE_INDEX_SORT_MAX_WIDTH
+        and torch.is_inference_mode_enabled()
+    ):
+        # TopK indices are nonnegative and below the score width, so the
+        # FP32 conversion is exact within this bound. Return int64 for page lookup.
+        result = indices.float().sort(-1).values.long()
+        logger.info_once("INDEX_SORT_NARROW_RUNTIME pid=%d", os.getpid(), scope="process")
+        return result
+    return indices.sort(-1).values
 
 
 def select_candidate_blocks(logits, compress_lens, topk_blocks, block_size, *, per_token=True):
@@ -1034,7 +1056,7 @@ class DeepseekV41Attention(nn.Module):
                 self.config.candidate_block_size,
                 runtime.decode_candidate_width,
             )
-        indices = topk_columns(scores, min(self.config.index_topk, capacity)).sort(-1).values
+        indices = sorted_topk_columns(scores, min(self.config.index_topk, capacity))
         runtime.decode_topk = torch.where(indices < lengths, indices, -1)
         if (arena := getattr(runtime, "slot_arena", None)) is not None:
             # Ascending nonnegative indices followed by -1. Generic external IDs get no witness.
