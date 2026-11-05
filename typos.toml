@@ -63,6 +63,10 @@ extend-ignore-re = []
 arange = "arange"
 NDArray = "NDArray"
 EOFError = "EOFError"
+# Native C++ field names referenced by the tiling regression test.
+tokens_splited_length = "tokens_splited_length"
+tokens_splited_remain = "tokens_splited_remain"
+tokens_splited_num = "tokens_splited_num"
 
 [type.py.extend-words]
 

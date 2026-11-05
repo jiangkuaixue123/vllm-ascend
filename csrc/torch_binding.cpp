@@ -30,6 +30,7 @@
 #include "utils.h"
 #include "aclnn_torch_adapter/op_api_common.h"
 #include "moe/add_rms_norm_bias/add_rms_norm_bias_torch_adpt.h"
+#include "moe/hc_pre_delayed/hc_pre_delayed_torch_adpt.h"
 #ifdef VLLM_ENABLE_ATB_AND_DIRECT_KERNELS
 #include "batch_matmul_transpose/batch_matmul_transpose_torch_adpt.h"
 #include "mla_preprocess/mla_preprocess_torch_adpt.h"
@@ -1390,6 +1391,25 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> npu_hc_pre_v2_npu(
     return run_hc_pre_fusion(x, hc_fn, hc_scale, hc_base, hc_mult, hc_sinkhorn_iters, norm_eps, hc_eps);
 }
 
+HcPreDelayedOutputs npu_hc_pre_delayed_npu(
+    const at::Tensor& x, const at::Tensor& fn, const at::Tensor& scale,
+    const at::Tensor& base, const at::Tensor& previous_pre, double norm_eps)
+{
+    check_hc_pre_delayed(x, fn, scale, base, previous_pre, norm_eps);
+    for (const at::Tensor *input : {&x, &fn, &scale, &base, &previous_pre}) {
+        TORCH_CHECK(NPUBridge::GetNpuStorageImplDesc(*input).npu_format_ == ACL_FORMAT_ND,
+            "HC delayed-pre requires ND storage format.");
+    }
+    constexpr int64_t HC_DELAYED_SINKHORN_ITERS = 20;
+    constexpr double HC_DELAYED_EPS = 1e-6;
+    auto outputs = make_hc_pre_delayed_outputs(x);
+    EXEC_NPU_CMD(aclnnHcPreDelayed, x, fn, scale, base, previous_pre,
+        HC_DELAYED_WIDTH, HC_DELAYED_SINKHORN_ITERS, HC_DELAYED_EPS, norm_eps,
+        std::get<0>(outputs), std::get<1>(outputs),
+        std::get<2>(outputs), std::get<3>(outputs), std::get<4>(outputs), std::get<5>(outputs));
+    return outputs;
+}
+
 void inplace_partial_rotary_mul_npu(at::Tensor & x, const at::Tensor &r1, const at::Tensor &r2, c10::string_view rotary_mode, at::IntArrayRef partial_slice)
 {
     constexpr int BSND_DIM_NUM = 4;
@@ -2532,6 +2552,11 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         ") -> (Tensor out0, Tensor out1, Tensor out2)"
         );
     ops.impl("npu_hc_pre_v2", torch::kPrivateUse1, &vllm_ascend::npu_hc_pre_v2_npu);
+
+    ops.def("npu_hc_pre_delayed(Tensor x, Tensor fn, Tensor scale, Tensor base, "
+        "Tensor previous_pre, float norm_eps) -> "
+        "(Tensor y, Tensor next_pre, Tensor post, Tensor comb, Tensor projection, Tensor rstd)");
+    ops.impl("npu_hc_pre_delayed", torch::kPrivateUse1, &vllm_ascend::npu_hc_pre_delayed_npu);
 
     ops.def(
         "inplace_partial_rotary_mul("

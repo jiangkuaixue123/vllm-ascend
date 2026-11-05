@@ -22,7 +22,7 @@
 
 namespace HcPre {
 using namespace AscendC;
-template <typename T>
+template <typename T, bool strictFp32 = false>
 class HcPreMembaseKSplitCorePart1 {
 public:
     __aicore__ inline HcPreMembaseKSplitCorePart1()
@@ -193,7 +193,7 @@ private:
     LocalTensor<float> yCastLocal;
     LocalTensor<float> mmOutLocal;
 
-    HcCubeCompute<false> cubeCompute_;
+    HcCubeCompute<false, strictFp32> cubeCompute_;
     static constexpr uint64_t SYNC_AIV_TO_AIC_FLAG = 8;
     static constexpr uint64_t SYNC_AIC_TO_AIV_FLAG = 9;
     static constexpr uint64_t SYNC_MODE2 = NUM_TWO;
@@ -205,7 +205,7 @@ private:
     uint64_t squareSumFp32BufSize_;
 };
 
-template <typename T>
+template <typename T, bool delayedPre = false>
 class HcPreMembaseKSplitCorePart2 {
 public:
     __aicore__ inline HcPreMembaseKSplitCorePart2()
@@ -297,10 +297,22 @@ public:
 
     __aicore__ inline void Init(GM_ADDR x, GM_ADDR hcScale, GM_ADDR hcBase,
         GM_ADDR y, GM_ADDR post, GM_ADDR combFrag, GM_ADDR workspace,
-        const HcPreTilingData *tilingDataPtr, TPipe *pipePtr)
+        const HcPreTilingData *tilingDataPtr, TPipe *pipePtr,
+        GM_ADDR previousPre = nullptr, GM_ADDR nextPre = nullptr,
+        GM_ADDR projection = nullptr, GM_ADDR rstd = nullptr)
     {
         pipe = pipePtr;
         tilingData = tilingDataPtr;
+        if constexpr (delayedPre) {
+            previousPreGm.SetGlobalBuffer((__gm__ float *)previousPre);
+            nextPreGm.SetGlobalBuffer((__gm__ float *)nextPre);
+            projectionGm.SetGlobalBuffer((__gm__ float *)projection);
+            rstdGm.SetGlobalBuffer((__gm__ float *)rstd);
+            pipe->InitBuffer(previousPreQue, 1,
+                tilingData->stage2RowFactor * tilingData->hcMultAlign * sizeof(float));
+            pipe->InitBuffer(diagnosticQue, 1,
+                tilingData->stage2RowFactor * tilingData->hcMult * tilingData->hcMultAlign * sizeof(float));
+        }
         InitGlobalBuffers(x, hcScale, hcBase, y, post, combFrag, workspace);
         int64_t stage1UsedCoreNum = tilingData->cubeBlockDimK;
         int64_t xQueNum2 = tilingData->stage2RowFactor * tilingData->hcMult *
@@ -365,10 +377,17 @@ int64_t curBsIdxForAll = (stage2BlockIdx * tilingData->rowLoopOfFormerBlock +
                 PipeBarrier<PIPE_V>();
                 Adds(rsqrtLocal, rsqrtLocal, tilingData->normEps, curRowFactor);
                 PipeBarrier<PIPE_V>();
-                Sqrt(rsqrtLocal, rsqrtLocal, curRowFactor);
-                Duplicate(rowBrcbLocal0, static_cast<float>(1.0f), curRowFactor);
-                PipeBarrier<PIPE_V>();
-                Div(rsqrtLocal, rowBrcbLocal0, rsqrtLocal, curRowFactor);
+                if constexpr (delayedPre) {
+                    RefineDelayedRsqrt(curRowFactor);
+                    CopyDiagnostic(rsqrtLocal, rstdGm[
+                        stage2BlockIdx * tilingData->rowOfFormerBlock +
+                        rowOuterIdx * tilingData->stage2RowFactor], 1, curRowFactor);
+                } else {
+                    Sqrt(rsqrtLocal, rsqrtLocal, curRowFactor);
+                    Duplicate(rowBrcbLocal0, static_cast<float>(1.0f), curRowFactor);
+                    PipeBarrier<PIPE_V>();
+                    Div(rsqrtLocal, rowBrcbLocal0, rsqrtLocal, curRowFactor);
+                }
 
                 mixes01Local = mixesQue01.AllocTensor<float>();
 
@@ -390,9 +409,31 @@ int64_t curBsIdxForAll = (stage2BlockIdx * tilingData->rowLoopOfFormerBlock +
                 mixes01Local = mixesQue01.DeQue<float>();
                 ReduceSumARAPerf(mixes01ReduceLocal, mixes01Local, NUM_TWO, stage1UsedCoreNum,
                 curRowFactor * tilingData->hcMultAlign);
+                int64_t outputRow = stage2BlockIdx * tilingData->rowOfFormerBlock +
+                    rowOuterIdx * tilingData->stage2RowFactor;
+                if constexpr (delayedPre) {
+                    for (int64_t row = 0; row < curRowFactor; ++row) {
+                        CopyDiagnostic(mixes01ReduceLocal[row * tilingData->hcMultAlign],
+                            projectionGm[(outputRow + row) * tilingData->hcMix], 1, tilingData->hcMult);
+                        CopyDiagnostic(mixes01ReduceLocal[
+                            (tilingData->stage2RowFactor + row) * tilingData->hcMultAlign],
+                            projectionGm[(outputRow + row) * tilingData->hcMix + tilingData->hcMult],
+                            1, tilingData->hcMult);
+                    }
+                }
                 ProcessPre(mixes01ReduceLocal, mixes01ReduceLocal, hcBase0Local, rsqrtLocal,
                 rowBrcbLocal0, hcBrcbLocal1, hcScaleGm.GetValue(0), tilingData->hcEps,
                 curRowFactor, tilingData->hcMult);
+                LocalTensor<float> preForY = mixes01ReduceLocal;
+                if constexpr (delayedPre) {
+                    CopyDiagnostic(mixes01ReduceLocal, nextPreGm[outputRow * tilingData->hcMult],
+                        curRowFactor, tilingData->hcMult);
+                    preForY = previousPreQue.AllocTensor<float>();
+                    CopyIn(previousPreGm[outputRow * tilingData->hcMult], preForY,
+                        curRowFactor, tilingData->hcMult);
+                    previousPreQue.EnQue(preForY);
+                    preForY = previousPreQue.DeQue<float>();
+                }
                 for (int64_t dLoopIdx = 0; dLoopIdx < tilingData->dLoop; dLoopIdx++) {
                     int64_t curDFactor =
                         (dLoopIdx == tilingData->dLoop - 1) ? tilingData->tailDFactor : tilingData->dFactor;
@@ -404,7 +445,7 @@ int64_t curBsIdxForAll = (stage2BlockIdx * tilingData->rowLoopOfFormerBlock +
                     xQue.template EnQue(xLocal);
                     xLocal = xQue.template DeQue<T>();
                     yLocal = yQue.template AllocTensor<T>();
-                    ProcessY(yLocal, xLocal, mixes01ReduceLocal, hcBrcbLocal1, xCastLocal, yCastLocal, curRowFactor,
+                    ProcessY(yLocal, xLocal, preForY, hcBrcbLocal1, xCastLocal, yCastLocal, curRowFactor,
                                 tilingData->hcMult, curDFactor);
                     xQue.template FreeTensor(xLocal);
                     yQue.template EnQue(yLocal);
@@ -415,6 +456,9 @@ int64_t curBsIdxForAll = (stage2BlockIdx * tilingData->rowLoopOfFormerBlock +
                         dLoopIdx * tilingData->dFactor],
                         curRowFactor, curDFactor, tilingData->d - curDFactor);
                     yQue.template FreeTensor(yLocal);
+                }
+                if constexpr (delayedPre) {
+                    previousPreQue.FreeTensor(preForY);
                 }
                 // post
                 postLocal = postQue.AllocTensor<float>();
@@ -449,6 +493,13 @@ int64_t curBsIdxForAll = (stage2BlockIdx * tilingData->rowLoopOfFormerBlock +
                 ReduceSumARAPerf(mixes02ReduceLocal, mixes2Local, 1, stage1UsedCoreNum,
                 curRowFactor * tilingData->hcMult * tilingData->hcMultAlign);
                 combFragLocal = combFragQue.AllocTensor<float>();
+                if constexpr (delayedPre) {
+                    for (int64_t row = 0; row < curRowFactor; ++row) {
+                        CopyDiagnostic(mixes02ReduceLocal[row * tilingData->hcMult * tilingData->hcMultAlign],
+                            projectionGm[(outputRow + row) * tilingData->hcMix + tilingData->hcMult * NUM_TWO],
+                            tilingData->hcMult, tilingData->hcMult);
+                    }
+                }
 
                 MulABLastDimBrcInline<float, false>(mixes02ReduceLocal, mixes02ReduceLocal,
                 rsqrtLocal, rowBrcbLocal0, curRowFactor,
@@ -499,8 +550,76 @@ int64_t curBsIdxForAll = (stage2BlockIdx * tilingData->rowLoopOfFormerBlock +
     }
 
 private:
+    __aicore__ inline void RefineDelayedRsqrt(int64_t count)
+    {
+        // A3's basic Rsqrt is the vrsqrt estimate, not the high-precision
+        // torch.rsqrt operation. Two FP32 Newton steps recover its precision.
+        constexpr int64_t REFINEMENT_STEPS = 2;
+        constexpr float MAX_FINITE = 0x1.fffffep127f;
+        constexpr float NEWTON_SCALE = -0.5f;
+        constexpr float NEWTON_BIAS = 1.5f;
+        constexpr int64_t COMPARE_REPEAT_FLOATS = 256 / sizeof(float);
+        // These existing buffers are scratch until ProcessPre below. Keep the
+        // mean+epsilon and unrefined result separate from the update workspace.
+        auto meanLocal = rowBrcbLocal0;
+        auto initialLocal = hcBrcbLocal1;
+        auto updateLocal = reduceLocal;
+        auto finiteMask = mixes01ReduceLocal.template ReinterpretCast<uint8_t>();
+        // A3 CompareScalar's count overload floors to whole 256-byte repeats.
+        // rowBrcbBuf0 holds at least 64 floats even for one live row. Initialize
+        // its padded lanes; Newton and Select still operate on live rows only.
+        const int64_t compareCount = CeilAlign(count, COMPARE_REPEAT_FLOATS);
+        Duplicate(meanLocal, 0.0f, compareCount);
+        PipeBarrier<PIPE_V>();
+        Adds(meanLocal, rsqrtLocal, 0.0f, count);
+        PipeBarrier<PIPE_V>();
+        Rsqrt(rsqrtLocal, rsqrtLocal, count);
+        PipeBarrier<PIPE_V>();
+        Adds(initialLocal, rsqrtLocal, 0.0f, count);
+        CompareScalar(finiteMask, meanLocal, MAX_FINITE, CMPMODE::LE, compareCount);
+        PipeBarrier<PIPE_V>();
+        for (int64_t step = 0; step < REFINEMENT_STEPS; ++step) {
+            // Associate as (mean * estimate) * estimate, avoiding an
+            // overflowing estimate squared for small positive mean+epsilon.
+            Mul(updateLocal, meanLocal, rsqrtLocal, count);
+            PipeBarrier<PIPE_V>();
+            Mul(updateLocal, updateLocal, rsqrtLocal, count);
+            PipeBarrier<PIPE_V>();
+            Muls(updateLocal, updateLocal, NEWTON_SCALE, count);
+            PipeBarrier<PIPE_V>();
+            Adds(updateLocal, updateLocal, NEWTON_BIAS, count);
+            PipeBarrier<PIPE_V>();
+            Mul(rsqrtLocal, rsqrtLocal, updateLocal, count);
+            PipeBarrier<PIPE_V>();
+        }
+        // mean+epsilon is positive or nonfinite. Preserve the original
+        // NaN/+Inf result instead of retaining Newton's Inf * zero NaN.
+        Select(rsqrtLocal, finiteMask, rsqrtLocal, initialLocal,
+            SELMODE::VSEL_TENSOR_TENSOR_MODE, count);
+        PipeBarrier<PIPE_V>();
+    }
+
+    // Queue ownership makes each diagnostic copy wait for vector writes and
+    // prevents its buffer from being reused before MTE3 has finished.
+    __aicore__ inline void CopyDiagnostic(const LocalTensor<float> &source,
+        const GlobalTensor<float> &destination, uint16_t rows, uint32_t columns)
+    {
+        auto local = diagnosticQue.AllocTensor<float>();
+        DataCopy(local, source, rows * RoundUp<float>(columns));
+        diagnosticQue.EnQue(local);
+        local = diagnosticQue.DeQue<float>();
+        CopyOut(local, destination, rows, columns);
+        diagnosticQue.FreeTensor(local);
+    }
+
     TPipe *pipe;
     const HcPreTilingData *tilingData;
+    GlobalTensor<float> previousPreGm;
+    GlobalTensor<float> nextPreGm;
+    GlobalTensor<float> projectionGm;
+    GlobalTensor<float> rstdGm;
+    TQue<QuePosition::VECIN, 1> previousPreQue;
+    TQue<QuePosition::VECOUT, 1> diagnosticQue;
     GlobalTensor<float> mixesGm;
     GlobalTensor<float> rsqrtGm;
     GlobalTensor<float> hcScaleGm;

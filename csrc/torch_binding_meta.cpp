@@ -5,6 +5,7 @@
 #include <torch_npu/csrc/framework/OpCommand.h>
 #include <torch_npu/csrc/npu/Module.h>
 #include "utils.h"
+#include "moe/hc_pre_delayed/hc_pre_delayed_torch_adpt.h"
 /*
  * How to write a meta implementation for a custom operator (meta kernel):
  *
@@ -1077,6 +1078,14 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> npu_hc_pre_meta(
     return std::tuple<at::Tensor, at::Tensor, at::Tensor>(y, post, comb_frag);
 }
 
+HcPreDelayedOutputs npu_hc_pre_delayed_meta(
+    const at::Tensor& x, const at::Tensor& fn, const at::Tensor& scale,
+    const at::Tensor& base, const at::Tensor& previous_pre, double norm_eps)
+{
+    check_hc_pre_delayed(x, fn, scale, base, previous_pre, norm_eps);
+    return make_hc_pre_delayed_outputs(x);
+}
+
 void inplace_partial_rotary_mul_meta(
     at::Tensor &x,
     const at::Tensor &r1,
@@ -2082,6 +2091,7 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl("npu_sparse_attn_sharedkv_metadata", &vllm_ascend::meta::npu_sparse_attn_sharedkv_metadata_meta);
     ops.impl("npu_hc_post", &vllm_ascend::meta::npu_hc_post_meta);
     ops.impl("npu_hc_pre_v2", &vllm_ascend::meta::npu_hc_pre_meta);
+    ops.impl("npu_hc_pre_delayed", &vllm_ascend::meta::npu_hc_pre_delayed_meta);
     ops.impl("inplace_partial_rotary_mul", &vllm_ascend::meta::inplace_partial_rotary_mul_meta);
     ops.impl("npu_rms_norm_dynamic_quant", &vllm_ascend::meta::npu_rms_norm_dynamic_quant_meta);
     ops.impl("kv_compress_epilog", &vllm_ascend::meta::kv_compress_epilog_meta);

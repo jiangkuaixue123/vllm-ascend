@@ -8,6 +8,8 @@ tables on the host and uses separate TP attention and DP/EP expert domains.
 """
 
 import json
+import os
+import sys
 from collections.abc import Iterable
 from pathlib import Path
 
@@ -18,6 +20,8 @@ from transformers import AutoTokenizer
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed import (
+    get_dp_group,
+    get_ep_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     get_tp_group,
@@ -33,6 +37,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.model_executor.models.interfaces import SupportsMultiModal
 from vllm.model_executor.models.utils import _merge_multimodal_embeddings
 
+from vllm_ascend.models.common.ops.hc_pre import hc_pre_delayed
 from vllm_ascend.models.common.ops.sequence_parallel import sp_all_gather, sp_shard
 from vllm_ascend.models.deepseek_v41.attention import (
     DeepseekV41Attention,
@@ -101,6 +106,8 @@ class DeepseekV41Block(nn.Module):
     def __init__(self, config, vllm_config, layer_id):
         super().__init__()
         self.config = config
+        # One instance owns the startup record; graph replay does not log again.
+        self._hc_native_witness_pending = layer_id == 0
         prefix = f"layers.{layer_id}"
         self.attn = DeepseekV41Attention(config, vllm_config, layer_id, f"{prefix}.attn")
         self.ffn = DeepseekV41MoE(
@@ -132,17 +139,64 @@ class DeepseekV41Block(nn.Module):
             self.config.hc_sinkhorn_iters,
         )
 
+    def pre_and_mixes(self, x, previous_pre, name, runtime):
+        if getattr(runtime, "decode", None) is not None:
+            record_witness = getattr(self, "_hc_native_witness_pending", False) and (
+                getattr(get_forward_context(), "capturing", False) is True
+            )
+            hf32_before = bool(torch.npu.matmul.allow_hf32) if record_witness else None
+            outputs = hc_pre_delayed(
+                x,
+                getattr(self, f"hc_{name}_fn"),
+                getattr(self, f"hc_{name}_scale"),
+                getattr(self, f"hc_{name}_base"),
+                previous_pre,
+                self.config.rms_norm_eps,
+                self.config.hc_eps,
+                self.config.hc_sinkhorn_iters,
+            )
+            if outputs is not None:
+                if record_witness:
+                    self._record_hc_native_witness(hf32_before)
+                return outputs
+        next_pre, post, comb = self.mixes(x, name)
+        return hc_pre(x, previous_pre), next_pre, post, comb
+
+    def _record_hc_native_witness(self, hf32_before):
+        """Read call-boundary metadata once during an existing capture."""
+        hf32_after = bool(torch.npu.matmul.allow_hf32)
+        binding = sys.modules.get("vllm_ascend.vllm_ascend_C")
+        binding_path = getattr(binding, "__file__", None)
+        record = {
+            "schema": "hc-native-startup-metadata-v1",
+            "phase": "existing_startup_warmup",
+            "context_capturing": True,
+            "pid": os.getpid(),
+            "dp": get_dp_group().rank_in_group,
+            "tp": get_tp_group().rank_in_group,
+            "ep": get_ep_group().rank_in_group,
+            # Observe the existing CANN loader input; this adds no configuration.
+            "effective_custom_opp_path": os.environ.get("ASCEND_CUSTOM_OPP_PATH"),
+            "hf32_before": hf32_before,
+            "hf32_after": hf32_after,
+            # The original call returned; no claim of device completion/sync.
+            "native_call_completed": True,
+            "binding_loaded": str(Path(binding_path).resolve()) if binding_path is not None else None,
+        }
+        self._hc_native_witness_pending = False
+        logger.info("HC_NATIVE_RUNTIME_WITNESS %s", json.dumps(record, sort_keys=True, separators=(",", ":")))
+
     def forward(self, hidden_states, pre_mix, runtime, decode_mask=None, image_mask=None):
         if hidden_states.shape[0] == 0:
             # Other DP replicas can be active. Participate in every expert
             # collective while avoiding empty NPU GEMMs and TP reductions.
             self.ffn(hidden_states.new_empty((0, self.config.hidden_size)))
             return hidden_states, pre_mix
-        attn_pre, post, comb = self.mixes(hidden_states, "attn")
-        attended = self.attn(self.attn_norm(hc_pre(hidden_states, pre_mix)), runtime)
+        attn_input, attn_pre, post, comb = self.pre_and_mixes(hidden_states, pre_mix, "attn", runtime)
+        attended = self.attn(self.attn_norm(attn_input), runtime)
         hidden_states = hc_post(attended, hidden_states, post, comb)
-        ffn_pre, post, comb = self.mixes(hidden_states, "ffn")
-        ffn_input = self.ffn_norm(hc_pre(hidden_states, attn_pre))
+        ffn_input, ffn_pre, post, comb = self.pre_and_mixes(hidden_states, attn_pre, "ffn", runtime)
+        ffn_input = self.ffn_norm(ffn_input)
         if getattr(runtime, "decode", None) is not None:
             output = self.ffn.forward_decode(ffn_input, runtime.decode.active if decode_mask is None else decode_mask)
         elif image_mask is not None:

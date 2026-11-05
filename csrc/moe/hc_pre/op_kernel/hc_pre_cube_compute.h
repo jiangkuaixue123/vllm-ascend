@@ -45,9 +45,12 @@ struct MmParams {
     bool isLastK;
     bool isFirstK;
 };
-#define HC_PRE_CUBE_COMPUTE_TEMPLATE_PARAM template <bool enableSquareSum>
+template <bool enableSquareSum, bool strictFp32 = false>
+class HcCubeCompute;
 
-#define HC_PRE_CUBE_COMPUTE_TEMPLATE_CLASS HcCubeCompute<enableSquareSum>
+#define HC_PRE_CUBE_COMPUTE_TEMPLATE_PARAM template <bool enableSquareSum, bool strictFp32>
+
+#define HC_PRE_CUBE_COMPUTE_TEMPLATE_CLASS HcCubeCompute<enableSquareSum, strictFp32>
 
 HC_PRE_CUBE_COMPUTE_TEMPLATE_PARAM
 class HcCubeCompute {
@@ -420,6 +423,10 @@ __aicore__ inline void HC_PRE_CUBE_COMPUTE_TEMPLATE_CLASS::MmadA2(
 {
     SetFlag<HardEvent::MTE1_M>(MTE1_M_EVENT);
     WaitFlag<HardEvent::MTE1_M>(MTE1_M_EVENT);
+    if constexpr (strictFp32) {
+        AscendC::SetHF32Mode(0);
+        AscendC::SetHF32TransMode(0);
+    }
     for (uint64_t mL0Offset = 0; mL0Offset < mmParams.curML1; mL0Offset += BLOCK_CUBE) {
         MmadParams mmadParams;
         mmadParams.m = BLOCK_CUBE;
@@ -459,8 +466,14 @@ __aicore__ inline void HC_PRE_CUBE_COMPUTE_TEMPLATE_CLASS::MmadAB(
 {
     SetFlag<HardEvent::MTE1_M>(MTE1_M_EVENT);
     WaitFlag<HardEvent::MTE1_M>(MTE1_M_EVENT);
-    AscendC::SetHF32Mode(1);
-    AscendC::SetHF32TransMode(1);
+    // Delayed-pre preserves the FP32 weight mantissa; the legacy mode is unchanged.
+    if constexpr (strictFp32) {
+        AscendC::SetHF32Mode(0);
+        AscendC::SetHF32TransMode(0);
+    } else {
+        AscendC::SetHF32Mode(1);
+        AscendC::SetHF32TransMode(1);
+    }
     MmadParams mmadParams;
     mmadParams.m = CeilAlign(mmParams.curML1, BLOCK_CUBE);
     mmadParams.n = mmParams.curNL1;
