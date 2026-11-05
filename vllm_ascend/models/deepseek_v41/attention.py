@@ -9,6 +9,7 @@ replay updates positions, slots and live-row masks at fixed addresses.
 """
 
 import math
+import os
 from dataclasses import dataclass, field
 
 import torch
@@ -39,6 +40,7 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 
+from vllm_ascend.models.common.ops.rotary_reuse import DecodeRotaryCache, RotaryFrequencyReference
 from vllm_ascend.utils import AscendDeviceType, enable_custom_op, enable_dsa_cp, enable_sp, get_ascend_device_type
 
 from .attention_ops import (
@@ -657,6 +659,7 @@ class DeepseekV41Runtime:
     decode_candidate_blocks: torch.Tensor | None = None
     decode_candidate_width: int = 0
     slot_arena: DecodeSlotArena | None = None
+    rotary_cache: DecodeRotaryCache = field(default_factory=DecodeRotaryCache)
 
     @classmethod
     def for_decode(cls, metadata: DeepseekV41Metadata):
@@ -784,8 +787,13 @@ class DeepseekV41Attention(nn.Module):
             source_ratio=self.ratio if self.owns_kv else 0,
             token_history=layer_id == 0,
         )
-        self.register_buffer(
-            "frequencies", rotary_frequencies(config, self.ratio > 0).to(self.attn_sink.device), persistent=False
+        # A normal tensor provides a version counter even during inference-only
+        # model construction, allowing reuse to reject later buffer mutations.
+        with torch.inference_mode(False):
+            cpu_frequencies = rotary_frequencies(config, self.ratio > 0)
+            self.register_buffer("frequencies", cpu_frequencies.to(self.attn_sink.device), persistent=False)
+        self.rotary_reference = RotaryFrequencyReference(
+            self.frequencies, tuple(cpu_frequencies.tolist()), self.frequencies._version
         )
         if getattr(vllm_config.compilation_config, "cudagraph_capture_sizes", None):
             capacity = vllm_config.model_config.max_model_len
@@ -793,7 +801,38 @@ class DeepseekV41Attention(nn.Module):
             selected_width = min(config.sliding_window, capacity) + compressed
             self.cache.native_layout = (self.attention_kernel, self.heads, tp if self.dsa_cp else 1, selected_width)
 
-    def rotate(self, x, positions, inverse=False):
+    def rotate(self, x, positions, inverse=False, runtime=None):
+        reference = getattr(self, "rotary_reference", None)
+        if (
+            runtime is not None
+            and reference is not None
+            and x.device.type == "npu"
+            and x.dtype == torch.bfloat16
+            and x.ndim in (3, 4)
+            and x.shape[0] == 1
+            and x.numel() > 0
+            and x.shape[-1] in _PARTIAL_ROPE_HEAD_DIMS
+            and self.rope_dim == _PARTIAL_ROPE_DIM
+            and positions.shape == (x.shape[1],)
+            and self.frequencies.shape == (self.rope_dim // 2,)
+            and self.frequencies.dtype == torch.float32
+            and x.is_contiguous()
+            and torch.is_inference_mode_enabled()
+            and enable_custom_op()
+            and hasattr(torch.ops._C_ascend, "inplace_partial_rotary_mul")
+        ):
+            factors = runtime.rotary_cache.factors(positions, self.frequencies, reference)
+            if factors is not None:
+                cosine, sine, inverse_sine = factors
+                torch.ops._C_ascend.inplace_partial_rotary_mul(
+                    x.view(x.shape[1], 1, -1, x.shape[-1]),
+                    cosine,
+                    inverse_sine if inverse else sine,
+                    rotary_mode="interleave",
+                    partial_slice=[x.shape[-1] - self.rope_dim, x.shape[-1]],
+                )
+                logger.info_once("ROTARY_REUSE_RUNTIME pid=%d", os.getpid(), scope="process")
+                return x
         phases = positions.float().unsqueeze(-1) * self.frequencies
         if (
             x.device.type == "npu"
@@ -945,10 +984,10 @@ class DeepseekV41Attention(nn.Module):
             scores = self.cache.decode_read(md, group_pos, 1, 0, dim)
             raw = (values * scores.softmax(1)).sum(1).to(x.dtype)
         latent = self.compressor.norm(raw)
-        group_start = (pos + 1 - ratio).clamp_min(0)
+        group_start = runtime.rotary_cache.group_start(pos, ratio)
         keys = self.indexer.k_norm(self.indexer.wk(latent))
-        self.rotate(keys.unsqueeze(0), group_start)
-        self.rotate(latent.unsqueeze(0), group_start)
+        self.rotate(keys.unsqueeze(0), group_start, runtime=runtime)
+        self.rotate(latent.unsqueeze(0), group_start, runtime=runtime)
         keys = fp4_quant_dequant(keys, 32, scale_format="e8m0")
         latent = fp4_quant_dequant(latent, 16, scale_format="e4m3")
         self.cache.decode_write(md, latent, 0, dim, complete)
@@ -971,7 +1010,7 @@ class DeepseekV41Attention(nn.Module):
         groups = torch.arange(capacity, device=x.device).unsqueeze(0)
         indexer = self.indexer
         q = indexer.wq_b(qr)[0].view(-1, self.index_heads, self.config.index_head_dim)
-        self.rotate(q.unsqueeze(0), pos)
+        self.rotate(q.unsqueeze(0), pos, runtime=runtime)
         q = fp4_quant_dequant(q, 32, scale_format="e8m0")
         weights = indexer.weights_proj(x)[0] * (self.config.index_head_dim**-0.5 * self.config.index_n_heads**-0.5)
         scores = None
@@ -1178,19 +1217,20 @@ class DeepseekV41Attention(nn.Module):
         return selected, ids
 
     def _decode_forward(self, local_states, runtime):
+        runtime.rotary_cache.begin_layer(self.layer_id)
         full_md = self.cache.metadata().decode
         gathered, offset = self._sequence_inputs(local_states, "uniform_decode")
         if full_md is None or gathered.shape[0] != full_md.active.shape[0]:
             raise ValueError("V4.1 graph token rows must match the decode metadata bucket")
         local_md = full_md.shard(offset, local_states.shape[0]) if self.sequence_group is not None else full_md
         x, md = (local_states, local_md) if self.dsa_cp else (gathered, full_md)
-        full_pos = (full_md.seq_lens - 1).clamp_min(0)
-        pos = full_pos[offset : offset + x.shape[0]] if self.dsa_cp else full_pos
+        full_pos = runtime.rotary_cache.positions(full_md.seq_lens)
+        pos = runtime.rotary_cache.shard(full_pos, offset, x.shape[0]) if self.dsa_cp else full_pos
         qr = self.q_norm(self.wq_a(x)[0])
         q = self.wq_b(qr)[0].view(x.shape[0], self.heads, self.dim)
         raw = self.kv_norm(self.wkv(gathered)[0])
-        self.rotate(q.unsqueeze(0), pos)
-        self.rotate(raw.unsqueeze(0), full_pos)
+        self.rotate(q.unsqueeze(0), pos, runtime=runtime)
+        self.rotate(raw.unsqueeze(0), full_pos, runtime=runtime)
         self.cache.decode_write(full_md, fp8_quant_dequant(raw, 32), 0, 0, full_md.active)
         extra = 0
         if self.ratio:
@@ -1221,7 +1261,7 @@ class DeepseekV41Attention(nn.Module):
                 f"ratio={self.ratio} refresh={int(refresh)}",
                 scope="process",
             )
-        self.rotate(attended.unsqueeze(0), pos, inverse=True)
+        self.rotate(attended.unsqueeze(0), pos, inverse=True, runtime=runtime)
         output = self._project_output(attended, x.dtype)
         return torch.where(local_md.active[:, None], output, 0)
 
