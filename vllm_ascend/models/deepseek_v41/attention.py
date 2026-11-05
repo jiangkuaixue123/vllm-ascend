@@ -1027,6 +1027,7 @@ class DeepseekV41Attention(nn.Module):
             field = cache.field(1, self.dim, self.config.index_head_dim)
             if supports_paged_index_scores(q, field, weights, runtime.source_decode, md, self.ratio, cache.block_size):
                 scores = paged_index_scores(q, field, weights, runtime.source_decode, md, self.ratio, cache.block_size)
+                logger.info_once("INDEX_PAGE_TILE_RUNTIME pid=%d", os.getpid(), scope="process")
                 logger.info_once(
                     "V4.1 paged decode index scores rows=%d capacity=%d ratio=%d",
                     q.shape[0],

@@ -7,7 +7,6 @@ from vllm.triton_utils import tl, triton
 
 from vllm_ascend.ops.triton.triton_utils import get_aicore_num
 
-_TILE_KEYS = 64
 _BLOCK_SIZE = 128
 _INDEX_HEADS = 32
 _INDEX_DIM = 128
@@ -48,8 +47,8 @@ def _paged_index_score(
     for start in range(lane * N, count, LANES * N):
         ids = start + tl.arange(0, N)
         ends = (ids + 1) * RATIO - 1
-        # A 64-key tile at ratio 1 or 2 is entirely inside one logical page
-        # of 128 tokens. It therefore has a single physical page mapping.
+        # Each tile spans one logical page: 128 keys at ratio 1, 64 at ratio 2.
+        # Its first key identifies the single physical page mapping.
         page = tl.load(source_table + row * TABLE_STRIDE + (start * RATIO) // PAGE).to(tl.int64)
         slots = page * PAGE + ends % PAGE
         valid = live_source & (ends < source_length) & (slots >= 0) & (slots < PHYSICAL_ROWS) & (ids < count)
@@ -135,7 +134,7 @@ def paged_index_scores(q, field, weights, source_md, query_md, ratio, block_size
             LANES=lanes,
             D=dim,
             H=heads,
-            N=_TILE_KEYS,
+            N=_BLOCK_SIZE // ratio,
             PAGE=block_size,
         )
     return output
