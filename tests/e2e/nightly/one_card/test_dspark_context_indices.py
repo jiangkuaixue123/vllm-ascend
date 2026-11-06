@@ -1,0 +1,184 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Real context-write dispatch with independent cache fields and a controlled producer."""
+
+import statistics
+import time
+from types import SimpleNamespace
+
+import pytest
+import torch
+import torch.nn.functional as F
+
+from vllm_ascend.models.deepseek_v41 import dspark
+from vllm_ascend.models.deepseek_v41.attention import DeepseekV41Cache
+
+WIDTH = 512
+HIDDEN = 5120
+STAGES = 3
+CALLS = 12
+REPEATS = 5
+
+
+class Cache:
+    write_slots = DeepseekV41Cache.write_slots
+
+    def __init__(self, backing):
+        self.backing = backing
+
+    def field(self, bank, offset, width):
+        assert bank == offset == 0 and width == WIDTH
+        return self.backing[:, 8 : 8 + width]
+
+
+class Attention:
+    store_context = dspark.DSparkAttention.store_context
+
+    def __init__(self, backing, kv, weight):
+        self.cache, self.kv, self.weight = Cache(backing), kv, weight
+
+    def project_kv(self, states, positions):
+        # Timings include a controlled BF16 projection producer, not a loaded model.
+        return self.kv if self.weight is None else F.linear(states, self.weight)
+
+
+def setup(rows, shared, *, projection=False, device="npu"):
+    if device == "npu":
+        torch.npu.set_device(0)
+    torch.manual_seed(20261106)
+    states = torch.randn(rows, HIDDEN, device=device, dtype=torch.bfloat16)
+    positions = torch.arange(rows, device=device)
+    mappings, parents, candidates = [], [], []
+    slot_backing = None
+    for stage in range(STAGES):
+        if stage == 0 or not shared:
+            slot_backing = torch.arange(rows + 1, device=device, dtype=torch.int64) + stage
+            slot_backing[1] = 0
+            slot_backing[2::3] = -1
+        mappings.append(slot_backing[1:])
+        backing = torch.randn(rows * 2 + 8, WIDTH + 16, device=device, dtype=torch.bfloat16)
+        kv = torch.randn(rows, WIDTH, device=device, dtype=torch.bfloat16)
+        kv[:, :4] = torch.tensor([0.0, -0.0, float("inf"), float("nan")], device=device, dtype=kv.dtype)
+        weight = torch.randn(WIDTH, HIDDEN, device=device, dtype=torch.bfloat16) if projection else None
+        parents.append(SimpleNamespace(attn=Attention(backing, kv, weight)))
+        candidates.append(SimpleNamespace(attn=Attention(backing.clone(), kv, weight)))
+    return SimpleNamespace(mtp=parents), SimpleNamespace(mtp=candidates), states, positions, mappings
+
+
+def parent(model, states, positions, mappings):
+    for stage, slots in zip(model.mtp, mappings):
+        stage.attn.store_context(states, positions, slots)
+
+
+def candidate(model, states, positions, mappings):
+    dspark.DeepseekV41DSparkForCausalLM.precompute_and_store_context_kv(model, states, positions, mappings)
+
+
+def assert_cache_bits(first, second):
+    for a, b in zip(first.mtp, second.mtp):
+        assert torch.equal(a.attn.cache.backing.cpu().view(torch.int16), b.attn.cache.backing.cpu().view(torch.int16))
+
+
+@pytest.mark.parametrize("rows", [6, 12, 24, 48, 8192])
+@pytest.mark.parametrize("shared", [True, False])
+@torch.inference_mode()
+def test_exact_cache_words_and_refreshed_reject_masks(monkeypatch, rows, shared):
+    monkeypatch.setattr(dspark, "is_draft_dummy", lambda: False)
+    old, new, states, positions, mappings = setup(rows, shared)
+    for step in range(3):
+        if step:
+            for slots in mappings:
+                if step == 1:
+                    slots.fill_(-1)
+                else:
+                    slots.copy_(torch.arange(rows, device=slots.device).flip(0))
+        active, groups = dspark.prepare_context_active_rows(mappings)
+        assert groups == (1 if shared else STAGES)
+        if shared:
+            assert active[0] is active[1] is active[2]
+        saved = [s.clone() for s in mappings]
+        parent(old, states, positions, mappings)
+        candidate(new, states, positions, mappings)
+        assert_cache_bits(old, new)
+        assert all(torch.equal(s, before) for s, before in zip(mappings, saved))
+
+
+@torch.inference_mode()
+def test_missing_mapping_and_misaligned_rows_keep_errors(monkeypatch):
+    monkeypatch.setattr(dspark, "is_draft_dummy", lambda: False)
+    old, new, states, positions, mappings = setup(6, True)
+    with pytest.raises(RuntimeError, match="Missing cache slots"):
+        candidate(new, states, positions, [None] * STAGES)
+    with pytest.raises(ValueError, match="one context slot"):
+        candidate(new, states, positions, mappings[:1])
+    for function, model in [(parent, old), (candidate, new)]:
+        with pytest.raises(ValueError, match="must align"):
+            function(model, states, positions, [m[:-1] for m in mappings])
+
+
+@torch.inference_mode()
+def test_valid_context_write_needs_no_forward_context(monkeypatch):
+    def no_context():
+        raise AssertionError("Valid slot mappings must not query the forward context")
+
+    monkeypatch.setattr(dspark, "is_draft_dummy", no_context)
+    old, new, states, positions, mappings = setup(6, True)
+    parent(old, states, positions, mappings)
+    candidate(new, states, positions, mappings)
+    assert_cache_bits(old, new)
+
+
+@pytest.mark.parametrize("dummy", [True, False])
+@torch.inference_mode()
+def test_cpu_and_dummy_fallback_preserve_cache(monkeypatch, dummy):
+    monkeypatch.setattr(dspark, "is_draft_dummy", lambda: dummy)
+    old, new, states, positions, mappings = setup(6, True, device="cpu")
+    if dummy:
+        mappings = [None] * STAGES
+    parent(old, states, positions, mappings)
+    candidate(new, states, positions, mappings)
+    assert_cache_bits(old, new)
+
+
+def elapsed(function, model, states, positions, mappings):
+    torch.npu.synchronize()
+    start, end = torch.npu.Event(enable_timing=True), torch.npu.Event(enable_timing=True)
+    begin = time.perf_counter()
+    start.record()
+    for _ in range(CALLS):
+        function(model, states, positions, mappings)
+    end.record()
+    submitted = time.perf_counter()
+    end.synchronize()
+    return 1000 * (submitted - begin), 1000 * (time.perf_counter() - begin), start.elapsed_time(end)
+
+
+@pytest.mark.parametrize("rows", [6, 24, 48])
+@pytest.mark.parametrize("shared", [True, False])
+@torch.inference_mode()
+def test_three_stage_projection_and_write_latency(monkeypatch, rows, shared):
+    monkeypatch.setattr(dspark, "is_draft_dummy", lambda: False)
+    old, new, states, positions, mappings = setup(rows, shared, projection=True)
+    parent(old, states, positions, mappings)
+    candidate(new, states, positions, mappings)
+    assert_cache_bits(old, new)
+    measurements = {"parent": [], "candidate": []}
+    for repeat in range(REPEATS):
+        order = [("parent", parent, old), ("candidate", candidate, new)]
+        if repeat % 2:
+            order.reverse()
+        for name, function, model in order:
+            measurements[name].append(elapsed(function, model, states, positions, mappings))
+    result = {
+        name: tuple(statistics.median(values) for values in zip(*samples)) for name, samples in measurements.items()
+    }
+    print(
+        {
+            "rows": rows,
+            "shared_slot_view": shared,
+            "three_stage_calls": CALLS,
+            "metrics": ["host_submit_ms", "wall_ready_ms", "device_ms"],
+            **result,
+        }
+    )
+    assert all(t > 0 for values in result.values() for t in values)
