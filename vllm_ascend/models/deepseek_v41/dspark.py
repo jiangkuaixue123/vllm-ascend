@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """DeepSeek V4.1's three trained DSpark stages, stored under checkpoint mtp.*."""
 
-import hashlib
 import json
 import os
 import time
@@ -19,6 +18,8 @@ from vllm.model_executor.layers.linear import ColumnParallelLinear, ReplicatedLi
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead, VocabParallelEmbedding
 from vllm.v1.attention.backend import AttentionCGSupport, AttentionMetadataBuilder
+
+from vllm_ascend.models.common.ops.dspark_markov_graph import DSparkMarkovGraph
 
 from .attention import (
     DeepseekV41Attention,
@@ -256,7 +257,6 @@ class DSparkAttention(DeepseekV41Attention):
             "host_monotonic_ns": time.monotonic_ns(),
             "cache_prefix": self.cache.prefix,
             "source_path": str(source),
-            "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
             "batch": len(metadata.requests),
             "num_actual_tokens": metadata.num_actual_tokens,
             "window_size": self.config.sliding_window,
@@ -413,6 +413,7 @@ class DeepseekV41DSparkForCausalLM(nn.Module):
         self.mtp[-1].confidence_head = DSparkConfidence(config)
         self.logits_processor = LogitsProcessor(config.vocab_size)
         self.model_path = Path(vllm_config.model_config.model)
+        self._markov_graph = DSparkMarkovGraph()
 
     def embed_input_ids(self, input_ids):
         return self.mtp[0].embed(input_ids)
@@ -462,6 +463,17 @@ class DeepseekV41DSparkForCausalLM(nn.Module):
 
     def markov_bias(self, embedding):
         return self.mtp[-1].markov_head.head(embedding.float())
+
+    def try_sample_greedy_markov(self, logits, draft_ids):
+        if is_draft_dummy():
+            return False
+        markov = self.mtp[-1].markov_head
+        sampled = self._markov_graph(logits, draft_ids, markov.embed, markov.head)
+        if sampled:
+            logger.info_once(
+                "DSPARK_MARKOV_GRAPH_RUNTIME pid=%d batch=%d", os.getpid(), logits.shape[0], scope="process"
+            )
+        return sampled
 
     def compute_confidence(self, hidden_states, markov_embed):
         features = torch.cat((hidden_states, markov_embed), dim=-1)
