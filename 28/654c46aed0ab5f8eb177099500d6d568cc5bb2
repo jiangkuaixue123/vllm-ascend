@@ -1,0 +1,24 @@
+vllm_ascend/ops/triton/deepseek_v41_slot_arena.py
+  s_6eab87361519a8::t_dcfdd35216578d 5-6,8,20-21,81-89,91-96,101-110,165-168
+  s_6eab87361519a8::t_24bc8d10ffab1a 97-100
+tests/e2e/nightly/one_card/test_target_slot_rows.py
+  s_6eab87361519a8::t_f57e27de4bfb2d 1-11,13-24,28-49,53-89,100-162
+  s_6eab87361519a8::t_dcfdd35216578d 12,90-99
+  s_6eab87361519a8::t_33bef58f18d379 25-27,50-52,163-170
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "28654c46aed0ab5f8eb177099500d6d568cc5bb2",
+  "prompts": {},
+  "sessions": {
+    "s_6eab87361519a8": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1ac13-1fd0-7670-ae84-d58acaf2730c",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "jiangkuaixue123 <jiangxiaozhou111@163.com>"
+    }
+  }
+}
