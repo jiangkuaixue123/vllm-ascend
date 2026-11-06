@@ -1362,20 +1362,25 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 draft_token_ids = self._dspark_draft_buffer[:num_blk]
                 draft_token_ids[:, 0].copy_(self._dspark_seed_buffer[:num_blk])
                 dspark_probs_list: list[torch.Tensor] = []
-                for idx in range(self.num_speculative_tokens):
-                    markov_emb = self.model.markov_embed(draft_token_ids[:, idx])
-                    logits_bias = self.model.markov_bias(markov_emb)
-                    logits[:, idx].add_(logits_bias)
-                    if use_probabilistic:
-                        # Use probabilistic sampling instead of argmax.
-                        # logits[:, idx] is [num_blk, V], matching
-                        # batch_size for per-request temperature.
-                        token_ids, probs = self._sample_draft_from_logits(logits[:, idx], sampling_metadata)
-                        draft_token_ids[:, idx + 1].copy_(token_ids)
-                        if probs is not None:
-                            dspark_probs_list.append(probs)
-                    else:
-                        draft_token_ids[:, idx + 1].copy_(logits[:, idx].argmax(dim=-1))
+                graph_sampler = getattr(self.model, "try_sample_greedy_markov", None)
+                sampled_by_graph = (
+                    not use_probabilistic and graph_sampler is not None and graph_sampler(logits, draft_token_ids)
+                )
+                if not sampled_by_graph:
+                    for idx in range(self.num_speculative_tokens):
+                        markov_emb = self.model.markov_embed(draft_token_ids[:, idx])
+                        logits_bias = self.model.markov_bias(markov_emb)
+                        logits[:, idx].add_(logits_bias)
+                        if use_probabilistic:
+                            # Use probabilistic sampling instead of argmax.
+                            # logits[:, idx] is [num_blk, V], matching
+                            # batch_size for per-request temperature.
+                            token_ids, probs = self._sample_draft_from_logits(logits[:, idx], sampling_metadata)
+                            draft_token_ids[:, idx + 1].copy_(token_ids)
+                            if probs is not None:
+                                dspark_probs_list.append(probs)
+                        else:
+                            draft_token_ids[:, idx + 1].copy_(logits[:, idx].argmax(dim=-1))
                 if use_probabilistic and dspark_probs_list:
                     # Stack [K x [num_blk, V]] -> [num_blk, K, V] ->
                     # [num_blk * K, V] to match early_exit view logic.
