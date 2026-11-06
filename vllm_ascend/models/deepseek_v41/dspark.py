@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """DeepSeek V4.1's three trained DSpark stages, stored under checkpoint mtp.*."""
 
-import hashlib
 import json
 import os
 import time
@@ -98,11 +97,9 @@ def ring_positions(context_length, window_size, *, device):
 def block_attention(q, context_kv, query_kv, sink, scale, kernel=None):
     """Every query sees the accepted context and every KV of its *own* block."""
     kv = torch.cat((context_kv, query_kv), dim=0).unsqueeze(0)
-    indices = torch.arange(kv.shape[1], dtype=torch.int32, device=q.device)
-    indices = indices.view(1, 1, -1).expand(1, q.shape[0], -1)
     if kernel is None:
         kernel = DeepseekV41NativeAttention()
-    return kernel(q.unsqueeze(0), kv, sink, indices, scale, mode="SWA draft bidirectional")[0]
+    return kernel(q.unsqueeze(0), kv, sink, None, scale, mode="SWA draft bidirectional")[0]
 
 
 def try_stage_block_inputs(q, query_kv, metadata, cache, *, window_size, block_size, dtype):
@@ -167,6 +164,18 @@ def try_stage_block_inputs(q, query_kv, metadata, cache, *, window_size, block_s
     return kv, indices
 
 
+def prepare_context_active_rows(slot_mappings):
+    """Reuse indices only for identical views, and only within this invocation."""
+    unique = {}
+    rows = []
+    for slots in slot_mappings:
+        key = (slots.device, slots.dtype, slots.data_ptr(), tuple(slots.shape), slots.stride())
+        if key not in unique:
+            unique[key] = (slots >= 0).nonzero().flatten()
+        rows.append(unique[key])
+    return rows, len(unique)
+
+
 def is_draft_dummy():
     ctx = get_forward_context()
     return getattr(ctx, "in_profile_run", False) or (
@@ -227,14 +236,15 @@ class DSparkAttention(DeepseekV41Attention):
         self.rotate(kv.unsqueeze(0), positions.reshape(-1))
         return fp8_quant_dequant(kv, 32)
 
-    def store_context(self, states, positions, slots):
+    def store_context(self, states, positions, slots, *, active=None):
         kv = self.project_kv(states, positions)
         if slots is None:
             return
         if slots.shape != positions.shape or states.shape[0] != slots.numel():
             raise ValueError("DSpark context positions, cache slots and hidden rows must align")
         # Slots for discarded / padded context tokens must never change slot 0.
-        active = (slots >= 0).nonzero().flatten()
+        if active is None:
+            active = (slots >= 0).nonzero().flatten()
         self.cache.write_slots(slots.index_select(0, active), kv.index_select(0, active), 0, 0)
 
     def _record_staging_b4_witness(self, q, query_kv, metadata, staged):
@@ -256,7 +266,6 @@ class DSparkAttention(DeepseekV41Attention):
             "host_monotonic_ns": time.monotonic_ns(),
             "cache_prefix": self.cache.prefix,
             "source_path": str(source),
-            "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
             "batch": len(metadata.requests),
             "num_actual_tokens": metadata.num_actual_tokens,
             "window_size": self.config.sliding_window,
@@ -309,12 +318,12 @@ class DSparkAttention(DeepseekV41Attention):
                         q[rows], context, query_kv[rows], self.attn_sink, self.dim**-0.5, self.attention_kernel
                     )
                 else:
-                    kv, indices = staged
+                    kv, _ = staged
                     attended[rows] = self.attention_kernel(
                         q[rows].unsqueeze(0),
                         kv[row : row + 1],
                         self.attn_sink,
-                        indices,
+                        None,
                         self.dim**-0.5,
                         mode="SWA draft bidirectional",
                     )[0]
@@ -437,8 +446,26 @@ class DeepseekV41DSparkForCausalLM(nn.Module):
             raise ValueError("DSpark needs one context slot mapping per stage")
         if any(slots is None for slots in context_slot_mapping) and not is_draft_dummy():
             raise RuntimeError("Missing cache slots for a real DSpark stage")
-        for stage, slots in zip(self.mtp, context_slot_mapping):
-            stage.attn.store_context(context_states, context_positions, slots)
+        if (
+            context_states.device.type == "npu"
+            and torch.is_inference_mode_enabled()
+            and all(slots is not None for slots in context_slot_mapping)
+        ):
+            # Resolve dynamic row counts before queuing the independent KV
+            # projections. Different physical groups retain their own indices.
+            active_rows, unique_views = prepare_context_active_rows(context_slot_mapping)
+            logger.info_once(
+                "DSPARK_CONTEXT_INDICES_RUNTIME pid=%d unique_views=%d stages=%d",
+                os.getpid(),
+                unique_views,
+                len(self.mtp),
+                scope="process",
+            )
+            for stage, slots, active in zip(self.mtp, context_slot_mapping, active_rows):
+                stage.attn.store_context(context_states, context_positions, slots, active=active)
+        else:
+            for stage, slots in zip(self.mtp, context_slot_mapping):
+                stage.attn.store_context(context_states, context_positions, slots)
 
     def forward(self, input_ids, positions, inputs_embeds=None, **kwargs):
         hidden = self.embed_input_ids(input_ids) if inputs_embeds is None else inputs_embeds
