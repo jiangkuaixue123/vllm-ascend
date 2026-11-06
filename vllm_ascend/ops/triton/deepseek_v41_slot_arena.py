@@ -27,6 +27,7 @@ def _gather(
     table,
     lens,
     active,
+    live_rows,
     topk,
     out,
     ROWS: tl.constexpr,
@@ -40,6 +41,7 @@ def _gather(
     RATIO: tl.constexpr,
     RAW: tl.constexpr,
     PROMOTE: tl.constexpr,
+    BF16_OUT: tl.constexpr,
     TILE: tl.constexpr,
     D: tl.constexpr,
 ):
@@ -71,6 +73,15 @@ def _gather(
         valid = live & (pos >= 0) & (slot >= 0) & (slot < PHYS)
         address = tl.where(valid, slot, 0) * STRIDE
         value = tl.load(field + address[:, None] + dims[None, :], mask=valid[:, None], other=0)
+        if BF16_OUT:
+            # Native BF16 Where canonicalizes every NaN to this positive payload.
+            BF16_ABSOLUTE_MASK: tl.constexpr = 0x7FFF
+            BF16_INFINITY: tl.constexpr = 0x7F80
+            BF16_CANONICAL_NAN: tl.constexpr = 0x7FFF
+            absolute_word = value.to(tl.int32) & BF16_ABSOLUTE_MASK
+            value = tl.where(absolute_word > BF16_INFINITY, BF16_CANONICAL_NAN, value)
+        row_live = tl.load(live_rows + row, mask=ok, other=0) != 0
+        value = tl.where(row_live[:, None], value, 0)
         if PROMOTE:
             value = value.to(tl.int32) << 16
         tl.store(out + flat[:, None] * D + dims[None, :], value, mask=ok[:, None])
@@ -114,13 +125,17 @@ def read(field, metadata, ids, ratio, raw, dtype, destination):
     count = UNION if raw else TOP
     rows = ids.shape[0] // QWIDTH if raw else ids.shape[0]
     bits = torch.int32 if dtype == torch.float32 else torch.int16
-    tmp = torch.empty((rows, count, DIM), dtype=bits, device=field.device)
+    live = metadata.active.view(-1, QWIDTH).any(-1) if raw else metadata.active
+    # The BF16 path preserves cache words and can fill its final arena directly.
+    direct = dtype == torch.bfloat16
+    tmp = destination.view(bits) if direct else torch.empty((rows, count, DIM), dtype=bits, device=field.device)
     grid = (min(triton.cdiv(rows * count, 8), get_vectorcore_num()),)
     _gather[grid](
         field.view(torch.int16 if raw or dtype == torch.bfloat16 else torch.int32),
         metadata.block_table_tensor,
         metadata.seq_lens,
         metadata.active,
+        live,
         ids,
         tmp,
         rows,
@@ -134,12 +149,13 @@ def read(field, metadata, ids, ratio, raw, dtype, destination):
         ratio,
         raw,
         raw and dtype == torch.float32,
+        direct,
         8,
         DIM,
     )
-    # Keep S's stock Where and stock final FP32 -> BF16 conversion, including NPU NaN handling.
-    live = metadata.active.view(-1, QWIDTH).any(-1) if raw else metadata.active
-    destination.copy_(torch.where(live[:, None, None], tmp.view(dtype), 0.0).to(torch.bfloat16))
+    # Keep the native conversion for FP32 cache words, including its NaN handling.
+    if not direct:
+        destination.copy_(tmp.view(dtype).to(torch.bfloat16))
 
 
 def stage(arena, raw, comp, md, src, topk, ratio, refresh):
@@ -166,4 +182,5 @@ def stage(arena, raw, comp, md, src, topk, ratio, refresh):
         md.seq_lens, md.active, topk, ids, rows, cmp_base, topk.stride(0), SLOT_COLUMNS, SLOT_ROWS
     )
     logger.info_once("TARGET_SLOT_ROWS_RUNTIME pid=%d rows=%d", os.getpid(), rows, scope="process")
+    logger.info_once("TARGET_ARENA_DIRECT_RUNTIME pid=%d rows=%d", os.getpid(), rows, scope="process")
     return ids
