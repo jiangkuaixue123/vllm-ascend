@@ -1,0 +1,25 @@
+tests/e2e/nightly/one_card/test_draft_attention_graph.py
+  s_6eab87361519a8::t_2ef795aeb7a1f2 1-234
+tests/ut/models/common/ops/test_draft_attention_graph.py
+  s_6eab87361519a8::t_bde49d019a39b3 1-148
+vllm_ascend/models/common/ops/draft_attention_graph.py
+  s_6eab87361519a8::t_fec772d35ee338 1-170
+vllm_ascend/models/deepseek_v41/dspark.py
+  s_6eab87361519a8::t_b62e1e4bbd39e5 22-23,193-195,286-302
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "ef4dffba6a2935ada55a27f32338357da23f6941",
+  "prompts": {},
+  "sessions": {
+    "s_6eab87361519a8": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1ac13-1fd0-7670-ae84-d58acaf2730c",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "jiangkuaixue123 <jiangxiaozhou111@163.com>"
+    }
+  }
+}
