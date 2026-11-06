@@ -1,0 +1,33 @@
+tests/ut/models/common/ops/test_dspark_markov_graph.py
+  s_6eab87361519a8::t_a6aed9454ed632 102-107,121-123,125-129,132-134
+  s_6eab87361519a8::t_37cf572d55b23f 1-16,18-54,67-101,108-120,124,130-131,135-136
+  s_6eab87361519a8::t_9c96630ea538a1 17,55-66
+vllm_ascend/models/common/ops/dspark_markov_graph.py
+  s_6eab87361519a8::t_9c96630ea538a1 40-41,76
+  s_6eab87361519a8::t_a6aed9454ed632 43
+  s_6eab87361519a8::t_08006fcbe85642 1-39,42,44-75,77-103
+vllm_ascend/models/deepseek_v41/dspark.py
+  s_6eab87361519a8::t_08006fcbe85642 22-23,416,467-476
+  s_6eab87361519a8::t_ca3f5485e2f3b0 477
+vllm_ascend/spec_decode/llm_base_proposer.py
+  s_6eab87361519a8::t_08006fcbe85642 1365-1383
+tests/e2e/nightly/one_card/test_dspark_markov_graph.py
+  s_6eab87361519a8::t_37cf572d55b23f 1-4,6-22,24-152
+  s_6eab87361519a8::t_ca4dc0e7490120 5,23
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "15e471a35f63bb0112340028f969711b7af301e9",
+  "prompts": {},
+  "sessions": {
+    "s_6eab87361519a8": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1ac13-1fd0-7670-ae84-d58acaf2730c",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "jiangkuaixue123 <jiangxiaozhou111@163.com>"
+    }
+  }
+}
