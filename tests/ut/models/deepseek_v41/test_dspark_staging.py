@@ -238,32 +238,32 @@ def witness_fixture(histories, *, dummy=False):
 
 
 def test_witness_first_b4_records_actual_dispatch_once_and_closes():
-    obj, case, records, calls, _, scope = witness_fixture([8192, 8193, 8194, 8195])
+    obj, case, records, calls, _, _scope = witness_fixture([8192, 8193, 8194, 8195])
     positions = torch.arange(20)
     obj.forward(case[1], positions)
-    assert len(records) == 1 and len(calls) == 4
+    assert len(records) == 1 and len(calls) == 1
     record = records[0]
-    assert record["staging_used"] and record["completed_native_calls"] == 4 and record["witness_closed"]
+    assert record["staging_used"] and record["completed_native_calls"] == 1 and record["witness_closed"]
     assert record["cache_prefix"] == "mtp.1.attn.cache" and record["pid"] == os.getpid()
     assert record["q"]["shape"] == [20, 16, 512]
     assert record["staged_kv"]["shape"] == [4, 133, 512]
     assert record["staged_indices"]["shape"] == [1, 5, 133]
     assert record["staged_indices"]["stride"] == [133, 0, 1]
-    assert all(c[0] == (1, 5, 16, 512) and c[1] == (1, 133, 512) for c in calls)
+    assert calls == [((4, 5, 16, 512), (4, 133, 512), (4, 5, 133), "SWA draft bidirectional")]
 
     def unexpected_record(*args):
         raise AssertionError("Closed witness must not build geometry or log")
 
     obj._record_staging_b4_witness = unexpected_record
     obj.forward(case[1], positions)
-    assert len(records) == 1 and len(calls) == 8 and not obj._staging_b4_witness_pending
+    assert len(records) == 1 and len(calls) == 2 and not obj._staging_b4_witness_pending
 
 
 @pytest.mark.parametrize("batch", [1, 2, 8])
 def test_witness_other_batches_do_not_record(batch):
     obj, case, records, calls, _, _ = witness_fixture([8192 + n for n in range(batch)])
     obj.forward(case[1], torch.arange(batch * 5))
-    assert not records and len(calls) == batch and obj._staging_b4_witness_pending
+    assert not records and len(calls) == 1 and obj._staging_b4_witness_pending
 
 
 def test_witness_b4_fallback_is_recorded_once_without_cherry_picking():
@@ -273,7 +273,7 @@ def test_witness_b4_fallback_is_recorded_once_without_cherry_picking():
     assert records[0]["staged_kv"] is None and records[0]["staged_indices"] is None
     case[2].requests[0].start_pos = 8195
     obj.forward(case[1], torch.arange(20))
-    assert len(records) == 1 and len(calls) == 8
+    assert len(records) == 1 and len(calls) == 5
 
 
 def test_witness_dummy_and_prefill_store_context_do_not_record():
@@ -285,7 +285,7 @@ def test_witness_dummy_and_prefill_store_context_do_not_record():
 
 
 def test_witness_never_certifies_a_partial_native_loop():
-    obj, case, records, calls, _, _ = witness_fixture([8192, 8193, 8194, 8195])
+    obj, case, records, calls, _, _ = witness_fixture([0, 8193, 8194, 8195])
     real_kernel = obj.attention_kernel
 
     def fail_second(*args, **kwargs):
@@ -315,3 +315,34 @@ def test_witness_is_host_only_and_state_is_per_instance():
         and any(isinstance(t, ast.Attribute) and t.attr == "_staging_b4_witness_pending" for t in n.targets)
         for n in init.body
     )
+
+
+@pytest.mark.parametrize("batch", [2, 4, 8])
+def test_batched_forward_preserves_request_rows(batch):
+    obj, case, _, calls, _, _ = witness_fixture([8192 + n for n in range(batch)])
+    q = case[0]
+
+    def echo_queries(query, kv, sink, ids, scale, *, mode):
+        calls.append(query.shape)
+        assert query.shape == (batch, 5, 16, 512)
+        assert ids.shape == (batch, 5, 133)
+        # Distinct request contents expose accidental broadcasting or reordering.
+        assert torch.equal(query.reshape_as(q), q)
+        return query.clone()
+
+    obj.attention_kernel = echo_queries
+    output = obj.forward(case[1], torch.arange(batch * 5))
+    assert torch.equal(output, q)
+    assert len(calls) == 1
+
+
+def test_batched_failure_does_not_record_success():
+    obj, case, records, calls, _, _ = witness_fixture([8192, 8193, 8194, 8195])
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("synthetic batched native failure")
+
+    obj.attention_kernel = fail
+    with pytest.raises(RuntimeError, match="synthetic batched native failure"):
+        obj.forward(case[1], torch.arange(20))
+    assert not records and not calls and obj._staging_b4_witness_pending
