@@ -43,6 +43,12 @@ def hc_split_sinkhorn(
         raise ValueError("HC scale must have three coefficients")
 
     mixes, scale, base = mixes.float(), scale.float(), base.float()
+    if mixes.device.type == "npu":
+        from vllm_ascend.models.common.ops.hc_gate_fused import try_hc_gate_fused
+
+        fused = try_hc_gate_fused(mixes, scale, base, hc_mult, sinkhorn_iters, eps)
+        if fused is not None:
+            return fused
     pre = torch.sigmoid(mixes[..., :hc_mult] * scale[0] + base[:hc_mult]) + eps
     post = 2 * torch.sigmoid(mixes[..., hc_mult : 2 * hc_mult] * scale[1] + base[hc_mult : 2 * hc_mult])
     comb = (mixes[..., 2 * hc_mult :] * scale[2] + base[2 * hc_mult :]).unflatten(-1, (hc_mult, hc_mult))
