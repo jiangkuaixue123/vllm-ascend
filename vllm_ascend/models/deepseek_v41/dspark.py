@@ -19,6 +19,8 @@ from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead, VocabParallelEmbedding
 from vllm.v1.attention.backend import AttentionCGSupport, AttentionMetadataBuilder
 
+from vllm_ascend.models.common.ops.draft_hc_graph import DraftHCMixGraph
+
 from .attention import (
     DeepseekV41Attention,
     DeepseekV41Backend,
@@ -373,6 +375,27 @@ class DSparkStage(DeepseekV41Block):
             )
             self.register_parameter(f"hc_{part}_scale", nn.Parameter(torch.empty(3, dtype=torch.float32)))
             self.register_parameter(f"hc_{part}_base", nn.Parameter(torch.empty(width, dtype=torch.float32)))
+
+        self._draft_hc_graphs = {
+            part: DraftHCMixGraph(config.rms_norm_eps, config.hc_eps, config.hc_sinkhorn_iters)
+            for part in ("attn", "ffn")
+        }
+
+    def pre_and_mixes(self, x, previous_pre, name, runtime):
+        if x.device.type == "npu" and torch.is_inference_mode_enabled() and not is_draft_dummy():
+            outputs = self._draft_hc_graphs[name](
+                x,
+                previous_pre,
+                getattr(self, f"hc_{name}_fn"),
+                getattr(self, f"hc_{name}_scale"),
+                getattr(self, f"hc_{name}_base"),
+            )
+            if outputs is not None:
+                logger.info_once(
+                    "DSPARK_HC_SINGLE_GRAPH_RUNTIME pid=%d rows=%d", os.getpid(), x.shape[0], scope="process"
+                )
+                return outputs
+        return super().pre_and_mixes(x, previous_pre, name, runtime)
 
 
 class DSparkMarkov(nn.Module):
