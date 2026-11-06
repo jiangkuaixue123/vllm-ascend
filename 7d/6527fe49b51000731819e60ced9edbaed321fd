@@ -1,0 +1,21 @@
+tests/e2e/nightly/one_card/test_target_arena_direct.py
+  s_6eab87361519a8::t_9a589eb24a38cd 1-261
+vllm_ascend/ops/triton/deepseek_v41_slot_arena.py
+  s_6eab87361519a8::t_fbd9c7b20fd92f 30,44,76-84,128-131,138,152,156-158,185
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "7d6527fe49b51000731819e60ced9edbaed321fd",
+  "prompts": {},
+  "sessions": {
+    "s_6eab87361519a8": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1ac13-1fd0-7670-ae84-d58acaf2730c",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "jiangkuaixue123 <jiangxiaozhou111@163.com>"
+    }
+  }
+}
