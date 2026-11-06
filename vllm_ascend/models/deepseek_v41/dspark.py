@@ -150,19 +150,29 @@ def try_stage_block_inputs(q, query_kv, metadata, cache, *, window_size, block_s
     ):
         return None
 
-    # The accepted history was already copied by DSparkMetadataBuilder. This one
-    # small H2D vector replaces per-request ring construction; include it in timing.
-    starts = torch.tensor([span.start_pos for span in metadata.requests], dtype=torch.long, device=q.device)
-    ring_slots = torch.arange(window_size, device=q.device)
-    history = starts[:, None] - 1 - (starts[:, None] - 1 - ring_slots).remainder(window_size)
-    pages = table[:batch].gather(1, history // cache.block_size).long()
-    slots = pages * cache.block_size + history % cache.block_size
+    # DSparkMetadataBuilder already copied the accepted histories to the host.
+    host_starts = [span.start_pos for span in metadata.requests]
+    prepared = None
+    if q.device.type == "npu":
+        from vllm_ascend.models.common.ops.dspark_ring_indices import try_build_ring_indices
+
+        prepared = try_build_ring_indices(host_starts, table, window_size=window_size, block_size=block_size)
+    if prepared is None:
+        starts = torch.tensor(host_starts, dtype=torch.long, device=q.device)
+        ring_slots = torch.arange(window_size, device=q.device)
+        history = starts[:, None] - 1 - (starts[:, None] - 1 - ring_slots).remainder(window_size)
+        pages = table[:batch].gather(1, history // cache.block_size).long()
+        slots = pages * cache.block_size + history % cache.block_size
+        indices = None
+    else:
+        slots, indices = prepared
     # Match cache.read's advanced indexing, including its signed-index semantics.
     # Do not use index_select: a narrowed cache field can materialize the full pool.
     context = field[slots]
     kv = torch.cat((context, query_kv.view(batch, block_size, q.shape[-1])), dim=1)
-    indices = torch.arange(window_size + block_size, dtype=torch.int32, device=q.device)
-    indices = indices.view(1, 1, -1).expand(1, block_size, -1)
+    if indices is None:
+        indices = torch.arange(window_size + block_size, dtype=torch.int32, device=q.device)
+        indices = indices.view(1, 1, -1).expand(1, block_size, -1)
     return kv, indices
 
 
