@@ -1,0 +1,27 @@
+vllm_ascend/ops/triton/deepseek_v41_hc_gate_fused.py
+  s_6eab87361519a8::t_4e798b1e9ffde1 1-21,24,36-42,54-55,61-93
+  s_6eab87361519a8::t_a0ce10e7cfe0b0 22-23,25-35,56-60
+  s_6eab87361519a8::t_c150131abaf180 43-53
+tests/e2e/nightly/one_card/test_hc_gate_fused.py
+  s_6eab87361519a8::t_1f0992c55f2d86 1-153
+vllm_ascend/models/common/ops/hc_gate_fused.py
+  s_6eab87361519a8::t_3e22fde6e18ea7 1-54
+vllm_ascend/models/deepseek_v41/core.py
+  s_6eab87361519a8::t_29d98ae9028834 46-51
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "2e043edc11875124177e01fd30b77a4af46b6381",
+  "prompts": {},
+  "sessions": {
+    "s_6eab87361519a8": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1ac13-1fd0-7670-ae84-d58acaf2730c",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "jiangkuaixue123 <jiangxiaozhou111@163.com>"
+    }
+  }
+}
