@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """DeepSeek V4.1's three trained DSpark stages, stored under checkpoint mtp.*."""
 
-import hashlib
 import json
 import os
 import time
@@ -256,7 +255,6 @@ class DSparkAttention(DeepseekV41Attention):
             "host_monotonic_ns": time.monotonic_ns(),
             "cache_prefix": self.cache.prefix,
             "source_path": str(source),
-            "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
             "batch": len(metadata.requests),
             "num_actual_tokens": metadata.num_actual_tokens,
             "window_size": self.config.sliding_window,
