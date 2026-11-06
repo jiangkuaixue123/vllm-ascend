@@ -519,7 +519,7 @@ def rotary_frequencies(config, compressed):
     return frequencies
 
 
-def _use_float32_tie_columns(scores, k):
+def _use_decode_tie_columns(scores, k):
     return (
         scores.device.type == "npu"
         and scores.ndim == 2
@@ -537,15 +537,20 @@ def topk_columns(scores, k):
         return columns[:k].long().expand(*scores.shape[:-1], k)
     top = scores.topk(k, dim=-1)
     cutoff = top.values[..., -1:]
-    if _use_float32_tie_columns(scores, k):
-        # Both column IDs and the out-of-range sentinel are exact FP32 integers.
-        # Keep the original score TopK and its NaN/non-cutoff selections intact.
-        columns = columns.float()
-        logger.info_once("INDEX_TIE_FP32_RUNTIME pid=%d", os.getpid(), scope="process")
-    # topk may choose different equal items at different padded widths.
-    # Retain all strictly higher scores; fill only the tied part by column.
-    tied = torch.where(scores == cutoff, columns, scores.shape[-1])
-    first = tied.topk(k, dim=-1, largest=False).values
+    if _use_decode_tie_columns(scores, k):
+        matches = scores == cutoff
+        tie_ordinals = matches.int().cumsum(-1, dtype=torch.int32) - 1
+        destinations = torch.where(matches & (tie_ordinals < k), tie_ordinals, k).long()
+        first = torch.full((*scores.shape[:-1], k + 1), scores.shape[-1], dtype=torch.int32, device=scores.device)
+        # Each retained tie writes to its unique rank. Only the discarded
+        # scratch column has duplicate writers, matching physical_indices.
+        first.scatter_(-1, destinations, columns.expand_as(scores))
+        first = first[..., :k].contiguous()
+        logger.info_once("INDEX_TIE_PREFIX_RUNTIME pid=%d", os.getpid(), scope="process")
+    else:
+        # topk may choose different equal items at different padded widths.
+        tied = torch.where(scores == cutoff, columns, scores.shape[-1])
+        first = tied.topk(k, dim=-1, largest=False).values
     at_cutoff = top.values == cutoff
     ordinal = at_cutoff.long().cumsum(-1) - 1
     return torch.where(at_cutoff, first.gather(-1, ordinal.clamp_min(0)).long(), top.indices)
