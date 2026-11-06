@@ -2,7 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Stage bounded raw windows and selected compressed values for the A3 target native attention operator."""
 
+import os
+
 import torch
+from vllm.logger import logger
 from vllm.triton_utils import tl, triton
 
 from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num
@@ -14,6 +17,8 @@ DIM = 512
 UNION = WIN + QWIDTH - 1
 RAW_PAD = 144
 WIDTH = WIN + TOP
+SLOT_ROWS = 4
+SLOT_COLUMNS = 64
 
 
 @triton.jit
@@ -73,25 +78,36 @@ def _gather(
 
 @triton.jit
 def _slots(
-    lens, active, topk, out, ROWS: tl.constexpr, CMP_BASE: tl.constexpr, TOP_ROW: tl.constexpr, TILE: tl.constexpr
+    lens,
+    active,
+    topk,
+    out,
+    ROWS: tl.constexpr,
+    CMP_BASE: tl.constexpr,
+    TOP_ROW: tl.constexpr,
+    TILE: tl.constexpr,
+    ROW_TILE: tl.constexpr,
 ):
-    for block in range(tl.program_id(0), tl.cdiv(ROWS * 640, TILE), tl.num_programs(0)):
-        flat = block * TILE + tl.arange(0, TILE)
-        ok = flat < ROWS * 640
-        row = flat // 640
-        col = flat % 640
-        group = row // 6
-        length = tl.load(lens + row, mask=ok, other=0)
-        first = tl.load(lens + group * 6, mask=ok, other=0)
-        active_row = tl.load(active + row, mask=ok, other=0) != 0
-        width = tl.minimum(128, tl.maximum(0, length))
-        ord = col - width
-        is_cmp = ok & (ord >= 0) & (ord < 512)
-        idx = tl.load(topk + row * TOP_ROW + tl.where(is_cmp, ord, 0), mask=is_cmp, other=-1)
-        raw_slot = group * 133 + tl.maximum(0, length - 128) - tl.maximum(0, first - 128) + col
-        cmp_slot = CMP_BASE + row * 512 + ord
-        slot = tl.where(col < width, raw_slot, tl.where(is_cmp & (idx >= 0), cmp_slot, -1))
-        tl.store(out + flat, tl.where(active_row, slot, -1).to(tl.int32), mask=ok)
+    # Keep row metadata vectorized while columns stay in contiguous small tiles.
+    row = tl.program_id(0) * ROW_TILE + tl.arange(0, ROW_TILE)
+    col = tl.program_id(1) * TILE + tl.arange(0, TILE)
+    row_valid = row < ROWS
+    ok = row_valid[:, None] & (col[None, :] < 640)
+    group = row // 6
+    # Qualified decode metadata is bounded by the 153600-token model limit.
+    # Physical indices and every intermediate therefore fit signed int32.
+    length = tl.load(lens + row, row_valid, 0).to(tl.int32)
+    first = tl.load(lens + group * 6, row_valid, 0).to(tl.int32)
+    active_row = tl.load(active + row, row_valid, 0) != 0
+    width = tl.minimum(128, tl.maximum(0, length))
+    ordinal = col[None, :] - width[:, None]
+    is_cmp = ok & (ordinal >= 0) & (ordinal < 512)
+    idx = tl.load(topk + row[:, None] * TOP_ROW + tl.where(is_cmp, ordinal, 0), mask=is_cmp, other=-1)
+    raw_begin = group * 133 + tl.maximum(0, length - 128) - tl.maximum(0, first - 128)
+    raw_slot = raw_begin[:, None] + col[None, :]
+    cmp_slot = CMP_BASE + row[:, None] * 512 + ordinal
+    slot = tl.where(col[None, :] < width[:, None], raw_slot, tl.where(is_cmp & (idx >= 0), cmp_slot, -1))
+    tl.store(out + row[:, None] * 640 + col[None, :], tl.where(active_row[:, None], slot, -1).to(tl.int32), mask=ok)
 
 
 def read(field, metadata, ids, ratio, raw, dtype, destination):
@@ -146,6 +162,8 @@ def stage(arena, raw, comp, md, src, topk, ratio, refresh):
     if refresh:
         read(comp, src, topk, ratio, False, comp.dtype, arena[cmp_base : cmp_base + rows * TOP].view(rows, TOP, DIM))
     ids = torch.empty((rows, 1, WIDTH), dtype=torch.int32, device=raw.device)
-    grid = (min(triton.cdiv(ids.numel(), 128), get_vectorcore_num()),)
-    _slots[grid](md.seq_lens, md.active, topk, ids, rows, cmp_base, topk.stride(0), 128)
+    _slots[(triton.cdiv(rows, SLOT_ROWS), triton.cdiv(WIDTH, SLOT_COLUMNS))](
+        md.seq_lens, md.active, topk, ids, rows, cmp_base, topk.stride(0), SLOT_COLUMNS, SLOT_ROWS
+    )
+    logger.info_once("TARGET_SLOT_ROWS_RUNTIME pid=%d rows=%d", os.getpid(), rows, scope="process")
     return ids
