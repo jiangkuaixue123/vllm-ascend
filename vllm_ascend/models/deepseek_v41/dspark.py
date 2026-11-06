@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """DeepSeek V4.1's three trained DSpark stages, stored under checkpoint mtp.*."""
 
-import hashlib
 import json
 import os
 import time
@@ -98,11 +97,9 @@ def ring_positions(context_length, window_size, *, device):
 def block_attention(q, context_kv, query_kv, sink, scale, kernel=None):
     """Every query sees the accepted context and every KV of its *own* block."""
     kv = torch.cat((context_kv, query_kv), dim=0).unsqueeze(0)
-    indices = torch.arange(kv.shape[1], dtype=torch.int32, device=q.device)
-    indices = indices.view(1, 1, -1).expand(1, q.shape[0], -1)
     if kernel is None:
         kernel = DeepseekV41NativeAttention()
-    return kernel(q.unsqueeze(0), kv, sink, indices, scale, mode="SWA draft bidirectional")[0]
+    return kernel(q.unsqueeze(0), kv, sink, None, scale, mode="SWA draft bidirectional")[0]
 
 
 def try_stage_block_inputs(q, query_kv, metadata, cache, *, window_size, block_size, dtype):
@@ -256,7 +253,6 @@ class DSparkAttention(DeepseekV41Attention):
             "host_monotonic_ns": time.monotonic_ns(),
             "cache_prefix": self.cache.prefix,
             "source_path": str(source),
-            "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
             "batch": len(metadata.requests),
             "num_actual_tokens": metadata.num_actual_tokens,
             "window_size": self.config.sliding_window,
@@ -309,12 +305,12 @@ class DSparkAttention(DeepseekV41Attention):
                         q[rows], context, query_kv[rows], self.attn_sink, self.dim**-0.5, self.attention_kernel
                     )
                 else:
-                    kv, indices = staged
+                    kv, _ = staged
                     attended[rows] = self.attention_kernel(
                         q[rows].unsqueeze(0),
                         kv[row : row + 1],
                         self.attn_sink,
-                        indices,
+                        None,
                         self.dim**-0.5,
                         mode="SWA draft bidirectional",
                     )[0]

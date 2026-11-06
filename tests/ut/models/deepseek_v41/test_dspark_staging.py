@@ -3,7 +3,6 @@
 """CPU input-contract tests; native A3 output and timing require device evidence."""
 
 import ast
-import hashlib
 import json
 import os
 import time
@@ -88,7 +87,9 @@ def test_ring_query_and_native_input_words_match_serial(helpers, batch, negative
             actual = staged_kv[row : row + 1]
             assert actual.is_contiguous() and actual.stride() == kv_single.stride()
             assert torch.equal(actual.view(torch.int16), kv_single.view(torch.int16))
-            assert staged_ids.stride() == ids_single.stride() and torch.equal(staged_ids, ids_single)
+            assert ids_single is None  # Full bidirectional block, with no request-specific selection.
+            expected_ids = torch.arange(kv_single.shape[1], dtype=torch.int32).view(1, 1, -1)
+            assert torch.equal(staged_ids, expected_ids.expand(1, q_single.shape[1], -1))
             return torch.zeros_like(q_single)
 
         helpers["block_attention"](q[rows], context, query[rows], torch.zeros(16), 512**-0.5, inspect)
@@ -195,7 +196,6 @@ def witness_fixture(histories, *, dummy=False):
     records, calls, writes = [], [], []
     scope = source_functions()
     scope.update(
-        hashlib=hashlib,
         json=json,
         os=os,
         time=time,
@@ -216,7 +216,8 @@ def witness_fixture(histories, *, dummy=False):
     cache.write_slots = lambda *args: writes.append(args)
 
     def kernel(q_single, kv, sink, ids, scale, *, mode):
-        calls.append((q_single.shape, kv.shape, ids.shape, mode))
+        assert ids is None
+        calls.append((q_single.shape, kv.shape, None, mode))
         return torch.zeros_like(q_single)
 
     obj = SimpleNamespace(
@@ -247,7 +248,6 @@ def test_witness_first_b4_records_actual_dispatch_once_and_closes():
     record = records[0]
     assert record["staging_used"] and record["completed_native_calls"] == 4 and record["witness_closed"]
     assert record["cache_prefix"] == "mtp.1.attn.cache" and record["pid"] == os.getpid()
-    assert record["source_sha256"] == hashlib.sha256(Path(scope["__file__"]).read_bytes()).hexdigest()
     assert record["q"]["shape"] == [20, 16, 512]
     assert record["staged_kv"]["shape"] == [4, 133, 512]
     assert record["staged_indices"]["shape"] == [1, 5, 133]

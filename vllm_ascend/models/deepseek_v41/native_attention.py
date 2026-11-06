@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Execute V4.1's selected latent attention on the A3 shared-KV operator."""
 
+import os
 from functools import lru_cache
 
 import torch
@@ -41,6 +42,8 @@ class DeepseekV41NativeAttention:
         # The CANN metadata is immutable for this geometry. Cache no batch data,
         # request pages or token positions. Bound memory for variable eager spans.
         self.plan = lru_cache(maxsize=32)(self._eager_plan)
+        # Full bidirectional blocks reuse only geometry, never Q/KV or page data.
+        self.full_block_indices = lru_cache(maxsize=32)(self._full_block_indices)
         self.decode_plans = {}
         self.verified_eager_templates = set()
 
@@ -117,18 +120,63 @@ class DeepseekV41NativeAttention:
             table = torch.arange(batch * blocks_per_row, dtype=torch.int32, device=device).reshape(batch, -1)
         return metadata, table, common
 
+    @staticmethod
+    def _full_block_indices(device, batch, sequence, length):
+        if min(batch, sequence, length) <= 0 or length > MAX_SPARSE_WIDTH:
+            raise ValueError("Full-block attention requires nonempty rows and between 1 and 2048 KV slots")
+        indices = torch.arange(length, dtype=torch.int32, device=device).view(1, 1, -1)
+        indices = indices.expand(batch, sequence, -1)
+        slots = physical_indices(
+            indices, aligned_length(length, PAGE_SIZE), length, aligned_length(length, SPARSE_ALIGNMENT)
+        )
+        return indices, slots
+
     def __call__(self, q, kv, sink, indices, scale, *, mode, swa_window=None, uniform_decode=False):
+        # None explicitly means every query sees the complete KV block in order.
+        # Arbitrary sparse indices keep the original per-invocation compaction.
+        prepared_slots = None
+        if indices is None:
+            if swa_window is not None or uniform_decode:
+                raise ValueError("Full-block indices are only supported by eager bidirectional attention")
+            if q.ndim != 4 or kv.ndim != 3:
+                raise ValueError("Full-block attention requires rank-four Q and rank-three KV")
+            indices, prepared_slots = self.full_block_indices(q.device, q.shape[0], q.shape[1], kv.shape[1])
         if q.device.type == "cpu":
             return sparse_attn(q, kv, sink, indices, scale)
         if q.device.type != "npu" or not enable_custom_op():
             raise RuntimeError("V4.1 attention requires Ascend's npu_sparse_attn_sharedkv custom operator")
-        return self._native(q, kv, sink, indices, scale, mode, swa_window, uniform_decode)
+        result = self._native(
+            q, kv, sink, indices, scale, mode, swa_window, uniform_decode, prepared_slots=prepared_slots
+        )
+        if prepared_slots is not None:
+            logger.info_once(
+                "DSPARK_DENSE_SLOTS_RUNTIME pid=%d batch=%d rows=%d length=%d",
+                os.getpid(),
+                q.shape[0],
+                q.shape[1],
+                kv.shape[1],
+                scope="process",
+            )
+        return result
 
     def decode_with_physical_slots(self, q, kv, sink, slots, scale):
         """Uniform target decode with absolute slots already packed in original logical order."""
         return self._native(q, kv, sink, slots, scale, "DSA target indexed decode", None, True, physical_slots=True)
 
-    def _native(self, q, kv, sink, indices, scale, mode, swa_window, uniform_decode=False, *, physical_slots=False):
+    def _native(
+        self,
+        q,
+        kv,
+        sink,
+        indices,
+        scale,
+        mode,
+        swa_window,
+        uniform_decode=False,
+        *,
+        physical_slots=False,
+        prepared_slots=None,
+    ):
         batch, sequence, heads, dim = q.shape
         if dim != LATENT_DIM or heads % 4 or q.dtype != torch.bfloat16 or kv.dtype != torch.bfloat16:
             raise ValueError(
@@ -154,7 +202,10 @@ class DeepseekV41NativeAttention:
             sparse_width = aligned_length(indices.shape[-1], SPARSE_ALIGNMENT)
             if not 0 < sparse_width <= MAX_SPARSE_WIDTH:
                 raise ValueError("A3 sparse attention requires between 1 and 2048 selected slots")
-            slots = indices if physical_slots else physical_indices(indices, stride, length, sparse_width)
+            if prepared_slots is not None:
+                slots = prepared_slots
+            else:
+                slots = indices if physical_slots else physical_indices(indices, stride, length, sparse_width)
             # One native sequence per query: each local CP query can have a
             # different index list, including the noncausal DSpark block.
             if uniform_decode:
