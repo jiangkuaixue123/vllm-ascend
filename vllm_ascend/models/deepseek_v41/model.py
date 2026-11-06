@@ -228,6 +228,15 @@ def read_parameter_slice(reader, key, parameter, module, tp_rank, tp_size):
         indices = module.shard_indices
         slices[0] = slice(indices.org_vocab_start_index, indices.org_vocab_end_index)
         value = source[tuple(slices)]
+        if (
+            isinstance(module, ParallelLMHead)
+            and parameter.device.type == "npu"
+            and value.dtype == torch.float32
+            and parameter.dtype in (torch.bfloat16, torch.float16)
+        ):
+            # Match the processor's device-side cast, including NaN encoding.
+            # Combining device/dtype conversion can instead cast on the CPU.
+            value = value.to(parameter.device).to(parameter.dtype)
         parameter.zero_()
         parameter[: value.shape[0]].copy_(value)
         return
@@ -297,13 +306,14 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsMultiModal):
             [DeepseekV41Block(config, vllm_config, layer_id) for layer_id in range(config.num_hidden_layers)]
         )
         self.norm = DeepseekV41RMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.logits_processor = LogitsProcessor(config.vocab_size)
         self.head = ParallelLMHead(
             config.vocab_size,
             config.hidden_size,
-            params_dtype=torch.float32,
+            # The processor otherwise recasts this large fixed weight every step.
+            params_dtype=getattr(self.logits_processor, "head_dtype", None) or torch.float32,
             prefix="head",
         )
-        self.logits_processor = LogitsProcessor(config.vocab_size)
         self.model_path = Path(vllm_config.model_config.model)
         self.engram_store = None
         self.engram_hasher = None
@@ -631,6 +641,14 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsMultiModal):
         return (output, auxiliary) if self.aux_hidden_state_layers else output
 
     def compute_logits(self, hidden_states):
+        if hidden_states.device.type == "npu":
+            logger.info_once(
+                "LM_HEAD_DTYPE_RUNTIME pid=%d role=target parameter=%s projection=%s",
+                os.getpid(),
+                self.head.weight.dtype,
+                getattr(self.logits_processor, "head_dtype", None),
+                scope="process",
+            )
         return self.logits_processor(self.head, hidden_states.float())
 
     @torch.no_grad()

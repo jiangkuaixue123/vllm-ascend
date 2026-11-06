@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """DeepSeek V4.1's three trained DSpark stages, stored under checkpoint mtp.*."""
 
-import hashlib
 import json
 import os
 import time
@@ -256,7 +255,6 @@ class DSparkAttention(DeepseekV41Attention):
             "host_monotonic_ns": time.monotonic_ns(),
             "cache_prefix": self.cache.prefix,
             "source_path": str(source),
-            "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
             "batch": len(metadata.requests),
             "num_actual_tokens": metadata.num_actual_tokens,
             "window_size": self.config.sliding_window,
@@ -406,12 +404,15 @@ class DeepseekV41DSparkForCausalLM(nn.Module):
         self.mtp[0].main_norm = DeepseekV41RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.mtp[0].embed = VocabParallelEmbedding(config.vocab_size, config.hidden_size, prefix="mtp.0.embed")
         self.mtp[-1].norm = DeepseekV41RMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.logits_processor = LogitsProcessor(config.vocab_size)
         self.mtp[-1].head = ParallelLMHead(
-            config.vocab_size, config.hidden_size, params_dtype=torch.float32, prefix=f"mtp.{count - 1}.head"
+            config.vocab_size,
+            config.hidden_size,
+            params_dtype=getattr(self.logits_processor, "head_dtype", None) or torch.float32,
+            prefix=f"mtp.{count - 1}.head",
         )
         self.mtp[-1].markov_head = DSparkMarkov(config)
         self.mtp[-1].confidence_head = DSparkConfidence(config)
-        self.logits_processor = LogitsProcessor(config.vocab_size)
         self.model_path = Path(vllm_config.model_config.model)
 
     def embed_input_ids(self, input_ids):
@@ -449,6 +450,14 @@ class DeepseekV41DSparkForCausalLM(nn.Module):
         return hc_pre(hidden, pre)
 
     def compute_logits(self, hidden_states, spec_step_idx=0):
+        if hidden_states.device.type == "npu":
+            logger.info_once(
+                "LM_HEAD_DTYPE_RUNTIME pid=%d role=draft parameter=%s projection=%s",
+                os.getpid(),
+                self.mtp[-1].head.weight.dtype,
+                getattr(self.logits_processor, "head_dtype", None),
+                scope="process",
+            )
         return self.logits_processor(self.mtp[-1].head, self.mtp[-1].norm(hidden_states).float())
 
     def compute_draft_logits(self, hidden_states):

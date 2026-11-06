@@ -3,7 +3,6 @@
 """CPU input-contract tests; native A3 output and timing require device evidence."""
 
 import ast
-import hashlib
 import json
 import os
 import time
@@ -195,7 +194,6 @@ def witness_fixture(histories, *, dummy=False):
     records, calls, writes = [], [], []
     scope = source_functions()
     scope.update(
-        hashlib=hashlib,
         json=json,
         os=os,
         time=time,
@@ -247,7 +245,6 @@ def test_witness_first_b4_records_actual_dispatch_once_and_closes():
     record = records[0]
     assert record["staging_used"] and record["completed_native_calls"] == 4 and record["witness_closed"]
     assert record["cache_prefix"] == "mtp.1.attn.cache" and record["pid"] == os.getpid()
-    assert record["source_sha256"] == hashlib.sha256(Path(scope["__file__"]).read_bytes()).hexdigest()
     assert record["q"]["shape"] == [20, 16, 512]
     assert record["staged_kv"]["shape"] == [4, 133, 512]
     assert record["staged_indices"]["shape"] == [1, 5, 133]
