@@ -20,6 +20,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead, 
 from vllm.v1.attention.backend import AttentionCGSupport, AttentionMetadataBuilder
 
 from vllm_ascend.models.common.ops.draft_attention_graph import DraftAttentionGraph
+from vllm_ascend.ops.triton.deepseek_v41_draft_context import try_write_draft_context
 
 from .attention import (
     DeepseekV41Attention,
@@ -235,6 +236,17 @@ class DSparkAttention(DeepseekV41Attention):
             return
         if slots.shape != positions.shape or states.shape[0] != slots.numel():
             raise ValueError("DSpark context positions, cache slots and hidden rows must align")
+        if try_write_draft_context is not None and try_write_draft_context(
+            self.cache.field(0, 0, kv.shape[-1]), slots, kv
+        ):
+            logger.info_once(
+                "DSPARK_CONTEXT_WRITE_RUNTIME pid=%d stage=%s rows=%d",
+                os.getpid(),
+                self.cache.prefix,
+                states.shape[0],
+                scope="process",
+            )
+            return
         # Slots for discarded / padded context tokens must never change slot 0.
         active = (slots >= 0).nonzero().flatten()
         self.cache.write_slots(slots.index_select(0, active), kv.index_select(0, active), 0, 0)

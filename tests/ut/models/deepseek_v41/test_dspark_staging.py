@@ -201,6 +201,7 @@ def witness_fixture(histories, *, dummy=False):
         __file__=str(source),
         _WITNESS_BATCH_SIZE=4,
         is_draft_dummy=lambda: dummy,
+        try_write_draft_context=None,
         logger=SimpleNamespace(info=lambda fmt, value: records.append(json.loads(value))),
     )
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(source), "exec"), scope)
