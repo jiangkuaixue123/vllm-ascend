@@ -13,7 +13,7 @@ LATENT_DIM = 512
 SELECTED_WIDTH = 640
 
 
-def try_selected_fia(q, kv, sink, slots, scale):
+def try_selected_fia(q, kv, sink, slots, scale, *, sink_source_dtype=None):
     """Consume compact-prefix physical slots; retain duplicates and their order."""
     if (
         q.device.type != "npu"
@@ -46,20 +46,22 @@ def try_selected_fia(q, kv, sink, slots, scale):
     valid = flat_slots >= 0
     selected = kv.reshape(-1, LATENT_DIM).index_select(0, flat_slots.clamp_min(0).flatten())
     selected = selected.view(rows, 1, SELECTED_WIDTH, LATENT_DIM)
+    native_sink = sink_source_dtype == torch.bfloat16
+    options = {"learnable_sink": sink.to(q.dtype)} if native_sink else {"return_softmax_lse": True}
     output, lse = torch_npu.npu_fused_infer_attention_score_v2(
         q.transpose(1, 2),
         selected,
         selected,
         atten_mask=(~valid).view(rows, 1, 1, SELECTED_WIDTH),
-        return_softmax_lse=True,
+        **options,
         num_query_heads=TARGET_HEADS,
         num_key_value_heads=1,
         input_layout="BNSD",
         sparse_mode=0,
         softmax_scale=scale,
     )
-    # Native FIA only accepts a BF16 sink for BF16 queries. Retain the original
-    # FP32 sink by applying its normalization factor from the returned logsumexp.
-    factor = torch.sigmoid(lse.reshape(rows, TARGET_HEADS, 1, 1) - sink.view(1, TARGET_HEADS, 1, 1))
-    output = (output.float() * factor).to(q.dtype)
+    if not native_sink:
+        # Original FP32 parameters retain the full-precision normalization.
+        factor = torch.sigmoid(lse.reshape(rows, TARGET_HEADS, 1, 1) - sink.view(1, TARGET_HEADS, 1, 1))
+        output = (output.float() * factor).to(q.dtype)
     return output.transpose(1, 2).masked_fill((~valid[:, 0]).view(rows, 1, 1, 1), 0)

@@ -18,6 +18,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmb
 from tests.ut.models.deepseek_v41 import paged_cache
 from vllm_ascend.models.deepseek_v41 import model as model_module
 from vllm_ascend.models.deepseek_v41.attention import (
+    DeepseekV41Attention,
     DeepseekV41Cache,
     DeepseekV41DecodeMetadata,
     DeepseekV41Metadata,
@@ -25,6 +26,7 @@ from vllm_ascend.models.deepseek_v41.attention import (
     RequestSpan,
 )
 from vllm_ascend.models.deepseek_v41.engram import EngramHasher, EngramLayout
+from vllm_ascend.models.deepseek_v41.native_attention import DeepseekV41NativeAttention
 
 
 class TensorSlice:
@@ -89,6 +91,20 @@ def test_vocab_last_tp_rank_zeroes_padding_without_loading_extra_rows():
     model_module.read_parameter_slice(TensorReader(source), "embed.weight", target, module, 1, 2)
     torch.testing.assert_close(target[:2], source[3:])
     torch.testing.assert_close(target[2], torch.zeros(2))
+
+
+@pytest.mark.parametrize("tp", [1, 4])
+def test_attention_sink_source_dtype_tracks_exact_loading_and_reload(tp):
+    module = unloaded_module(DeepseekV41Attention)
+    module.attention_kernel = DeepseekV41NativeAttention()
+    target = torch.empty(64 // tp, dtype=torch.float32)
+    rank = tp - 1
+    for dtype in (torch.bfloat16, torch.float32, torch.bfloat16):
+        source = torch.linspace(-7.3, 15.7, 64).to(dtype)
+        model_module.read_parameter_slice(TensorReader(source), "layers.0.attn.attn_sink", target, module, rank, tp)
+        expected = source[rank * target.numel() : (rank + 1) * target.numel()].float()
+        assert torch.equal(target, expected)
+        assert module.attention_kernel.sink_source_dtype == dtype
 
 
 @pytest.mark.parametrize("shape", [(5, 2), (6, 3)])

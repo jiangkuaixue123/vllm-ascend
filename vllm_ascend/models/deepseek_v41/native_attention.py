@@ -45,6 +45,7 @@ class DeepseekV41NativeAttention:
         self.plan = lru_cache(maxsize=32)(self._eager_plan)
         self.decode_plans = {}
         self.verified_eager_templates = set()
+        self.sink_source_dtype = None
 
     def pin_decode_plan(self, device, heads, rows, selected_width, shared=None):
         """Hold every address used by the recorded graph for the model's lifetime."""
@@ -128,8 +129,16 @@ class DeepseekV41NativeAttention:
 
     def decode_with_physical_slots(self, q, kv, sink, slots, scale):
         """Uniform target decode with absolute slots already packed in original logical order."""
-        selected = try_selected_fia(q, kv, sink, slots, scale)
+        selected = try_selected_fia(q, kv, sink, slots, scale, sink_source_dtype=self.sink_source_dtype)
         if selected is not None:
+            if self.sink_source_dtype == torch.bfloat16:
+                logger.info_once(
+                    "TARGET_NATIVE_SINK_RUNTIME pid=%d rows=%d width=%d",
+                    os.getpid(),
+                    q.shape[0],
+                    slots.shape[-1],
+                    scope="process",
+                )
             logger.info_once(
                 "TARGET_GATHER_FIA2_RUNTIME pid=%d rows=%d width=%d",
                 os.getpid(),

@@ -250,6 +250,10 @@ def read_parameter_slice(reader, key, parameter, module, tp_rank, tp_size):
     if value.shape != parameter.shape:
         raise ValueError(f"Checkpoint shape mismatch for {key}: {value.shape} != {parameter.shape}")
     parameter.copy_(value)
+    if key.endswith(".attn_sink") and isinstance(module, DeepseekV41Attention):
+        # BF16 checkpoint values were promoted exactly into the FP32 parameter.
+        # Reset this on every load so an FP32 replacement keeps its original path.
+        module.attention_kernel.sink_source_dtype = value.dtype
 
 
 @register_vision_processor
