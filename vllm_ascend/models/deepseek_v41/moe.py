@@ -9,6 +9,7 @@ down projection, including its activation quantization. This implementation
 supports replicated or sequence-sharded input rows with static expert placement.
 """
 
+import os
 from collections.abc import Sequence
 from typing import Protocol
 
@@ -37,6 +38,17 @@ from vllm_ascend.models.deepseek_v41.core import (
     clipped_swiglu,
     route_sqrtsoftplus,
 )
+from vllm_ascend.quantization.method_adapters import AscendLinearMethod
+from vllm_ascend.quantization.methods.w8a8.w8a8_dynamic import AscendW8A8DynamicLinearMethod
+from vllm_ascend.utils import (
+    AscendDeviceType,
+    get_ascend_device_type,
+    npu_stream_switch,
+    shared_experts_calculation_stream,
+)
+
+_TARGET_SHARED_ROWS = (6, 12)
+_TARGET_SHARED_LAYOUT = (4, 16, 384, 5120, 2304, 6)
 
 
 def local_expert_ids(num_experts: int, ep_size: int, ep_rank: int) -> range:
@@ -389,6 +401,20 @@ class DeepseekV41MoE(nn.Module):
             replicated_shared=communication.replicated_shared,
             sequence_parallel=communication.sequence_parallel,
         )
+        self._shared_overlap_stream = None
+        tp_size, ep_size, experts, _, _, _ = _TARGET_SHARED_LAYOUT
+        if (
+            self.use_fused_runner
+            and self.n_routed_experts == experts
+            and communication.ep_size == ep_size
+            and communication.sequence_parallel
+            and communication.replicated_shared
+            and communication.tp_group.world_size == tp_size
+            and self.gate.weight.device.type == "npu"
+            and get_ascend_device_type() == AscendDeviceType.A3
+        ):
+            # Create the existing process stream before any graph capture.
+            self._shared_overlap_stream = shared_experts_calculation_stream()
         logger.info_once(
             "V4.1 MoE layout: sequence_parallel=%s replicated_shared=%s shared_w2_shape=%s",
             communication.sequence_parallel,
@@ -457,6 +483,60 @@ class DeepseekV41MoE(nn.Module):
             output = output + self._shared_output(hidden_states).float()
         return output.to(hidden_states.dtype)
 
+    def _try_overlap_target_shared(self, states):
+        stream = getattr(self, "_shared_overlap_stream", None)
+        if stream is None:
+            return None
+        tp_size, ep_size, experts, hidden, intermediate, top_k = _TARGET_SHARED_LAYOUT
+        comm = self.communication
+        if not (
+            self.use_fused_runner
+            and self.n_routed_experts == experts
+            and self.gate.top_k == top_k
+            and comm.ep_size == ep_size
+            and comm.sequence_parallel
+            and comm.replicated_shared
+            and comm.tp_group.world_size == tp_size
+            and states.device.type == "npu"
+            and states.dtype == torch.bfloat16
+            and states.ndim == 2
+            and states.shape[0] in _TARGET_SHARED_ROWS
+            and states.shape[1] == hidden
+            and states.is_contiguous()
+            and torch.is_inference_mode_enabled()
+            and not torch.compiler.is_compiling()
+            and get_ascend_device_type() == AscendDeviceType.A3
+        ):
+            return None
+        shared = self.shared_experts
+        if not (
+            not shared.reduce_shared
+            and (shared.w1.input_size, shared.w1.output_size) == (hidden, intermediate)
+            and (shared.w3.input_size, shared.w3.output_size) == (hidden, intermediate)
+            and (shared.w2.input_size, shared.w2.output_size) == (intermediate, hidden)
+            and all(
+                isinstance(layer.quant_method, AscendLinearMethod)
+                and isinstance(layer.quant_method.quant_method, AscendW8A8DynamicLinearMethod)
+                for layer in (shared.w1, shared.w2, shared.w3)
+            )
+        ):
+            return None
+        main = torch.npu.current_stream(states.device)
+        if main == stream:
+            return None
+        input_ready = main.record_event()
+        states.record_stream(stream)
+        with npu_stream_switch(stream):
+            stream.wait_event(input_ready)
+            shared_output = self._shared_output(states).float()
+            shared_done = stream.record_event()
+        routed_output = self._routed_output(states, decode=True)
+        main.wait_event(shared_done)
+        shared_output.record_stream(main)
+        output = routed_output + shared_output
+        logger.info_once("TARGET_SHARED_OVERLAP_RUNTIME pid=%d rows=%d", os.getpid(), states.shape[0], scope="process")
+        return output
+
     def forward_decode(self, hidden_states: torch.Tensor, token_mask: torch.Tensor) -> torch.Tensor:
         """Run the same collectives on every rank using fixed local decode slots."""
         if (
@@ -470,5 +550,7 @@ class DeepseekV41MoE(nn.Module):
             raise ValueError("Expected fixed decode states [slots, hidden] and bool slot mask")
         valid = token_mask.unsqueeze(-1)
         states = torch.where(valid, hidden_states, 0.0)
-        output = self._routed_output(states, decode=True) + self._shared_output(states).float()
+        output = self._try_overlap_target_shared(states)
+        if output is None:
+            output = self._routed_output(states, decode=True) + self._shared_output(states).float()
         return torch.where(valid, output.to(states.dtype), 0.0)
