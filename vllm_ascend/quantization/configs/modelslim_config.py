@@ -97,8 +97,8 @@ _MINIMAX_M3_PACKED_MODULES = {
 }
 
 packed_modules_model_mapping: dict[str, dict[str, list[str]]] = {
-    "deepseek_v41": {"experts": ["experts.0.w1", "experts.0.w3", "experts.0.w2"]},
-    "deepseek_v41_text": {"experts": ["experts.0.w1", "experts.0.w3", "experts.0.w2"]},
+    "deepseek_v41": {"experts": ["experts.0.w1", "experts.0.w3", "experts.0.w2"], "w13": ["w1", "w3"]},
+    "deepseek_v41_text": {"experts": ["experts.0.w1", "experts.0.w3", "experts.0.w2"], "w13": ["w1", "w3"]},
     "minimax_m3": _MINIMAX_M3_PACKED_MODULES,
     "minimax_m3_vl": _MINIMAX_M3_PACKED_MODULES,
     "qwen3_moe": {
