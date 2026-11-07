@@ -64,8 +64,10 @@ else:
 
 # Bound the per-head score tensor for eager prefill; cached candidates span the whole request.
 _INDEX_SCORE_TILE_BYTES = 32 * 1024 * 1024
-# At TP4 this bounds each WO quantizer's temporary FP32 tensor to 8 MiB.
+# Bound each WO quantizer's temporary FP32 tensor during prefill.
 _OUTPUT_QDQ_TILE_ROWS = 256
+_WOA_BEFORE_EXCHANGE_GEOMETRY = (4, 64, 512, 8, 1024)
+_WOA_RUNTIME_MAX_ROWS = 12
 # A FULL graph uses a static context width even when only a few pages are live.
 # Tile the key axis; candidate-block and top-k selection still see all scores.
 _DECODE_INDEX_TILE_KEYS = 8192
@@ -766,6 +768,13 @@ class DeepseekV41Attention(nn.Module):
         self.ratio = config.compress_ratios[layer_id]
         self.sequence_group = get_tp_group() if tp > 1 and enable_sp(vllm_config) else None
         self.dsa_cp = self.sequence_group is not None and enable_dsa_cp()
+        self.project_before_exchange = (
+            self.dsa_cp
+            and (tp, config.num_attention_heads, config.head_dim, config.o_groups, config.o_lora_rank)
+            == _WOA_BEFORE_EXCHANGE_GEOMETRY
+            and getattr(vllm_config, "lora_config", None) is None
+            and get_ascend_device_type() == AscendDeviceType.A3
+        )
         self.local_heads = config.num_attention_heads // tp
         self.heads = config.num_attention_heads if self.dsa_cp else self.local_heads
         self.groups = config.o_groups // tp
@@ -803,12 +812,15 @@ class DeepseekV41Attention(nn.Module):
             prefix=f"{prefix}.wkv",
         )
         self.kv_norm = DeepseekV41RMSNorm(self.dim, config.rms_norm_eps)
-        self.wo_a = ColumnParallelLinear(
+        output_up_class = ReplicatedLinear if self.project_before_exchange else ColumnParallelLinear
+        output_up_options = {"disable_tp": True} if self.project_before_exchange else {}
+        self.wo_a = output_up_class(
             config.num_attention_heads * self.dim // config.o_groups,
             config.o_groups * config.o_lora_rank,
             bias=False,
             params_dtype=torch.bfloat16,
             prefix=f"{prefix}.wo_a",
+            **output_up_options,
         )
         self.wo_b = RowParallelLinear(
             config.o_groups * config.o_lora_rank,
@@ -1352,17 +1364,38 @@ class DeepseekV41Attention(nn.Module):
         return self._project_output(output, hidden_states.dtype)
 
     def _project_output(self, output, dtype):
+        projected = self.dsa_cp and getattr(self, "project_before_exchange", False)
         if self.dsa_cp:
-            # Exchange local tokens and complete heads for complete tokens and
-            # local heads. Each receiver owns the matching wo_a / wo_b slice.
-            send = output.reshape(-1, self.tp, self.local_heads, self.dim).transpose(0, 1).contiguous()
-            send = send.reshape(-1, self.local_heads, self.dim)
+            if projected:
+                # WO_A groups are independent. Project the complete local-token
+                # groups first, then exchange one quarter of the BF16 payload.
+                rows = output.shape[0]
+                output = output.view(rows, self.config.o_groups, -1)
+                output = _quantize_projection_input(output)
+                projection = self.wo_a.weight.view(self.config.o_groups, self.config.o_lora_rank, -1)
+                output = torch.einsum("sgd,grd->gsr", output, projection)
+                send = output.reshape(self.tp, self.groups, rows, self.config.o_lora_rank)
+                send = send.transpose(1, 2).contiguous().reshape(-1, self.groups * self.config.o_lora_rank)
+                if rows <= _WOA_RUNTIME_MAX_ROWS:
+                    logger.info_once(
+                        "TARGET_WOA_BEFORE_EXCHANGE_RUNTIME pid=%d layer=%d rows=%d",
+                        os.getpid(),
+                        self.layer_id,
+                        rows,
+                        scope="process",
+                    )
+            else:
+                # Exchange local tokens and complete heads for complete tokens
+                # and local heads matching the sharded WO_A / WO_B weights.
+                send = output.reshape(-1, self.tp, self.local_heads, self.dim).transpose(0, 1).contiguous()
+                send = send.reshape(-1, self.local_heads, self.dim)
             output = torch.empty_like(send)
             dist.all_to_all_single(output, send, group=self.sequence_group.device_group)
-        output = output.view(-1, self.groups, self.local_heads * self.dim // self.groups)
-        output = _quantize_projection_input(output)
-        projection = self.wo_a.weight.view(self.groups, self.config.o_lora_rank, -1)
-        output = torch.einsum("sgd,grd->sgr", output, projection).flatten(1)
+        if not projected:
+            output = output.view(-1, self.groups, self.local_heads * self.dim // self.groups)
+            output = _quantize_projection_input(output)
+            projection = self.wo_a.weight.view(self.groups, self.config.o_lora_rank, -1)
+            output = torch.einsum("sgd,grd->sgr", output, projection).flatten(1)
         if self.sequence_group is not None:
             # The input is already the local WO column slice. Keep the BF16
             # linear partial and perform precisely one FP32 TP reduce-scatter.
