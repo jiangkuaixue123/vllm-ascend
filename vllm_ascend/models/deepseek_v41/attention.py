@@ -79,6 +79,9 @@ _PARTIAL_ROPE_DIM = 64
 _ARENA_BLOCK_SIZE = 128
 _ARENA_LEGACY_LENGTH = 16384
 _ARENA_LONG_LENGTH = 153600
+_HEAD_GATHER_DECODE_ROWS = (6, 12)
+# TP size, local heads, output projection groups, and latent head width.
+_HEAD_GATHER_LAYOUT = (4, 16, 2, 512)
 
 
 def _quantize_projection_input(output):
@@ -1351,14 +1354,46 @@ class DeepseekV41Attention(nn.Module):
             output[rows] = attended
         return self._project_output(output, hidden_states.dtype)
 
+    def _try_gather_target_heads(self, output):
+        if (
+            output.device.type != "npu"
+            or output.dtype != torch.bfloat16
+            or output.ndim != 3
+            or output.shape[0] not in _HEAD_GATHER_DECODE_ROWS
+            or (self.tp, self.local_heads, self.groups, self.dim) != _HEAD_GATHER_LAYOUT
+            or output.shape[1:] != (self.tp * self.local_heads, self.dim)
+            or not output.is_contiguous()
+            or self.sequence_group is None
+            or self.sequence_group.world_size != self.tp
+            or not torch.is_inference_mode_enabled()
+            or get_ascend_device_type() != AscendDeviceType.A3
+        ):
+            return None
+        gathered = self.sequence_group.all_gather(output, dim=0)
+        start = self.sequence_group.rank_in_group * self.local_heads
+        local = gathered[:, start : start + self.local_heads].contiguous()
+        logger.info_once(
+            "TARGET_HEAD_GATHER_RUNTIME pid=%d rows=%d heads=%d local_heads=%d",
+            os.getpid(),
+            output.shape[0],
+            output.shape[1],
+            self.local_heads,
+            scope="process",
+        )
+        return local
+
     def _project_output(self, output, dtype):
         if self.dsa_cp:
             # Exchange local tokens and complete heads for complete tokens and
             # local heads. Each receiver owns the matching wo_a / wo_b slice.
-            send = output.reshape(-1, self.tp, self.local_heads, self.dim).transpose(0, 1).contiguous()
-            send = send.reshape(-1, self.local_heads, self.dim)
-            output = torch.empty_like(send)
-            dist.all_to_all_single(output, send, group=self.sequence_group.device_group)
+            gathered = self._try_gather_target_heads(output)
+            if gathered is None:
+                send = output.reshape(-1, self.tp, self.local_heads, self.dim).transpose(0, 1).contiguous()
+                send = send.reshape(-1, self.local_heads, self.dim)
+                output = torch.empty_like(send)
+                dist.all_to_all_single(output, send, group=self.sequence_group.device_group)
+            else:
+                output = gathered
         output = output.view(-1, self.groups, self.local_heads * self.dim // self.groups)
         output = _quantize_projection_input(output)
         projection = self.wo_a.weight.view(self.groups, self.config.o_lora_rank, -1)
