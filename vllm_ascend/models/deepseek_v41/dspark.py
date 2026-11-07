@@ -21,6 +21,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead, 
 from vllm.v1.attention.backend import AttentionCGSupport, AttentionMetadataBuilder
 
 from vllm_ascend.models.common.ops.draft_attention_graph import DraftAttentionGraph
+from vllm_ascend.models.common.ops.draft_context_graph import DraftContextGraph
 
 from .attention import (
     DeepseekV41Attention,
@@ -215,6 +216,7 @@ class DSparkAttention(DeepseekV41Attention):
         self.attention_kernel = DeepseekV41NativeAttention()
         self._staging_b4_witness_pending = True
         self._attention_graph = DraftAttentionGraph() if getattr(vllm_config, "lora_config", None) is None else None
+        self._context_graph = DraftContextGraph() if getattr(vllm_config, "lora_config", None) is None else None
         self.sequence_group = None
         self.dim = config.head_dim
         self.rope_dim = config.qk_rope_head_dim
@@ -254,6 +256,16 @@ class DSparkAttention(DeepseekV41Attention):
         return fp8_quant_dequant(kv, 32)
 
     def store_context(self, states, positions, slots):
+        graph = getattr(self, "_context_graph", None)
+        if graph is not None and graph(self, states, positions, slots):
+            logger.info_once(
+                "DSPARK_CONTEXT_GRAPH_RUNTIME pid=%d stage=%s rows=%d",
+                os.getpid(),
+                self.cache.prefix,
+                states.shape[0],
+                scope="process",
+            )
+            return
         kv = self.project_kv(states, positions)
         if slots is None:
             return
