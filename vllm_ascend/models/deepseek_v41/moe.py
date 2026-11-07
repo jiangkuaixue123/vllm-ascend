@@ -9,6 +9,7 @@ down projection, including its activation quantization. This implementation
 supports replicated or sequence-sharded input rows with static expert placement.
 """
 
+import os
 from collections.abc import Sequence
 from typing import Protocol
 
@@ -26,6 +27,7 @@ from vllm.distributed import (
 from vllm.logger import logger
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
+    MergedColumnParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
 )
@@ -37,6 +39,10 @@ from vllm_ascend.models.deepseek_v41.core import (
     clipped_swiglu,
     route_sqrtsoftplus,
 )
+from vllm_ascend.quantization.method_adapters import AscendLinearMethod
+from vllm_ascend.quantization.methods.w8a8.w8a8_dynamic import AscendW8A8DynamicLinearMethod
+
+MERGED_UP_RUNTIME_MAX_ROWS = 12
 
 
 def local_expert_ids(num_experts: int, ep_size: int, ep_rank: int) -> range:
@@ -307,9 +313,36 @@ class DeepseekV41MoEExpert(nn.Module):
         self.w1 = up_class(hidden, intermediate, prefix=f"{prefix}.w1", **common, **up_options)
         self.w2 = down_class(intermediate, hidden, prefix=f"{prefix}.w2", **common, **down_options)
         self.w3 = up_class(hidden, intermediate, prefix=f"{prefix}.w3", **common, **up_options)
+        self._merged_up = (
+            shared
+            and replicated_shared
+            and all(
+                type(getattr(layer, "quant_method", None)) is AscendLinearMethod
+                and type(layer.quant_method.quant_method) is AscendW8A8DynamicLinearMethod
+                for layer in (self.w1, self.w3)
+            )
+        )
+        self._merged_prefix = prefix
+        if self._merged_up:
+            self.w13 = MergedColumnParallelLinear(
+                hidden, [intermediate, intermediate], disable_tp=True, prefix=f"{prefix}.w13", **common
+            )
+            del self.w1, self.w3
 
     def forward(self, hidden_states: torch.Tensor, routing_weights: torch.Tensor | None = None) -> torch.Tensor:
-        activation = clipped_swiglu(self.w1(hidden_states), self.w3(hidden_states), self.swiglu_limit)
+        if getattr(self, "_merged_up", False):
+            gate, up = self.w13(hidden_states).chunk(2, dim=-1)
+            if hidden_states.shape[0] <= MERGED_UP_RUNTIME_MAX_ROWS:
+                logger.info_once(
+                    "SHARED_UP_MERGED_RUNTIME pid=%d layer=%s rows=%d",
+                    os.getpid(),
+                    self._merged_prefix,
+                    hidden_states.shape[0],
+                    scope="process",
+                )
+        else:
+            gate, up = self.w1(hidden_states), self.w3(hidden_states)
+        activation = clipped_swiglu(gate, up, self.swiglu_limit)
         if routing_weights is not None:
             activation = activation * routing_weights
         output = self.w2(activation.to(hidden_states.dtype))

@@ -10,6 +10,7 @@ import torch
 from safetensors import safe_open
 from vllm.logger import logger
 from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+from vllm.model_executor.layers.linear import MergedColumnParallelLinear
 
 
 @dataclass(frozen=True)
@@ -39,6 +40,13 @@ def _list_parts(parameters, modules):
     expert_ids = {key: _owned_experts(owner) for key, owner in owners.items()}
     for destination in parameters:
         path, _, field = destination.rpartition(".")
+        module = modules.get(path)
+        if path.endswith(".shared_experts.w13") and isinstance(module, MergedColumnParallelLinear):
+            if module.tp_size != 1 or field not in ("weight", "weight_scale", "weight_offset"):
+                raise ValueError(f"Unsupported merged V4.1 shared projection: {destination}")
+            for projection in ("w1", "w3"):
+                yield IndexedPart(f"{path.rpartition('.')[0]}.{projection}.{field}", destination, projection)
+            continue
         owner = owners.get(path)
         packed, _, suffix = field.partition("_")
         if owner is None or packed not in ("w13", "w2") or suffix not in ("weight", "weight_scale", "weight_offset"):
@@ -79,6 +87,17 @@ def _load_expert_tensor(reader, part, parameter, config):
         raise ValueError(f"Local V4.1 expert refused checkpoint tensor {part.source}")
 
 
+def _load_shared_projection(reader, part, parameter, config):
+    source = reader.get_tensor(part.source)
+    is_weight = part.source.endswith(".weight")
+    expected = (config.moe_intermediate_size, config.hidden_size if is_weight else 1)
+    if tuple(source.shape) != expected:
+        raise ValueError(f"Invalid V4.1 shared projection shape for {part.source}: {source.shape} != {expected}")
+    if (is_weight and source.dtype != parameter.dtype) or (not is_weight and not source.is_floating_point()):
+        raise ValueError(f"Invalid V4.1 shared projection dtype for {part.source}: {source.dtype}")
+    parameter.weight_loader(parameter, source, 0 if part.projection == "w1" else 1)
+
+
 @torch.no_grad()
 def load_indexed_v41_weights(model, weight_map, tp_rank, tp_size, read_parameter_slice):
     """Return loaded parameter names only after every required source part was read."""
@@ -101,6 +120,8 @@ def load_indexed_v41_weights(model, weight_map, tp_rank, tp_size, read_parameter
                 param = parameters[part.destination]
                 if part.expert_id >= 0:
                     _load_expert_tensor(reader, part, param, model.config)
+                elif part.projection:
+                    _load_shared_projection(reader, part, param, model.config)
                 else:
                     module = modules[part.destination.rpartition(".")[0]]
                     read_parameter_slice(reader, part.source, param, module, tp_rank, tp_size)

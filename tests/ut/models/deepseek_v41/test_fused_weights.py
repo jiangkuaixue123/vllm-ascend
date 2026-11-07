@@ -16,7 +16,7 @@ from vllm_ascend.quantization.configs.modelslim_config import (
     get_packed_modules_mapping,
     get_quant_type_for_layer,
 )
-from vllm_ascend.quantization.method_adapters import AscendFusedMoEMethod
+from vllm_ascend.quantization.method_adapters import AscendFusedMoEMethod, AscendLinearMethod
 from vllm_ascend.quantization.methods.w8a8 import w8a8_dynamic
 from vllm_ascend.quantization.methods.w8a8.w8a8_dynamic import AscendW8A8DynamicFusedMoEMethod
 
@@ -158,3 +158,65 @@ def test_quant_dispatch_resolves_named_v41_experts(root):
     desc[prefix + ".0.w3.weight"] = "FLOAT"
     with pytest.raises(ValueError):
         get_quant_type_for_layer(desc, prefix, "moe", mapping)
+
+
+class SharedQuantConfig:
+    def get_quant_method(self, layer, prefix):
+        return AscendLinearMethod(w8a8_dynamic.AscendW8A8DynamicLinearMethod())
+
+
+def shared_model_and_checkpoint(path, root):
+    model = nn.Module()
+    model.config = SimpleNamespace(hidden_size=6, moe_intermediate_size=4)
+    model.model_path = path
+    blocks = nn.ModuleList([nn.Module()])
+    setattr(model, root, blocks)
+    blocks[0].ffn = nn.Module()
+    shared = blocks[0].ffn.shared_experts = nn.Module()
+    prefix = f"{root}.0.ffn.shared_experts"
+    shared.w13 = fused_weights.MergedColumnParallelLinear(
+        6, [4, 4], bias=False, disable_tp=True, quant_config=SharedQuantConfig(), prefix=prefix + ".w13"
+    )
+    sources, index = {}, {}
+    for i, projection in enumerate(("w1", "w3")):
+        values = {
+            f"{prefix}.{projection}.weight": torch.full((4, 6), i + 1, dtype=torch.int8),
+            f"{prefix}.{projection}.weight_scale": torch.full((4, 1), i + 0.25),
+            f"{prefix}.{projection}.weight_offset": torch.zeros(4, 1),
+        }
+        name = f"shared-{i}.safetensors"
+        save_file(values, str(path / name))
+        index.update({key: name for key in values})
+        sources.update(values)
+    return model, shared.w13, sources, index
+
+
+@pytest.mark.parametrize("root", ["layers", "mtp"])
+def test_merged_shared_loads_original_parts_and_channel_order(tmp_path, root):
+    model, linear, sources, index = shared_model_and_checkpoint(tmp_path, root)
+    loaded = fused_weights.load_indexed_v41_weights(model, index, 3, 4, read_parameter_slice)
+    assert loaded == set(dict(model.named_parameters()))
+    assert linear.tp_rank == 0 and linear.tp_size == 1
+    for field in ("weight", "weight_scale", "weight_offset"):
+        expected = torch.cat([sources[f"{root}.0.ffn.shared_experts.{p}.{field}"] for p in ("w1", "w3")])
+        torch.testing.assert_close(getattr(linear, field), expected, rtol=0, atol=0, check_dtype=False)
+    for model_type in ("deepseek_v41", "deepseek_v41_text"):
+        desc = {f"{root}.0.ffn.shared_experts.{p}.weight": "W8A8_DYNAMIC" for p in ("w1", "w3")}
+        mapping = get_packed_modules_mapping(model_type)
+        assert get_quant_type_for_layer(desc, f"{root}.0.ffn.shared_experts.w13", "linear", mapping) == "W8A8_DYNAMIC"
+
+
+@pytest.mark.parametrize("failure", ["missing", "shape", "dtype"])
+def test_merged_shared_rejects_missing_or_invalid_source(tmp_path, failure):
+    model, _, sources, index = shared_model_and_checkpoint(tmp_path, "mtp")
+    key = "mtp.0.ffn.shared_experts.w3.weight"
+    if failure == "missing":
+        del index[key]
+        error, match = KeyError, "w3.weight"
+    else:
+        value = sources[key][:1] if failure == "shape" else sources[key].float()
+        save_file({key: value}, str(tmp_path / "invalid.safetensors"))
+        index[key] = "invalid.safetensors"
+        error, match = ValueError, f"shared projection {failure}"
+    with pytest.raises(error, match=match):
+        fused_weights.load_indexed_v41_weights(model, index, 3, 4, read_parameter_slice)
