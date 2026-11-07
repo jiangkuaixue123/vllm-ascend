@@ -1,0 +1,30 @@
+tests/e2e/nightly/single_node/ops/multicard_ops_a3/test_target_query_overlap.py
+  s_6eab87361519a8::t_6bff45fba79836 79-80,86,92,125,131,136,138
+vllm_ascend/models/deepseek_v41/attention.py
+  s_6eab87361519a8::t_0191536a044e2e 83,1261
+  s_6eab87361519a8::t_2cc2e2b92498af 1033,1043-1050,1254-1260,1262-1275,1320,1322,1348,1351,1356-1365,1374
+tests/ut/models/deepseek_v41/test_decode_index_tiles.py
+  s_6eab87361519a8::t_c4370ccc7a9eec 14-15,58-64
+tests/e2e/nightly/single_node/ops/multicard_ops_a3/test_target_index_overlap.py
+  s_6eab87361519a8::t_37830d8ec57650 1-27,31-90,93,97-98,100-102,115-122,124-147,149-175,182-194,196-199,218-256,271-292,308-311
+  s_6eab87361519a8::t_e36ea79f873dc4 148,176-181,257-270,293-297
+  s_6eab87361519a8::t_65caa9c65e0d67 28-30,91-92,94-96,99,103-114,123,195
+  s_6eab87361519a8::t_a28ddbd51b872d 200-217
+  s_6eab87361519a8::t_d8fd4f669a713a 298-307
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "9e522a199a8f5cd2228a0067ca1f4b251945f6f0",
+  "prompts": {},
+  "sessions": {
+    "s_6eab87361519a8": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1ac13-1fd0-7670-ae84-d58acaf2730c",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "jiangkuaixue123 <jiangxiaozhou111@163.com>"
+    }
+  }
+}
