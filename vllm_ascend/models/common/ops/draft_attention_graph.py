@@ -19,6 +19,21 @@ LOCAL_HEADS = 16
 WINDOW = 128
 ND_FORMAT = 2
 SUPPORTED_BATCHES = (1, 4)
+OUTPUT_GROUPS = 2
+OUTPUT_RANK = 1024
+TENSOR_PARALLEL_SIZE = 4
+
+
+def supports_draft_output_graph(attention):
+    """Capture only local projection; no collective may run during recording."""
+    return (
+        attention.tp == TENSOR_PARALLEL_SIZE
+        and attention.sequence_group is None
+        and attention.groups == OUTPUT_GROUPS
+        and attention.local_heads == LOCAL_HEADS
+        and attention.config.o_lora_rank == OUTPUT_RANK
+        and not attention.wo_b.reduce_results
+    )
 
 
 def supports_draft_attention_graph(attention, hidden, positions, metadata):
@@ -147,13 +162,20 @@ class _AttentionGraphEntry:
 
 
 class DraftAttentionGraph:
-    """Bound each layer to two graphs; output projection and communication stay outside."""
+    """Bound each layer to two graphs; communication always stays outside."""
 
-    def __init__(self):
+    def __init__(self, *, project_output=False):
         self.entries = {}
+        self.project_output = project_output
+
+    def _run(self, attention, hidden, positions, table, start, device_history):
+        output = draft_attention_core(attention, hidden, positions, table, start, device_history=device_history)
+        return attention._project_output_local(output) if self.project_output else output
 
     def __call__(self, attention, hidden, positions, metadata):
         if not supports_draft_attention_graph(attention, hidden, positions, metadata):
+            return None
+        if self.project_output and not supports_draft_output_graph(attention):
             return None
         if torch.npu.is_current_stream_capturing():
             return None
@@ -176,7 +198,10 @@ class DraftAttentionGraph:
         device_history = device_lengths is not None
         table = metadata.block_table_tensor[:batch]
         tensors = [attention.attn_sink, attention.frequencies]
-        for module in (attention.wq_a, attention.wq_b, attention.wkv, attention.q_norm, attention.kv_norm):
+        modules = [attention.wq_a, attention.wq_b, attention.wkv, attention.q_norm, attention.kv_norm]
+        if self.project_output:
+            modules.extend((attention.wo_a, attention.wo_b))
+        for module in modules:
             tensors.extend(module.parameters())
             tensors.extend(module.buffers())
         if any(tensor.device != hidden.device for tensor in tensors):
@@ -216,14 +241,10 @@ class DraftAttentionGraph:
                     [span.start_pos for span in metadata.requests], device=hidden.device, dtype=torch.int64
                 )
             # Warm lazy kernels and native attention metadata before recording once.
-            draft_attention_core(
-                attention, static_hidden, static_positions, static_table, start, device_history=device_history
-            )
+            self._run(attention, static_hidden, static_positions, static_table, start, device_history)
             graph = torch.npu.NPUGraph()
             with torch.npu.graph(graph):
-                output = draft_attention_core(
-                    attention, static_hidden, static_positions, static_table, start, device_history=device_history
-                )
+                output = self._run(attention, static_hidden, static_positions, static_table, start, device_history)
             entry = _AttentionGraphEntry(static_hidden, static_positions, static_table, start, graph, output, signature)
             self.entries[batch] = entry
         else:

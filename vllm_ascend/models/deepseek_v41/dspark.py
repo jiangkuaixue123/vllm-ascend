@@ -12,7 +12,11 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 from torch import nn
-from vllm.distributed import get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size
+from vllm.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
+)
 from vllm.forward_context import get_forward_context
 from vllm.logger import logger
 from vllm.model_executor.layers.linear import ColumnParallelLinear, ReplicatedLinear, RowParallelLinear
@@ -30,6 +34,7 @@ from .attention import (
     DeepseekV41Metadata,
     DeepseekV41RMSNorm,
     RequestSpan,
+    _quantize_projection_input,
     rotary_frequencies,
 )
 from .attention_ops import fp8_quant_dequant
@@ -215,7 +220,9 @@ class DSparkAttention(DeepseekV41Attention):
         self.dsa_cp = False
         self.attention_kernel = DeepseekV41NativeAttention()
         self._staging_b4_witness_pending = True
-        self._attention_graph = DraftAttentionGraph() if getattr(vllm_config, "lora_config", None) is None else None
+        self._attention_graph = (
+            DraftAttentionGraph(project_output=True) if getattr(vllm_config, "lora_config", None) is None else None
+        )
         self._context_graph = DraftContextGraph() if getattr(vllm_config, "lora_config", None) is None else None
         self.sequence_group = None
         self.dim = config.head_dim
@@ -315,6 +322,14 @@ class DSparkAttention(DeepseekV41Attention):
         marker = "DSPARK_BATCH_ATTENTION_RUNTIME %s" if staged is not None else "DSPARK_STAGING_B4_WITNESS %s"
         logger.info(marker, json.dumps(record, sort_keys=True, separators=(",", ":")))
 
+    def _project_output_local(self, output):
+        """Preserve the parent's projection arithmetic up to its FP32 TP sum."""
+        output = output.view(-1, self.groups, self.local_heads * self.dim // self.groups)
+        output = _quantize_projection_input(output)
+        projection = self.wo_a.weight.view(self.groups, self.config.o_lora_rank, -1)
+        output = torch.einsum("sgd,grd->sgr", output, projection).flatten(1)
+        return self.wo_b(output)[0].float()
+
     def forward(self, hidden, positions):
         positions = positions.reshape(-1)
         graph = getattr(self, "_attention_graph", None)
@@ -342,6 +357,15 @@ class DSparkAttention(DeepseekV41Attention):
                     hidden.shape[0],
                     scope="process",
                 )
+                if getattr(graph, "project_output", False):
+                    logger.info_once(
+                        "DSPARK_OUTPUT_GRAPH_RUNTIME pid=%d stage=%s rows=%d",
+                        os.getpid(),
+                        self.cache.prefix,
+                        hidden.shape[0],
+                        scope="process",
+                    )
+                    return tensor_model_parallel_all_reduce(attended).to(hidden.dtype)
                 return self._project_output(attended, hidden.dtype)
         qr = self.q_norm(self.wq_a(hidden)[0])
         q = self.wq_b(qr)[0].view(-1, self.heads, self.dim)
