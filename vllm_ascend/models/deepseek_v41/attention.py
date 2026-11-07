@@ -41,6 +41,7 @@ from vllm.v1.attention.backend import (
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 
 from vllm_ascend.models.common.ops.rms_rsqrt_fused import try_rms_rsqrt_fused
+from vllm_ascend.ops.linear import AscendUnquantizedLinearMethod
 from vllm_ascend.utils import AscendDeviceType, enable_custom_op, enable_dsa_cp, enable_sp, get_ascend_device_type
 
 from .attention_ops import (
@@ -79,6 +80,8 @@ _PARTIAL_ROPE_DIM = 64
 _ARENA_BLOCK_SIZE = 128
 _ARENA_LEGACY_LENGTH = 16384
 _ARENA_LONG_LENGTH = 153600
+_LOCAL_KV_DECODE_ROWS = (6, 12)
+_LOCAL_KV_LAYOUT = (4, 5120, 512)
 
 
 def _quantize_projection_input(output):
@@ -1224,10 +1227,51 @@ class DeepseekV41Attention(nn.Module):
         ids = torch.where(valid, columns, -1).to(torch.int32).unsqueeze(1)
         return selected, ids
 
+    def _try_gather_projected_kv(self, local_states):
+        """Project independent token rows before gathering non-source decode KV."""
+        tp, hidden_size, head_dim = _LOCAL_KV_LAYOUT
+        method = getattr(self.wkv, "quant_method", None)
+        if not (
+            self.dsa_cp
+            and self.tp == tp
+            and self.dim == head_dim
+            and self.sequence_group is not None
+            and self.sequence_group.world_size == tp
+            and (not self.ratio or not self.owns_kv)
+            and local_states.device.type == "npu"
+            and local_states.dtype == torch.bfloat16
+            and local_states.ndim == 2
+            and local_states.shape[0] in _LOCAL_KV_DECODE_ROWS
+            and local_states.shape[1] == hidden_size
+            and local_states.is_contiguous()
+            and isinstance(method, AscendUnquantizedLinearMethod)
+            and self.wkv.weight.dtype == torch.bfloat16
+            and torch.is_inference_mode_enabled()
+            and get_ascend_device_type() == AscendDeviceType.A3
+        ):
+            return None
+        projected = self.wkv(local_states)[0]
+        gathered = self.sequence_group.all_gather(projected.contiguous(), dim=0)
+        logger.info_once(
+            "TARGET_KV_BEFORE_GATHER_BF16_RUNTIME pid=%d layer=%d rows=%d",
+            os.getpid(),
+            self.layer_id,
+            local_states.shape[0],
+            scope="process",
+        )
+        return gathered
+
     def _decode_forward(self, local_states, runtime):
         full_md = self.cache.metadata().decode
-        gathered, offset = self._sequence_inputs(local_states, "uniform_decode")
-        if full_md is None or gathered.shape[0] != full_md.active.shape[0]:
+        projected_kv = self._try_gather_projected_kv(local_states)
+        if projected_kv is None:
+            gathered, offset = self._sequence_inputs(local_states, "uniform_decode")
+            global_rows = gathered.shape[0]
+        else:
+            gathered = None
+            offset = self.sequence_group.rank_in_group * local_states.shape[0]
+            global_rows = projected_kv.shape[0]
+        if full_md is None or global_rows != full_md.active.shape[0]:
             raise ValueError("V4.1 graph token rows must match the decode metadata bucket")
         local_md = full_md.shard(offset, local_states.shape[0]) if self.sequence_group is not None else full_md
         x, md = (local_states, local_md) if self.dsa_cp else (gathered, full_md)
@@ -1235,14 +1279,14 @@ class DeepseekV41Attention(nn.Module):
         pos = full_pos[offset : offset + x.shape[0]] if self.dsa_cp else full_pos
         qr = self.q_norm(self.wq_a(x)[0])
         q = self.wq_b(qr)[0].view(x.shape[0], self.heads, self.dim)
-        raw = self.kv_norm(self.wkv(gathered)[0])
+        raw = self.kv_norm(self.wkv(gathered)[0] if projected_kv is None else projected_kv)
         self.rotate(q.unsqueeze(0), pos)
         self.rotate(raw.unsqueeze(0), full_pos)
         self.cache.decode_write(full_md, fp8_quant_dequant(raw, 32), 0, 0, full_md.active)
         extra = 0
         if self.ratio:
-            self._decode_compressed(gathered, full_pos, full_md, runtime)
             if self.owns_kv:
+                self._decode_compressed(gathered, full_pos, full_md, runtime)
                 runtime.source_decode = md
             self._decode_index(x, qr, pos, md, runtime)
             extra = runtime.decode_topk.shape[-1]
