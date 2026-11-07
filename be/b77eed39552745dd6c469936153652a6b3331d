@@ -1,0 +1,36 @@
+tests/e2e/nightly/single_node/ops/multicard_ops_a3/test_target_row_mask_moe.py
+  s_6eab87361519a8::t_925a7e6f9a56f4 204-242
+  s_6eab87361519a8::t_3ffb49333d451d 1-203,243-297
+vllm_ascend/models/deepseek_v41/moe.py
+  s_6eab87361519a8::t_d1b51563e2448e 35,472,474
+vllm_ascend/models/deepseek_v41/attention.py
+  s_6eab87361519a8::t_d1b51563e2448e 43,1363
+tests/ut/ops/test_decode_row_mask.py
+  s_6eab87361519a8::t_adadc8a41ae85d 1-53,59-79,81-102,112-113
+  s_6eab87361519a8::t_925a7e6f9a56f4 54-58,80,103-111
+vllm_ascend/models/common/ops/decode_row_mask.py
+  s_6eab87361519a8::t_41defb8a7878a4 19
+  s_6eab87361519a8::t_e4048946a313ef 1-7,9-18,20-48
+  s_6eab87361519a8::t_d1b51563e2448e 8
+vllm_ascend/ops/triton/decode_row_mask.py
+  s_6eab87361519a8::t_41defb8a7878a4 3,11-13,19-28,32,34-36,47-49
+  s_6eab87361519a8::t_e4048946a313ef 1-2,4-10,14-18,29-31,33,37-46,50-54
+tests/ut/models/deepseek_v41/test_moe.py
+  s_6eab87361519a8::t_d1b51563e2448e 546,559-560
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "beb77eed39552745dd6c469936153652a6b3331d",
+  "prompts": {},
+  "sessions": {
+    "s_6eab87361519a8": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1ac13-1fd0-7670-ae84-d58acaf2730c",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "jiangkuaixue123 <jiangxiaozhou111@163.com>"
+    }
+  }
+}
