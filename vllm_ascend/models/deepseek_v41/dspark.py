@@ -26,6 +26,7 @@ from vllm.v1.attention.backend import AttentionCGSupport, AttentionMetadataBuild
 
 from vllm_ascend.models.common.ops.draft_attention_graph import DraftAttentionGraph
 from vllm_ascend.models.common.ops.draft_context_graph import DraftContextGraph
+from vllm_ascend.models.common.ops.draft_stage_graph import DraftStageGraph
 
 from .attention import (
     DeepseekV41Attention,
@@ -462,6 +463,44 @@ class DSparkStage(DeepseekV41Block):
             )
             self.register_parameter(f"hc_{part}_scale", nn.Parameter(torch.empty(3, dtype=torch.float32)))
             self.register_parameter(f"hc_{part}_base", nn.Parameter(torch.empty(width, dtype=torch.float32)))
+
+        self._stage_graphs = (
+            {"attn": DraftStageGraph(), "ffn": DraftStageGraph(after_attention=True)}
+            if getattr(vllm_config, "lora_config", None) is None
+            else None
+        )
+
+    def forward(self, hidden_states, pre_mix, runtime, decode_mask=None, image_mask=None):
+        graphs = getattr(self, "_stage_graphs", None)
+        if (
+            graphs is None
+            or decode_mask is not None
+            or image_mask is not None
+            or getattr(runtime, "decode", None) is not None
+        ):
+            return super().forward(hidden_states, pre_mix, runtime, decode_mask, image_mask)
+        prepared = graphs["attn"](self, (hidden_states, pre_mix))
+        if prepared is None:
+            return super().forward(hidden_states, pre_mix, runtime, decode_mask, image_mask)
+        attn_input, attn_pre, post, comb, _ = prepared
+        attended = self.attn(attn_input, runtime)
+        prepared = graphs["ffn"](self, (attended, hidden_states, attn_pre, post, comb))
+        if prepared is None:
+            # Attention already communicated; finish the parent chain once.
+            hidden_states = self.post_residual(attended, hidden_states, post, comb, runtime)
+            ffn_input, ffn_pre, post, comb = self.pre_and_mixes(hidden_states, attn_pre, "ffn", runtime)
+            ffn_input = self.ffn_norm(ffn_input)
+        else:
+            ffn_input, ffn_pre, post, comb, hidden_states = prepared
+            logger.info_once(
+                "DSPARK_STAGE_LOCAL_GRAPH_RUNTIME pid=%d stage=%s rows=%d",
+                os.getpid(),
+                self.attn.cache.prefix,
+                hidden_states.shape[0],
+                scope="process",
+            )
+        output = self.ffn(ffn_input)
+        return self.post_residual(output, hidden_states, post, comb, runtime), ffn_pre
 
 
 class DSparkMarkov(nn.Module):
