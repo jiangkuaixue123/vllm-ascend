@@ -5,6 +5,7 @@
 import statistics
 import time
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -29,6 +30,8 @@ PHYSICAL = 1024
 TABLE_PAGES = 1200
 CALLS = 12
 REPEATS = 5
+OUTPUT_GROUPS = 2
+OUTPUT_RANK = 1024
 
 
 class QuantLinear(nn.Module):
@@ -260,6 +263,119 @@ def test_complete_attention_eager_latency(model, monkeypatch, batch):
         {
             "batch": batch,
             "calls": CALLS,
+            "metrics": ["host_submit_ms", "wall_ready_ms", "device_ms"],
+            **{name: [statistics.median(values) for values in zip(*samples)] for name, samples in measurements.items()},
+        }
+    )
+
+
+@pytest.fixture
+def idle_model(model, monkeypatch):
+    context = SimpleNamespace(in_profile_run=True, is_draft_model=True, attn_metadata=None, draft_attn_metadatas=[])
+    monkeypatch.setattr(dspark, "get_forward_context", lambda: context)
+    config = SimpleNamespace(**vars(model.config), o_lora_rank=OUTPUT_RANK)
+    monkeypatch.setattr(model, "config", config)
+    monkeypatch.setattr(model, "groups", OUTPUT_GROUPS, raising=False)
+    monkeypatch.setattr(model, "local_heads", HEADS, raising=False)
+    monkeypatch.setattr(model, "sequence_group", None, raising=False)
+    with torch.inference_mode():
+        wo_a = nn.Linear(
+            DIM * HEADS // OUTPUT_GROUPS, OUTPUT_RANK * OUTPUT_GROUPS, bias=False, device="npu", dtype=torch.bfloat16
+        )
+        wo_b = QuantLinear(OUTPUT_RANK * OUTPUT_GROUPS, HIDDEN)
+    monkeypatch.setattr(model, "wo_a", wo_a, raising=False)
+    monkeypatch.setattr(model, "wo_b", wo_b, raising=False)
+    monkeypatch.setattr(model, "_project_output", dspark.DSparkAttention._project_output.__get__(model))
+    collective = Mock(side_effect=lambda output: output)
+    monkeypatch.setattr("vllm_ascend.models.deepseek_v41.attention.tensor_model_parallel_all_reduce", collective)
+    return model, context, collective
+
+
+@pytest.mark.parametrize("batch", [1, 4, 8])
+@torch.inference_mode()
+def test_idle_native_output_keeps_projection_and_collective(idle_model, monkeypatch, batch):
+    model, context, collective = idle_model
+    hidden, positions, _ = inputs(model, batch=batch)
+    model.cache.metadata = lambda: None
+    project = Mock(wraps=model.project_kv)
+    monkeypatch.setattr(model, "project_kv", project)
+    expected = model(hidden, positions)
+    assert project.call_count == collective.call_count == 1
+    context.in_profile_run = False
+    actual = model(hidden, positions)
+    same(actual, expected)
+    assert actual.shape == hidden.shape
+    assert project.call_count == 1 and collective.call_count == 2
+
+
+@torch.inference_mode()
+def test_idle_context_only_skips_unwritten_nonprofile_projection(idle_model, monkeypatch):
+    model, context, _ = idle_model
+    hidden, positions, _ = inputs(model)
+    cache = model.cache.field(0, 0, DIM)
+    saved = cache.clone()
+    project = Mock(wraps=model.project_kv)
+    monkeypatch.setattr(model, "project_kv", project)
+    model.store_context(hidden, positions, None)
+    assert project.call_count == 1
+    context.in_profile_run = False
+    model.store_context(hidden, positions, None)
+    assert project.call_count == 1
+    same(cache, saved)
+    expected = model.project_kv(hidden, positions)
+    slots = torch.arange(ROWS, dtype=torch.int64, device="npu")
+    model.store_context(hidden, positions, slots)
+    assert project.call_count == 3
+    same(cache[slots], expected)
+
+
+@torch.inference_mode()
+def test_real_missing_metadata_still_raises(idle_model):
+    model, context, collective = idle_model
+    hidden, positions, _ = inputs(model)
+    model.cache.metadata = lambda: None
+    context.in_profile_run = context.is_draft_model = False
+    with pytest.raises(RuntimeError, match="requires the draft layer's paged metadata"):
+        model(hidden, positions)
+    collective.assert_not_called()
+
+
+@torch.inference_mode()
+def test_idle_outer_capture_keeps_full_projection_path(idle_model, monkeypatch):
+    model, context, _ = idle_model
+    hidden, positions, _ = inputs(model)
+    model.cache.metadata = lambda: None
+    expected = model(hidden, positions)
+    context.in_profile_run = False
+    project = Mock(wraps=model.project_kv)
+    monkeypatch.setattr(model, "project_kv", project)
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph):
+        output = model(hidden, positions)
+    assert project.call_count == 1
+    graph.replay()
+    same(output, expected)
+
+
+@torch.inference_mode()
+def test_complete_idle_attention_latency(idle_model):
+    model, context, _ = idle_model
+    hidden, positions, _ = inputs(model)
+    model.cache.metadata = lambda: None
+
+    def run(profile):
+        context.in_profile_run = profile
+        model.store_context(hidden, positions, None)
+        return model(hidden, positions)
+
+    same(run(False), run(True))
+    measurements = {"parent": [], "candidate": []}
+    for repeat in range(REPEATS):
+        for name in ("parent", "candidate") if repeat % 2 == 0 else ("candidate", "parent"):
+            measurements[name].append(elapsed(lambda profile=name == "parent": run(profile)))
+    print(
+        {
+            "idle_calls": CALLS,
             "metrics": ["host_submit_ms", "wall_ready_ms", "device_ms"],
             **{name: [statistics.median(values) for values in zip(*samples)] for name, samples in measurements.items()},
         }

@@ -177,6 +177,17 @@ def is_draft_dummy():
     )
 
 
+def is_idle_draft():
+    """Idle DP ranks still join draft collectives; memory profiling must compute."""
+    ctx = get_forward_context()
+    return (
+        not getattr(ctx, "in_profile_run", False)
+        and getattr(ctx, "is_draft_model", False)
+        and ctx.attn_metadata is None
+        and getattr(ctx, "draft_attn_metadatas", None) == []
+    )
+
+
 class DSparkAttention(DeepseekV41Attention):
     """TP-head attention over paged target context and a bidirectional draft block."""
 
@@ -230,6 +241,17 @@ class DSparkAttention(DeepseekV41Attention):
         return fp8_quant_dequant(kv, 32)
 
     def store_context(self, states, positions, slots):
+        if (
+            slots is None
+            and states.device.type == "npu"
+            and torch.is_inference_mode_enabled()
+            and not torch.npu.is_current_stream_capturing()
+            and is_idle_draft()
+        ):
+            logger.info_once(
+                "DSPARK_IDLE_CONTEXT_RUNTIME pid=%d stage=%s", os.getpid(), self.cache.prefix, scope="process"
+            )
+            return
         kv = self.project_kv(states, positions)
         if slots is None:
             return
@@ -281,6 +303,27 @@ class DSparkAttention(DeepseekV41Attention):
 
     def forward(self, hidden, positions):
         positions = positions.reshape(-1)
+        metadata = self.cache.metadata()
+        if (
+            metadata is None
+            and hidden.device.type == "npu"
+            and torch.is_inference_mode_enabled()
+            and not torch.npu.is_current_stream_capturing()
+            and is_idle_draft()
+        ):
+            # The parent discards Q/KV and feeds zero attention to the same
+            # rotation, output projection and TP collective on idle DP ranks.
+            attended = hidden.new_zeros((hidden.shape[0], self.heads, self.dim))
+            self.rotate(attended.unsqueeze(0), positions, inverse=True)
+            output = self._project_output(attended, hidden.dtype)
+            logger.info_once(
+                "DSPARK_IDLE_ATTN_RUNTIME pid=%d stage=%s rows=%d",
+                os.getpid(),
+                self.cache.prefix,
+                hidden.shape[0],
+                scope="process",
+            )
+            return output
         graph = getattr(self, "_attention_graph", None)
         if (
             graph is not None
@@ -288,7 +331,7 @@ class DSparkAttention(DeepseekV41Attention):
             and torch.is_inference_mode_enabled()
             and not is_draft_dummy()
         ):
-            attended = graph(self, hidden, positions, self.cache.metadata())
+            attended = graph(self, hidden, positions, metadata)
             if attended is not None:
                 logger.info_once(
                     "DSPARK_ATTN_GRAPH_RUNTIME pid=%d stage=%s rows=%d",
@@ -302,7 +345,6 @@ class DSparkAttention(DeepseekV41Attention):
         q = self.wq_b(qr)[0].view(-1, self.heads, self.dim)
         self.rotate(q.unsqueeze(0), positions)
         query_kv = self.project_kv(hidden, positions)
-        metadata = self.cache.metadata()
         if metadata is None:
             if not is_draft_dummy():
                 raise RuntimeError("DSpark proposal requires the draft layer's paged metadata")
