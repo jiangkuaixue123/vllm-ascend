@@ -11,7 +11,8 @@ from vllm_ascend.models.deepseek_v41 import attention
 
 @pytest.mark.parametrize("ratio", [1, 2])
 @pytest.mark.parametrize("tensor_device", ["cpu", "npu"])
-def test_decode_index_selects_across_key_tiles(monkeypatch, ratio, tensor_device):
+@pytest.mark.parametrize("precomputed", [False, True])
+def test_decode_index_selects_across_key_tiles(monkeypatch, ratio, tensor_device, precomputed):
     if tensor_device == "npu" and not torch.npu.is_available():
         pytest.skip("requires Ascend NPU")
     device = torch.device(tensor_device)
@@ -54,7 +55,13 @@ def test_decode_index_selects_across_key_tiles(monkeypatch, ratio, tensor_device
     )
     runtime = SimpleNamespace(source_cache=SimpleNamespace(decode_read=read), source_decode=md)
     monkeypatch.setattr(attention, "_DECODE_INDEX_TILE_KEYS", 4)
-    attention.DeepseekV41Attention._decode_index(layer, q, q.clone(), md.seq_lens - 1, md, runtime)
+    prepared = None
+    if precomputed:
+        prepared = (
+            attention.fp4_quant_dequant(q.clone(), 32, scale_format="e8m0"),
+            weights * (dim**-0.5 * heads**-0.5),
+        )
+    attention.DeepseekV41Attention._decode_index(layer, q, q.clone(), md.seq_lens - 1, md, runtime, prepared)
 
     query = attention.fp4_quant_dequant(q, 32, scale_format="e8m0")
     per_head = torch.einsum("bhd,btd->bht", query, keys).relu_()
