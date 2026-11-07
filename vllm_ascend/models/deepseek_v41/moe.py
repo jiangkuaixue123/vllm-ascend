@@ -32,6 +32,7 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.quantization import QuantizationConfig
 
 from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.models.common.ops.decode_row_mask import mask_decode_rows
 from vllm_ascend.models.deepseek_v41.config import DeepseekV41TextConfig
 from vllm_ascend.models.deepseek_v41.core import (
     clipped_swiglu,
@@ -468,7 +469,6 @@ class DeepseekV41MoE(nn.Module):
             or token_mask.device != hidden_states.device
         ):
             raise ValueError("Expected fixed decode states [slots, hidden] and bool slot mask")
-        valid = token_mask.unsqueeze(-1)
-        states = torch.where(valid, hidden_states, 0.0)
+        states = mask_decode_rows(hidden_states, token_mask)
         output = self._routed_output(states, decode=True) + self._shared_output(states).float()
-        return torch.where(valid, output.to(states.dtype), 0.0)
+        return mask_decode_rows(output.to(states.dtype), token_mask)

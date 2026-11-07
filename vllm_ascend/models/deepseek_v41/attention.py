@@ -40,6 +40,7 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 
+from vllm_ascend.models.common.ops.decode_row_mask import mask_decode_rows
 from vllm_ascend.models.common.ops.rms_rsqrt_fused import try_rms_rsqrt_fused
 from vllm_ascend.ops.linear import AscendUnquantizedLinearMethod
 from vllm_ascend.quantization.method_adapters import AscendLinearMethod
@@ -1359,7 +1360,7 @@ class DeepseekV41Attention(nn.Module):
             )
         self.rotate(attended.unsqueeze(0), pos, inverse=True)
         output = self._project_output(attended, x.dtype)
-        return torch.where(local_md.active[:, None], output, 0)
+        return mask_decode_rows(output, local_md.active)
 
     def forward(self, hidden_states, runtime):
         if runtime.decode is not None:
