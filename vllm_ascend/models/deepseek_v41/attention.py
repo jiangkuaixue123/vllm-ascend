@@ -40,6 +40,7 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 
+from vllm_ascend.models.common.ops.decode_cache_prepare import try_prepare_decode_raw_write
 from vllm_ascend.models.common.ops.rms_rsqrt_fused import try_rms_rsqrt_fused
 from vllm_ascend.ops.linear import AscendUnquantizedLinearMethod
 from vllm_ascend.quantization.method_adapters import AscendLinearMethod
@@ -290,6 +291,7 @@ class DeepseekV41Backend(AttentionBackend):
 # The largest validated dense temporary is 379.25 MiB. Bound the allocation
 # separately for each field width and element size before recording a graph.
 _MAX_DECODE_SCATTER_BYTES = 384 * 1024 * 1024
+_CACHE_PREPARE_QUERY_WIDTH = 6
 
 
 def _supports_decode_scatter(page, slots, updates, md, source_ratio):
@@ -463,16 +465,28 @@ class DeepseekV41Cache(nn.Module, AttentionLayerBase):
         page = self.field(bank, offset, values.shape[-1])
         input_dtype = values.dtype
         values = values.to(page.dtype)
-        valid = enabled & md.active & (md.slot_mapping >= 0) & (md.slot_mapping < page.shape[0])
-        slots = torch.where(valid, md.slot_mapping, 0)
+        prepared = None
+        if (
+            bank == 0
+            and offset == 0
+            and md.query_width == _CACHE_PREPARE_QUERY_WIDTH
+            and getattr(md, "grouped_row_start", None) == 0
+        ):
+            prepared = try_prepare_decode_raw_write(page, values, md.slot_mapping, md.active, enabled)
+        if prepared is not None:
+            slots, updates = prepared
+        else:
+            valid = enabled & md.active & (md.slot_mapping >= 0) & (md.slot_mapping < page.shape[0])
+            slots = torch.where(valid, md.slot_mapping, 0)
+            if md.query_width > 1:
+                # A verify bucket can contain 48 rows. All live slots are unique.
+                # For the one shared destination of masked rows, select its final
+                # bits before the write, so every alias writes the same value.
+                zero_is_live = valid & (slots == 0)
+                zero_row = zero_is_live.long().argmax().reshape(1)
+                zero_value = torch.where(zero_is_live.any(), values.index_select(0, zero_row), page[:1])
+                updates = torch.where(slots[:, None] == 0, zero_value, values)
         if md.query_width > 1:
-            # A verify bucket can contain 48 rows. All live slots are unique.
-            # For the one shared destination of masked rows, select its final
-            # bits before the write, so every alias writes the same value.
-            zero_is_live = valid & (slots == 0)
-            zero_row = zero_is_live.long().argmax().reshape(1)
-            zero_value = torch.where(zero_is_live.any(), values.index_select(0, zero_row), page[:1])
-            updates = torch.where(slots[:, None] == 0, zero_value, values)
             if _supports_decode_scatter(page, slots, updates, md, self.source_ratio):
                 _scatter_decode_field(page, slots, updates)
                 if torch.npu.is_current_stream_capturing():
