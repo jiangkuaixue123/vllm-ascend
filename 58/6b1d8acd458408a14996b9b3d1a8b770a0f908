@@ -1,0 +1,36 @@
+vllm_ascend/quantization/configs/modelslim_config.py
+  s_6eab87361519a8::t_882d4666035b57 100-101
+tests/ut/models/deepseek_v41/test_moe.py
+  s_6eab87361519a8::t_53ac268e2eb0e3 546,548,560-561
+vllm_ascend/models/deepseek_v41/moe.py
+  s_6eab87361519a8::t_1dfae59c35e249 316-323,338-341
+  s_6eab87361519a8::t_4121b3c4be15b2 45,333,335
+  s_6eab87361519a8::t_882d4666035b57 12,30,42-43,324-330,334,336-337,342-345
+  s_6eab87361519a8::t_818975f59bc6c6 44
+vllm_ascend/models/deepseek_v41/fused_weights.py
+  s_6eab87361519a8::t_882d4666035b57 13,43-49,90-100,123-124
+tests/ut/models/deepseek_v41/test_fused_weights.py
+  s_6eab87361519a8::t_65d1ae89da30e8 161-222
+  s_6eab87361519a8::t_1dfae59c35e249 19
+tests/e2e/nightly/one_card/test_shared_up_merged.py
+  s_6eab87361519a8::t_1dfae59c35e249 43-48,89-91,174,178,192-204
+  s_6eab87361519a8::t_e1c12937fba1f1 67
+  s_6eab87361519a8::t_48d294c35622b3 1-42,49-66,69-88,92-98,100-102,104-106,108-116,127-173,175-177,179-191
+  s_6eab87361519a8::t_3f5bc3ec1c2b5d 68,99,103,107,117-126
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "586b1d8acd458408a14996b9b3d1a8b770a0f908",
+  "prompts": {},
+  "sessions": {
+    "s_6eab87361519a8": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1ac13-1fd0-7670-ae84-d58acaf2730c",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "jiangkuaixue123 <jiangxiaozhou111@163.com>"
+    }
+  }
+}
