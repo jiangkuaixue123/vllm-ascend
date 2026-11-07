@@ -84,6 +84,40 @@ def test_complete_singleton_and_boundary_history(case, dtype):
         assert namespace["supports_draft_attention_graph"](*args)
 
 
+class DeviceSpans:
+    def __init__(self, batch, lengths):
+        self.query_bounds = tuple(range(0, (batch + 1) * 5, 5))
+        self.device_seq_lens = lengths
+
+    def __len__(self):
+        return len(self.query_bounds) - 1
+
+    def __iter__(self):
+        raise AssertionError("Graph eligibility must not resolve device lengths on the host")
+
+
+@pytest.mark.parametrize("batch", [1, 4])
+@pytest.mark.parametrize("dtype", ["int32", "int64"])
+def test_device_history_geometry_avoids_host_span_access(case, batch, dtype):
+    namespace, attention, hidden, positions, metadata = case
+    hidden = replace(hidden, shape=(batch * 5, 5120))
+    positions = replace(positions, shape=(batch * 5,))
+    metadata.requests = DeviceSpans(batch, TensorMetadata((batch,), dtype, hidden.device))
+    metadata.num_actual_tokens = batch * 5
+    metadata.block_table_tensor = replace(metadata.block_table_tensor, shape=(batch, 1200))
+    assert namespace["supports_draft_attention_graph"](attention, hidden, positions, metadata)
+    metadata.requests.query_bounds = tuple(range(batch + 1))
+    assert not namespace["supports_draft_attention_graph"](attention, hidden, positions, metadata)
+
+
+@pytest.mark.parametrize("updates", [{"shape": (2,)}, {"dtype": "fp32"}, {"contiguous": False}, {"negative": True}])
+def test_invalid_device_lengths_keep_eager_fallback(case, updates):
+    namespace, attention, hidden, positions, metadata = case
+    lengths = replace(TensorMetadata((1,), "int32", hidden.device), **updates)
+    metadata.requests = DeviceSpans(1, lengths)
+    assert not namespace["supports_draft_attention_graph"](attention, hidden, positions, metadata)
+
+
 @pytest.mark.parametrize(
     "index,change",
     [

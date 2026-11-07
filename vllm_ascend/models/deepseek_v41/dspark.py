@@ -5,6 +5,7 @@
 import json
 import os
 import time
+from collections.abc import Sequence
 from copy import copy
 from pathlib import Path
 
@@ -45,6 +46,30 @@ _STAGING_MAX_REQUESTS = 8
 _WITNESS_BATCH_SIZE = 4
 
 
+class DSparkRequestSpans(Sequence):
+    """Keep exact device lengths until an eager consumer needs Python spans."""
+
+    def __init__(self, bounds, seq_lens):
+        self.query_bounds = tuple(bounds)
+        self.device_seq_lens = seq_lens
+        self._spans = None
+
+    def __len__(self):
+        return len(self.query_bounds) - 1
+
+    @property
+    def materialized(self):
+        return self._spans is not None
+
+    def __getitem__(self, index):
+        if self._spans is None:
+            lengths = self.device_seq_lens.cpu().tolist()
+            self._spans = [
+                RequestSpan(lo, hi, length) for lo, hi, length in zip(self.query_bounds, self.query_bounds[1:], lengths)
+            ]
+        return self._spans[index]
+
+
 class DSparkMetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
     # The initial proposal implementation uses packed, variable-length EP MoE.
     _cudagraph_support = AttentionCGSupport.NEVER
@@ -55,11 +80,10 @@ class DSparkMetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
     def build(self, common_prefix_len, common_attn_metadata, fast_build=False, **kwargs):
         common = common_attn_metadata
         bounds = common.query_start_loc_cpu[: common.num_reqs + 1].tolist()
-        # The proposer subtracts rejected target tokens on the device and
-        # appends the five draft positions. The target's CPU upper bound can
-        # still describe the old length. Copy once for the packed eager batch.
-        lengths = common.seq_lens[: common.num_reqs].cpu().tolist()
-        requests = [RequestSpan(lo, hi, length) for lo, hi, length in zip(bounds, bounds[1:], lengths)]
+        # The device lengths include rejected-token corrections. The attention
+        # graph consumes them directly; eager fallback resolves the exact spans
+        # once, never substituting the target's optimistic host upper bounds.
+        requests = DSparkRequestSpans(bounds, common.seq_lens[: common.num_reqs])
         return DeepseekV41Metadata(requests, common.block_table_tensor, common.slot_mapping, common.num_actual_tokens)
 
     def build_for_drafting(self, common_attn_metadata, draft_index=1, **kwargs):
@@ -288,8 +312,17 @@ class DSparkAttention(DeepseekV41Attention):
             and torch.is_inference_mode_enabled()
             and not is_draft_dummy()
         ):
-            attended = graph(self, hidden, positions, self.cache.metadata())
+            metadata = self.cache.metadata()
+            attended = graph(self, hidden, positions, metadata)
             if attended is not None:
+                if isinstance(metadata.requests, DSparkRequestSpans) and not metadata.requests.materialized:
+                    logger.info_once(
+                        "DSPARK_DEVICE_HISTORY_RUNTIME pid=%d stage=%s rows=%d",
+                        os.getpid(),
+                        self.cache.prefix,
+                        hidden.shape[0],
+                        scope="process",
+                    )
                 logger.info_once(
                     "DSPARK_ATTN_GRAPH_RUNTIME pid=%d stage=%s rows=%d",
                     os.getpid(),
