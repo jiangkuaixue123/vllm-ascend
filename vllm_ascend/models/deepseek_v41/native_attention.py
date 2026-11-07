@@ -2,12 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Execute V4.1's selected latent attention on the A3 shared-KV operator."""
 
+import os
 from functools import lru_cache
 
 import torch
 import torch.nn.functional as F
 from vllm.logger import logger
 
+from vllm_ascend.models.common.ops.selected_fia import try_selected_fia
 from vllm_ascend.utils import enable_custom_op
 
 from .attention_ops import sparse_attn
@@ -126,6 +128,16 @@ class DeepseekV41NativeAttention:
 
     def decode_with_physical_slots(self, q, kv, sink, slots, scale):
         """Uniform target decode with absolute slots already packed in original logical order."""
+        selected = try_selected_fia(q, kv, sink, slots, scale)
+        if selected is not None:
+            logger.info_once(
+                "TARGET_GATHER_FIA2_RUNTIME pid=%d rows=%d width=%d",
+                os.getpid(),
+                q.shape[0],
+                slots.shape[-1],
+                scope="process",
+            )
+            return selected
         return self._native(q, kv, sink, slots, scale, "DSA target indexed decode", None, True, physical_slots=True)
 
     def _native(self, q, kv, sink, indices, scale, mode, swa_window, uniform_decode=False, *, physical_slots=False):
