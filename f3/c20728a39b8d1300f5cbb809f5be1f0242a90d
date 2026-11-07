@@ -1,0 +1,22 @@
+tests/e2e/nightly/single_node/ops/multicard_ops_a3/test_target_kv_before_gather.py
+  s_6eab87361519a8::t_30d7fc0875c09e 40-41,177
+  s_6eab87361519a8::t_cec63767f88424 1-39,42-176,178-305
+vllm_ascend/models/deepseek_v41/attention.py
+  s_6eab87361519a8::t_fd1236df415f14 44,83-84,1230-1263,1266-1274,1282,1289
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "f3c20728a39b8d1300f5cbb809f5be1f0242a90d",
+  "prompts": {},
+  "sessions": {
+    "s_6eab87361519a8": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1ac13-1fd0-7670-ae84-d58acaf2730c",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "jiangkuaixue123 <jiangxiaozhou111@163.com>"
+    }
+  }
+}
