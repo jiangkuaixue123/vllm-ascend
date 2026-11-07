@@ -26,6 +26,7 @@ from vllm.v1.attention.backend import AttentionCGSupport, AttentionMetadataBuild
 
 from vllm_ascend.models.common.ops.draft_attention_graph import DraftAttentionGraph
 from vllm_ascend.models.common.ops.draft_context_graph import DraftContextGraph
+from vllm_ascend.models.common.ops.draft_router_graph import DraftRouterGraph
 
 from .attention import (
     DeepseekV41Attention,
@@ -425,6 +426,10 @@ class DSparkAttention(DeepseekV41Attention):
 
 class DSparkMoE(DeepseekV41MoE):
     """The draft block has all DP rows; SP experts own contiguous local rows."""
+
+    def __init__(self, config, quant_config, prefix, **kwargs):
+        super().__init__(config, quant_config, prefix, **kwargs)
+        self.gate._draft_router_graph = DraftRouterGraph(prefix)
 
     def forward(self, states):
         comm = self.communication

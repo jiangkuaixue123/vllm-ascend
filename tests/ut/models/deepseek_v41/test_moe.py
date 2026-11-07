@@ -543,8 +543,9 @@ def test_fused_runner_restores_outer_comm_on_failure(monkeypatch):
     from vllm_ascend.models.deepseek_v41 import fused_moe
 
     outer = object()
-    forward = SimpleNamespace(moe_comm_type="outer", moe_comm_method=outer)
+    forward = SimpleNamespace(moe_comm_type="outer", moe_comm_method=outer, padded_num_tokens=0)
     monkeypatch.setattr(fused_moe, "_EXTRA_CTX", forward)
+    monkeypatch.setattr(fused_moe, "is_forward_context_available", lambda: False)
     runner = SimpleNamespace(v41_comm=object())
 
     def fail(self, *args):
@@ -556,6 +557,8 @@ def test_fused_runner_restores_outer_comm_on_failure(monkeypatch):
     real = object.__new__(fused_moe.DeepseekV41FusedMoERunner)
     nn.Module.__init__(real)
     real.v41_comm = runner.v41_comm
+    real.v41_fused_mc2 = None
+    real.moe_config = SimpleNamespace(tp_group=SimpleNamespace(world_size=1))
     with pytest.raises(RuntimeError, match="test dispatch failed"):
         real.forward(torch.empty(0))
     assert forward.moe_comm_method is outer and forward.moe_comm_type == "outer"

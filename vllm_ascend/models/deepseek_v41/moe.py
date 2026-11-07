@@ -246,6 +246,7 @@ class DeepseekV41Gate(nn.Module):
         )
 
         self.bias_vl = nn.Parameter(torch.empty_like(self.bias), requires_grad=False) if vision_routing else None
+        self._draft_router_graph = None
 
     def logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if not hidden_states.shape[0]:
@@ -263,6 +264,11 @@ class DeepseekV41Gate(nn.Module):
         return torch.cat((logits, image_mask.reshape(-1, 1).to(logits.dtype)), dim=-1)
 
     def select_experts(self, hidden_states, gating_output, topk, renormalize):
+        graph = getattr(self, "_draft_router_graph", None)
+        if graph is not None:
+            selected = graph(self, gating_output, topk, renormalize)
+            if selected is not None:
+                return selected
         bias = self.bias
         if self.bias_vl is not None and gating_output.shape[-1] == bias.numel() + 1:
             logits, modality = gating_output.split((bias.numel(), 1), dim=-1)
