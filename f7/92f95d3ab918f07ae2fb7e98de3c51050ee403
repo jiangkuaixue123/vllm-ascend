@@ -1,0 +1,34 @@
+tests/e2e/nightly/one_card/test_draft_router_graph.py
+  s_6eab87361519a8::t_5d46aba07a9e26 1-128
+tests/e2e/nightly/single_node/ops/multicard_ops_a3/test_draft_router_graph.py
+  s_6eab87361519a8::t_e116e6a1df940d 78,104-119
+  s_6eab87361519a8::t_c9c741a2b38311 1-33,35-55,57,59-77,79-83,101-102,120-176
+  s_6eab87361519a8::t_e3fb207197613f 34
+  s_6eab87361519a8::t_560b2ca576f8cf 56,58,84-100,103
+vllm_ascend/models/deepseek_v41/dspark.py
+  s_6eab87361519a8::t_5d46aba07a9e26 29,430-432
+  s_6eab87361519a8::t_8635833d2b0372 433
+vllm_ascend/models/deepseek_v41/moe.py
+  s_6eab87361519a8::t_e2abc07a615130 249,267-271
+tests/ut/models/deepseek_v41/test_moe.py
+  s_6eab87361519a8::t_87047500b27f8e 546,548,560-561
+vllm_ascend/models/common/ops/draft_router_graph.py
+  s_6eab87361519a8::t_3cb5961aa21dba 37-39
+  s_6eab87361519a8::t_e2abc07a615130 1-36,40-97
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "f792f95d3ab918f07ae2fb7e98de3c51050ee403",
+  "prompts": {},
+  "sessions": {
+    "s_6eab87361519a8": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1ac13-1fd0-7670-ae84-d58acaf2730c",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "jiangkuaixue123 <jiangxiaozhou111@163.com>"
+    }
+  }
+}
