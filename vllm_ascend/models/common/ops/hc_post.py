@@ -8,18 +8,19 @@ from vllm_ascend.device.device_config import get_ascend_device_type
 from vllm_ascend.device.hardware import AscendDeviceType
 
 _DECODE_ROWS = (6, 12)
+_DRAFT_ROWS = (5, 20)
 _HC_WIDTH = 4
 _HIDDEN_SIZE = 5120
 _ND_FORMAT = 2
 
 
-def hc_post_fused(sublayer_output, residual, post, comb):
-    """Return the fused decode result, or None for unsupported metadata."""
+def hc_post_fused(sublayer_output, residual, post, comb, *, draft=False):
+    """Return the qualified target/draft result, or None for unsupported metadata."""
     if (
         sublayer_output.device.type != "npu"
         or not torch.is_inference_mode_enabled()
         or sublayer_output.ndim != 2
-        or sublayer_output.shape[0] not in _DECODE_ROWS
+        or sublayer_output.shape[0] not in (_DRAFT_ROWS if draft else _DECODE_ROWS)
         or sublayer_output.shape[1] != _HIDDEN_SIZE
         or residual.shape != (sublayer_output.shape[0], _HC_WIDTH, _HIDDEN_SIZE)
         or post.shape != (sublayer_output.shape[0], _HC_WIDTH)

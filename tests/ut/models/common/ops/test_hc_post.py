@@ -71,6 +71,22 @@ def test_supported_inputs_preserve_operand_order(rows):
     assert len(calls) == 1 and all(actual is expected for actual, expected in zip(calls[0], args))
 
 
+@pytest.mark.parametrize("rows", [5, 20])
+def test_draft_rows_are_explicit_and_preserve_operand_order(rows):
+    env, calls, output = load_dispatcher()
+    args = inputs(rows)
+    assert env["hc_post_fused"](*args) is None
+    assert env["hc_post_fused"](*args, draft=True) is output
+    assert len(calls) == 1 and all(actual is expected for actual, expected in zip(calls[0], args))
+
+
+@pytest.mark.parametrize("rows", [0, 1, 6, 10, 12, 24, 40])
+def test_other_draft_rows_keep_parent(rows):
+    env, calls, _ = load_dispatcher()
+    assert env["hc_post_fused"](*inputs(rows), draft=True) is None
+    assert not calls
+
+
 @pytest.mark.parametrize(
     "index,changes",
     [
@@ -145,3 +161,35 @@ def test_actual_model_method_only_fuses_decode(decode, supported):
     assert result is (fused if decode and supported else reference)
     expected = (["fused"] if supported else ["fused", "reference"]) if decode else ["reference"]
     assert calls == expected
+
+
+@pytest.mark.parametrize("supported", [False, True])
+def test_actual_draft_stage_uses_explicit_draft_dispatch_and_parent_fallback(supported):
+    path = ROOT / "vllm_ascend/models/deepseek_v41/dspark.py"
+    tree = ast.parse(path.read_text())
+    cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "DSparkStage")
+    cls.body = [node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == "post_residual"]
+    fused, reference = object(), object()
+    calls = []
+
+    class Parent:
+        def post_residual(self, *args):
+            calls.append("parent")
+            return reference
+
+    def dispatch(*args, draft=False):
+        assert draft is True
+        calls.append("draft")
+        return fused if supported else None
+
+    env = {
+        "DeepseekV41Block": Parent,
+        "hc_post_fused": dispatch,
+        "logger": SimpleNamespace(info_once=lambda *args, **kwargs: None),
+        "os": SimpleNamespace(getpid=lambda: 1),
+    }
+    exec(compile(ast.Module(body=[cls], type_ignores=[]), str(path), "exec"), env)
+    stage = env["DSparkStage"]()
+    stage.attn = SimpleNamespace(cache=SimpleNamespace(prefix="mtp.0.attn.cache"))
+    assert stage.post_residual(*inputs(5), object()) is (fused if supported else reference)
+    assert calls == (["draft"] if supported else ["draft", "parent"])

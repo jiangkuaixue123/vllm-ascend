@@ -26,6 +26,7 @@ from vllm.v1.attention.backend import AttentionCGSupport, AttentionMetadataBuild
 
 from vllm_ascend.models.common.ops.draft_attention_graph import DraftAttentionGraph
 from vllm_ascend.models.common.ops.draft_context_graph import DraftContextGraph
+from vllm_ascend.models.common.ops.hc_post import hc_post_fused
 
 from .attention import (
     DeepseekV41Attention,
@@ -462,6 +463,19 @@ class DSparkStage(DeepseekV41Block):
             )
             self.register_parameter(f"hc_{part}_scale", nn.Parameter(torch.empty(3, dtype=torch.float32)))
             self.register_parameter(f"hc_{part}_base", nn.Parameter(torch.empty(width, dtype=torch.float32)))
+
+    def post_residual(self, sublayer_output, residual, post, comb, runtime):
+        output = hc_post_fused(sublayer_output, residual, post, comb, draft=True)
+        if output is not None:
+            logger.info_once(
+                "DSPARK_HC_POST_RUNTIME pid=%d stage=%s rows=%d",
+                os.getpid(),
+                self.attn.cache.prefix,
+                residual.shape[0],
+                scope="process",
+            )
+            return output
+        return super().post_residual(sublayer_output, residual, post, comb, runtime)
 
 
 class DSparkMarkov(nn.Module):
