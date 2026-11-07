@@ -19,6 +19,8 @@ from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead, VocabParallelEmbedding
 from vllm.v1.attention.backend import AttentionCGSupport, AttentionMetadataBuilder
 
+from vllm_ascend.models.common.ops.draft_attention_graph import DraftAttentionGraph
+
 from .attention import (
     DeepseekV41Attention,
     DeepseekV41Backend,
@@ -188,6 +190,7 @@ class DSparkAttention(DeepseekV41Attention):
         self.dsa_cp = False
         self.attention_kernel = DeepseekV41NativeAttention()
         self._staging_b4_witness_pending = True
+        self._attention_graph = DraftAttentionGraph() if getattr(vllm_config, "lora_config", None) is None else None
         self.sequence_group = None
         self.dim = config.head_dim
         self.rope_dim = config.qk_rope_head_dim
@@ -278,6 +281,23 @@ class DSparkAttention(DeepseekV41Attention):
 
     def forward(self, hidden, positions):
         positions = positions.reshape(-1)
+        graph = getattr(self, "_attention_graph", None)
+        if (
+            graph is not None
+            and hidden.device.type == "npu"
+            and torch.is_inference_mode_enabled()
+            and not is_draft_dummy()
+        ):
+            attended = graph(self, hidden, positions, self.cache.metadata())
+            if attended is not None:
+                logger.info_once(
+                    "DSPARK_ATTN_GRAPH_RUNTIME pid=%d stage=%s rows=%d",
+                    os.getpid(),
+                    self.cache.prefix,
+                    hidden.shape[0],
+                    scope="process",
+                )
+                return self._project_output(attended, hidden.dtype)
         qr = self.q_norm(self.wq_a(hidden)[0])
         q = self.wq_b(qr)[0].view(-1, self.heads, self.dim)
         self.rotate(q.unsqueeze(0), positions)
