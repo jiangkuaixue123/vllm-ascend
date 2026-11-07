@@ -217,8 +217,12 @@ def test_v1_graph_resolver_preserves_q6_tp8_buckets_with_eager_draft():
     runner.cudagraph_dispatcher.initialize_cudagraph_keys.assert_called_once_with(CUDAGraphMode.FULL_DECODE_ONLY, 6)
 
 
-def test_idle_dp_draft_still_runs_its_ep_forward_without_reusing_live_cache_slots(monkeypatch):
-    proposer = object.__new__(AscendDeepseekV41DSparkProposer)
+@pytest.mark.parametrize("proposer_type", [AscendDSparkProposer, AscendDeepseekV41DSparkProposer])
+@pytest.mark.parametrize("is_profile", [False, True])
+def test_idle_dp_draft_still_runs_its_ep_forward_without_reusing_live_cache_slots(
+    monkeypatch, proposer_type, is_profile
+):
+    proposer = object.__new__(proposer_type)
     proposer.runner = Mock()
     proposer.runner._sync_metadata_across_dp.return_value = (10, torch.tensor([10, 10]), None)
     proposer.num_query_per_req = proposer.num_speculative_tokens = 5
@@ -231,20 +235,36 @@ def test_idle_dp_draft_still_runs_its_ep_forward_without_reusing_live_cache_slot
     proposer._get_positions = lambda count: torch.arange(count)
     proposer._pad_draft_buffers = Mock()
     proposer.model = Mock()
+    proposer.input_ids = torch.zeros(10, dtype=torch.int64)
     proposer._context_slot_mapping_buffers = [torch.tensor([17, 23])] * 3
     proposer._runnable = Mock(
         side_effect=lambda **args: proposer.build_model_inputs_first_pass(
             args["num_input_tokens"], proposer._context_slot_mapping_buffers
         )
     )
-    monkeypatch.setattr(
-        "vllm_ascend.spec_decode.dspark_proposer.set_ascend_forward_context", lambda *a, **k: nullcontext()
-    )
-    proposer.dummy_run(num_tokens=5, num_reqs=1)
+    context = Mock(side_effect=lambda *a, **k: nullcontext())
+    monkeypatch.setattr("vllm_ascend.spec_decode.dspark_proposer.set_ascend_forward_context", context)
+    proposer.dummy_run(num_tokens=5, num_reqs=1, is_profile=is_profile)
     proposer.runner._sync_metadata_across_dp.assert_called_once_with(5, is_draft_model=True)
-    proposer._runnable.assert_called_once()
-    states, positions, slots = proposer.model.precompute_and_store_context_kv.call_args.args
-    assert states.shape[0] == positions.numel() == 10 and slots is None
+    actual = 0 if proposer_type is AscendDeepseekV41DSparkProposer and not is_profile else 10
+    assert context.call_args.kwargs["num_actual_tokens"] == actual
+    assert context.call_args.kwargs["num_tokens"] == 10
+    torch.testing.assert_close(context.call_args.kwargs["num_tokens_across_dp"], torch.tensor([10, 10]))
+    if is_profile:
+        proposer._runnable.assert_not_called()
+        proposer.model.assert_called_once()
+        states, positions = proposer.model.precompute_and_store_context_kv.call_args.args
+        assert states.shape[0] == positions.numel() == 10
+    else:
+        proposer._runnable.assert_called_once()
+        states, positions, slots = proposer.model.precompute_and_store_context_kv.call_args.args
+        assert states.shape[0] == positions.numel() == 10
+        if proposer_type is AscendDeepseekV41DSparkProposer:
+            assert slots is None
+        else:
+            assert len(slots) == len(proposer._context_slot_mapping_buffers)
+            for actual_slots, expected_slots in zip(slots, proposer._context_slot_mapping_buffers):
+                torch.testing.assert_close(actual_slots, expected_slots)
 
 
 def test_target_auxiliary_projection_and_sequential_markov_block(monkeypatch):

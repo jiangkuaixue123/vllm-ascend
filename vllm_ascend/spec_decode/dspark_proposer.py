@@ -357,6 +357,9 @@ class AscendDSparkProposer(AscendDflashProposer):
 
         return num_query_total, token_indices_to_sample, cad, long_seq_args
 
+    def _dummy_num_actual_tokens(self, num_tokens: int, is_profile: bool) -> int:
+        return num_tokens
+
     @torch.inference_mode()
     def dummy_run(
         self,
@@ -392,7 +395,7 @@ class AscendDSparkProposer(AscendDflashProposer):
             self.vllm_config,
             num_tokens=num_input_tokens,
             num_tokens_across_dp=num_tokens_across_dp,
-            num_actual_tokens=num_input_tokens,
+            num_actual_tokens=self._dummy_num_actual_tokens(num_input_tokens, is_profile),
             in_profile_run=is_profile,
             batch_descriptor=batch_descriptor,
             aclgraph_runtime_mode=aclgraph_runtime_mode,
@@ -425,6 +428,15 @@ class AscendDeepseekV41DSparkProposer(AscendDSparkProposer):
 
     # mtp.0.embed and the FP32 mtp.2.head are distinct checkpoint tensors.
     share_target_weights = False
+
+    def _dummy_num_actual_tokens(self, num_tokens: int, is_profile: bool) -> int:
+        if is_profile:
+            return num_tokens
+        # Keep every rank in the same EP collectives with the same padded
+        # shapes. The existing MC2 mask suppresses only this idle DP's routes;
+        # it still evaluates experts selected by active remote participants.
+        logger.info_once("DSPARK_IDLE_MASK_RUNTIME communication_rows=%d actual_tokens=0", num_tokens, scope="process")
+        return 0
 
     def __init__(self, vllm_config, device, runner=None):
         if get_ascend_config().enable_reduce_sample:
