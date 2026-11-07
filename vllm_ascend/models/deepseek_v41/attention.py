@@ -41,7 +41,18 @@ from vllm.v1.attention.backend import (
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 
 from vllm_ascend.models.common.ops.rms_rsqrt_fused import try_rms_rsqrt_fused
-from vllm_ascend.utils import AscendDeviceType, enable_custom_op, enable_dsa_cp, enable_sp, get_ascend_device_type
+from vllm_ascend.ops.linear import AscendUnquantizedLinearMethod
+from vllm_ascend.quantization.method_adapters import AscendLinearMethod
+from vllm_ascend.quantization.methods.w8a8.w8a8_dynamic import AscendW8A8DynamicLinearMethod
+from vllm_ascend.utils import (
+    AscendDeviceType,
+    enable_custom_op,
+    enable_dsa_cp,
+    enable_sp,
+    get_ascend_device_type,
+    npu_stream_switch,
+    shared_experts_calculation_stream,
+)
 
 from .attention_ops import (
     apply_rotary_emb_real,
@@ -79,6 +90,9 @@ _PARTIAL_ROPE_DIM = 64
 _ARENA_BLOCK_SIZE = 128
 _ARENA_LEGACY_LENGTH = 16384
 _ARENA_LONG_LENGTH = 153600
+_QUERY_OVERLAP_ROWS = (6, 12)
+_QUERY_OVERLAP_LAYOUT = (4, 5120, 1280, 64, 512)
+_QUERY_OVERLAP_QUERY_WIDTH = 6
 
 
 def _quantize_projection_input(output):
@@ -803,6 +817,15 @@ class DeepseekV41Attention(nn.Module):
             prefix=f"{prefix}.wkv",
         )
         self.kv_norm = DeepseekV41RMSNorm(self.dim, config.rms_norm_eps)
+        self._query_overlap_stream = None
+        if (
+            self.dsa_cp
+            and (tp, config.hidden_size, config.q_lora_rank, self.heads, self.dim) == _QUERY_OVERLAP_LAYOUT
+            and self.wq_a.weight.device.type == "npu"
+            and get_ascend_device_type() == AscendDeviceType.A3
+        ):
+            # Reuse the existing process stream, initialized before graph capture.
+            self._query_overlap_stream = shared_experts_calculation_stream()
         self.wo_a = ColumnParallelLinear(
             config.num_attention_heads * self.dim // config.o_groups,
             config.o_groups * config.o_lora_rank,
@@ -1224,8 +1247,51 @@ class DeepseekV41Attention(nn.Module):
         ids = torch.where(valid, columns, -1).to(torch.int32).unsqueeze(1)
         return selected, ids
 
+    def _start_decode_query(self, states, metadata):
+        stream = getattr(self, "_query_overlap_stream", None)
+        if stream is None or metadata is None:
+            return None
+        tp, hidden, q_rank, heads, dim = _QUERY_OVERLAP_LAYOUT
+        if not (
+            self.dsa_cp
+            and self.sequence_group is not None
+            and self.sequence_group.world_size == tp
+            and (self.heads, self.dim) == (heads, dim)
+            and states.device.type == "npu"
+            and states.dtype == torch.bfloat16
+            and states.ndim == 2
+            and states.shape[0] in _QUERY_OVERLAP_ROWS
+            and states.shape[1] == hidden
+            and states.is_contiguous()
+            and metadata.query_width == _QUERY_OVERLAP_QUERY_WIDTH
+            and metadata.active.shape[0] == tp * states.shape[0]
+            and torch.is_inference_mode_enabled()
+            and not torch.compiler.is_compiling()
+            and get_ascend_device_type() == AscendDeviceType.A3
+            and (self.wq_a.input_size, self.wq_a.output_size) == (hidden, q_rank)
+            and (self.wq_b.input_size, self.wq_b.output_size) == (q_rank, heads * dim)
+            and isinstance(self.wq_a.quant_method, AscendUnquantizedLinearMethod)
+            and isinstance(self.wkv.quant_method, AscendUnquantizedLinearMethod)
+            and self.wq_a.weight.dtype == self.wkv.weight.dtype == torch.bfloat16
+            and isinstance(self.wq_b.quant_method, AscendLinearMethod)
+            and isinstance(self.wq_b.quant_method.quant_method, AscendW8A8DynamicLinearMethod)
+        ):
+            return None
+        main = torch.npu.current_stream(states.device)
+        if main == stream:
+            return None
+        inputs_ready = main.record_event()
+        states.record_stream(stream)
+        with npu_stream_switch(stream):
+            stream.wait_event(inputs_ready)
+            qr = self.q_norm(self.wq_a(states)[0])
+            q = self.wq_b(qr)[0].view(states.shape[0], self.heads, self.dim)
+            complete = stream.record_event()
+        return qr, q, complete
+
     def _decode_forward(self, local_states, runtime):
         full_md = self.cache.metadata().decode
+        pending_query = self._start_decode_query(local_states, full_md)
         gathered, offset = self._sequence_inputs(local_states, "uniform_decode")
         if full_md is None or gathered.shape[0] != full_md.active.shape[0]:
             raise ValueError("V4.1 graph token rows must match the decode metadata bucket")
@@ -1233,9 +1299,24 @@ class DeepseekV41Attention(nn.Module):
         x, md = (local_states, local_md) if self.dsa_cp else (gathered, full_md)
         full_pos = (full_md.seq_lens - 1).clamp_min(0)
         pos = full_pos[offset : offset + x.shape[0]] if self.dsa_cp else full_pos
-        qr = self.q_norm(self.wq_a(x)[0])
-        q = self.wq_b(qr)[0].view(x.shape[0], self.heads, self.dim)
-        raw = self.kv_norm(self.wkv(gathered)[0])
+        if pending_query is None:
+            qr = self.q_norm(self.wq_a(x)[0])
+            q = self.wq_b(qr)[0].view(x.shape[0], self.heads, self.dim)
+            raw = self.kv_norm(self.wkv(gathered)[0])
+        else:
+            raw = self.kv_norm(self.wkv(gathered)[0])
+            qr, q, complete = pending_query
+            main = torch.npu.current_stream(local_states.device)
+            main.wait_event(complete)
+            qr.record_stream(main)
+            q.record_stream(main)
+            logger.info_once(
+                "TARGET_QUERY_OVERLAP_RUNTIME pid=%d rows=%d layer=%d",
+                os.getpid(),
+                local_states.shape[0],
+                self.layer_id,
+                scope="process",
+            )
         self.rotate(q.unsqueeze(0), pos)
         self.rotate(raw.unsqueeze(0), full_pos)
         self.cache.decode_write(full_md, fp8_quant_dequant(raw, 32), 0, 0, full_md.active)
