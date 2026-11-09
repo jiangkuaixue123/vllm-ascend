@@ -8,9 +8,9 @@ from vllm.triton_utils import tl, triton
 from .deepseek_v41 import _round_binary_float, _round_scale_up_kernel
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["ROWS"])
 def _kv_norm_rope_qdq_kernel(
-    x, weight, cosine, sine, output, ROWS: tl.constexpr, DIM: tl.constexpr, ROPE: tl.constexpr, EPS: tl.constexpr
+    x, weight, cosine, sine, output, ROWS, DIM: tl.constexpr, ROPE: tl.constexpr, EPS: tl.constexpr
 ):
     channels = tl.arange(0, DIM)
     weights = tl.load(weight + channels).to(tl.float32)

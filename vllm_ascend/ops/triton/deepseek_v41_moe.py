@@ -6,13 +6,13 @@ import torch
 from vllm.triton_utils import tl, triton
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["ROWS"])
 def _activation_kernel(
     gate,
     up,
     factor,
     output,
-    ROWS: tl.constexpr,
+    ROWS,
     DIM: tl.constexpr,
     G0: tl.constexpr,
     G1: tl.constexpr,

@@ -6,12 +6,12 @@ import torch
 from vllm.triton_utils import tl, triton
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["ROWS"])
 def _router_weights_kernel(
     scores,
     indices,
     output,
-    ROWS: tl.constexpr,
+    ROWS,
     EXPERTS: tl.constexpr,
     TOP_K: tl.constexpr,
     RENORMALIZE: tl.constexpr,
@@ -53,13 +53,13 @@ def router_weights(scores, indices, renormalize=True, scale=1.5):
     return output
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["ROWS"])
 def _confidence_kernel(
     hidden,
     markov,
     weight,
     output,
-    ROWS: tl.constexpr,
+    ROWS,
     HIDDEN: tl.constexpr,
     MARKOV: tl.constexpr,
     H0: tl.constexpr,

@@ -6,8 +6,8 @@ import torch
 from vllm.triton_utils import tl, triton
 
 
-@triton.jit
-def _hc_post_kernel(output, residual, post, comb, result, ROWS: tl.constexpr, DIM: tl.constexpr, TILE: tl.constexpr):
+@triton.jit(do_not_specialize=["ROWS"])
+def _hc_post_kernel(output, residual, post, comb, result, ROWS, DIM: tl.constexpr, TILE: tl.constexpr):
     dim_tiles: tl.constexpr = triton.cdiv(DIM, TILE)
     channels = tl.arange(0, TILE)
     streams = tl.arange(0, 4)
@@ -40,13 +40,13 @@ def hc_post(sublayer_output, residual, post, comb):
     return result
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["ROWS"])
 def _hc_pre_norm_kernel(
     hidden,
     pre,
     weight,
     output,
-    ROWS: tl.constexpr,
+    ROWS,
     DIM: tl.constexpr,
     EPS: tl.constexpr,
     NORM: tl.constexpr,

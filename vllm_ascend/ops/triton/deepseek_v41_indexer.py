@@ -6,12 +6,12 @@ import torch
 from vllm.triton_utils import tl, triton
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["ROWS"])
 def _indexer_reduce_kernel(
     values,
     weights,
     output,
-    ROWS: tl.constexpr,
+    ROWS,
     HEADS: tl.constexpr,
     KEYS: tl.constexpr,
     V0: tl.constexpr,

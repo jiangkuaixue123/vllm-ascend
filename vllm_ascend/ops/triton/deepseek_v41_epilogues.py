@@ -6,8 +6,8 @@ import torch
 from vllm.triton_utils import tl, triton
 
 
-@triton.jit
-def _pool_norm_kernel(values, scores, weight, output, ROWS: tl.constexpr, EPS: tl.constexpr):
+@triton.jit(do_not_specialize=["ROWS"])
+def _pool_norm_kernel(values, scores, weight, output, ROWS, EPS: tl.constexpr):
     dim = tl.arange(0, 512)
     w = tl.load(weight + dim).to(tl.float32)
     for row in range(tl.program_id(0), ROWS, tl.num_programs(0)):
@@ -37,7 +37,7 @@ def compressor_pool_norm(values, scores, weight, eps=1e-20, dtype=torch.bfloat16
     return output
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["QUERIES"])
 def _sink_kernel(
     output,
     maximum,
@@ -45,7 +45,7 @@ def _sink_kernel(
     sink,
     slots,
     result,
-    QUERIES: tl.constexpr,
+    QUERIES,
     HEADS: tl.constexpr,
     SLOT_WIDTH: tl.constexpr,
     DIM: tl.constexpr,

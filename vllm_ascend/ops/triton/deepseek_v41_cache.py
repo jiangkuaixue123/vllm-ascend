@@ -25,7 +25,7 @@ def field_storage(cache, bank, offset, width):
     raise ValueError(f"Unallocated V4.1 cache field: bank={bank}, offset={offset}, width={width}")
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["ROWS"])
 def _decode_read_kernel(
     page,
     positions,
@@ -33,10 +33,10 @@ def _decode_read_kernel(
     active,
     lengths,
     output,
-    ROWS: tl.constexpr,
+    ROWS,
     COUNT: tl.constexpr,
     WIDTH: tl.constexpr,
-    PAGE_ROWS: tl.constexpr,
+    PAGE_ROWS,
     PAGE_STRIDE: tl.constexpr,
     OFFSET: tl.constexpr,
     POS_S0: tl.constexpr,
@@ -99,16 +99,16 @@ def decode_read(cache, md, positions, bank, offset, width):
     return output
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["ROWS"])
 def _decode_write_kernel(
     page,
     values,
     slots,
     active,
     enabled,
-    ROWS: tl.constexpr,
+    ROWS,
     WIDTH: tl.constexpr,
-    PAGE_ROWS: tl.constexpr,
+    PAGE_ROWS,
     PAGE_STRIDE: tl.constexpr,
     OFFSET: tl.constexpr,
     VALUE_S0: tl.constexpr,
