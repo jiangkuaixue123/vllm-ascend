@@ -160,11 +160,17 @@ def test_bundle_leaf_callbacks_are_instance_local_and_use_their_manifest(tmp_pat
     manifest = {
         "specialization": specialization(model.config),
         "files": {"attention.py": {"sha256": hashlib.sha256(source.encode()).hexdigest()}},
-        "method_overrides": {"target": [{"path": "layers.*.attn", "file": "attention.py", "methods": ["forward"]}]},
+        "method_overrides": {
+            "target": [
+                {"path": "layers.*.attn", "file": "attention.py", "methods": ["forward"]},
+                {"path": "", "file": "attention.py", "methods": ["forward"]},
+            ]
+        },
     }
     (tmp_path / "manifest.json").write_text(json.dumps(manifest))
     install_leaf_overrides(model, tmp_path)
     states = torch.zeros(1, 12)
+    torch.testing.assert_close(model(states), states + 7)
     for block in model.layers:
         torch.testing.assert_close(block.attn(states), states + 7)
     torch.testing.assert_close(other.layers[0].attn(states), states)

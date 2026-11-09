@@ -305,7 +305,7 @@ def install_leaf_overrides(model, directory, *, draft=False):
     loaded = {}
     for entry in entries:
         targets = [model]
-        for component in entry["path"].split("."):
+        for component in entry["path"].split(".") if entry["path"] else ():
             if component == "*":
                 targets = [child for target in targets for child in target]
             else:
