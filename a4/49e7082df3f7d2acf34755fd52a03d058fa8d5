@@ -1,0 +1,71 @@
+tests/e2e/nightly/one_card/test_draft_output_graph.py
+  s_7e452973ee06c9::t_900384c25e2bb2 34-38
+  s_7e452973ee06c9::t_71cd4a7f84aadf 13,29-30,40,54,76,102-103,162-163,166
+tests/e2e/nightly/single_node/ops/singlecard_ops/test_v41_decode_slot_arena.py
+  s_7e452973ee06c9::t_bfd6c78f8bdf03 12,21,23,34,50,98,130,201-202,206-209,213,224
+  s_7e452973ee06c9::t_f9d3e87943c739 295-302
+tests/ut/models/deepseek_v41/test_decode_slot_arena.py
+  s_7e452973ee06c9::t_900384c25e2bb2 65,67
+  s_7e452973ee06c9::t_54fef42600eb03 66,68-69,85-89
+tests/e2e/nightly/single_node/ops/multicard_ops_a3/test_target_query_overlap.py
+  s_7e452973ee06c9::t_900384c25e2bb2 62,71,77,96-97,107-108,111,187,225,271,321,345,350,353
+  s_7e452973ee06c9::t_304e854d4e9756 3,32,59-61
+csrc/moe/hc_pre_delayed/hc_pre_delayed_torch_adpt.h
+  s_7e452973ee06c9::t_82aa4fd9cde06b 19-20
+csrc/moe/hc_pre_delayed/op_host/hc_pre_delayed_tiling.cpp
+  s_7e452973ee06c9::t_6dbd156e716034 84
+examples/deepseek_v41/parallel-layouts.md
+  s_7e452973ee06c9::t_cfba1bbb6137a0 1-78
+tests/e2e/nightly/one_card/test_draft_attention_graph.py
+  s_7e452973ee06c9::t_c5c5f98a6fa147 55-56,63,68,76,223,230
+tests/e2e/nightly/one_card/test_draft_context_graph.py
+  s_7e452973ee06c9::t_4e06b2e92811db 47,67-69,100,114,149
+tests/e2e/nightly/one_card/test_hc_post_fused.py
+  s_7e452973ee06c9::t_36e81702aa01c4 37,58,107
+tests/e2e/nightly/single_node/ops/singlecard_ops/test_hc_pre_delayed.py
+  s_7e452973ee06c9::t_2b93927371e182 45
+tests/e2e/nightly/single_node/ops/singlecard_ops/test_v41_single_pass_fp8_qdq.py
+  s_7e452973ee06c9::t_b7b2b772f444f8 41-49
+tests/ut/models/common/ops/test_draft_attention_graph.py
+  s_7e452973ee06c9::t_8d2a8450d17314 61,100,102,104
+tests/ut/models/common/ops/test_draft_context_graph.py
+  s_7e452973ee06c9::t_a948c24e8ee4d4 106,126-135
+tests/ut/models/common/ops/test_draft_output_graph.py
+  s_7e452973ee06c9::t_4f93ae8d60597d 12,14,27,29-30
+tests/ut/models/common/ops/test_hc_post.py
+  s_7e452973ee06c9::t_2410c521c5ad27 66
+tests/ut/models/common/ops/test_hc_pre_delayed.py
+  s_7e452973ee06c9::t_167a226639bd32 137,320
+vllm_ascend/models/common/ops/draft_attention_graph.py
+  s_7e452973ee06c9::t_89f5b3dcb80cac 17-20,30,56,63,140,146,163
+vllm_ascend/models/common/ops/draft_context_graph.py
+  s_7e452973ee06c9::t_21b8aa66673109 17-19,30,48,83
+vllm_ascend/models/common/ops/hc_post.py
+  s_7e452973ee06c9::t_b6769edf571c64 10
+vllm_ascend/models/common/ops/hc_pre.py
+  s_7e452973ee06c9::t_432c15302c37a5 15
+vllm_ascend/models/common/ops/selected_fia.py
+  s_7e452973ee06c9::t_029901bea1f707 10
+vllm_ascend/models/deepseek_v41/attention.py
+  s_7e452973ee06c9::t_035406d8fc64f7 83,93-95,675,685,824-825,1052,1143,1146,1158,1256-1257,1260
+vllm_ascend/models/deepseek_v41/attention_ops.py
+  s_7e452973ee06c9::t_31a9c84f674c60 25
+vllm_ascend/ops/triton/deepseek_v41_slot_arena.py
+  s_7e452973ee06c9::t_44c405f511396a 32,54,56,86,98,102,117-118,129,145,151-153,171
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "a449e7082df3f7d2acf34755fd52a03d058fa8d5",
+  "prompts": {},
+  "sessions": {
+    "s_7e452973ee06c9": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1be27-e9f1-7c70-835a-54fe7b523546",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "jiangkuaixue123 <jiangxiaozhou111@163.com>"
+    }
+  }
+}
