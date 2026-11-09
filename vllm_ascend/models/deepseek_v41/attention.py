@@ -80,7 +80,7 @@ _OUTPUT_QDQ_TILE_ROWS = 256
 # A FULL graph uses a static context width even when only a few pages are live.
 # Tile the key axis; candidate-block and top-k selection still see all scores.
 _DECODE_INDEX_TILE_KEYS = 8192
-_DECODE_INDEX_SORT_ROWS = (6, 12)
+_DECODE_INDEX_SORT_ROWS = (3, 6, 12)
 _DECODE_INDEX_SORT_K = 512
 _DECODE_INDEX_SORT_MAX_WIDTH = 1 << 24
 _DECODE_INDEX_TIE_WIDTHS = (76800, 153600)
@@ -90,8 +90,9 @@ _PARTIAL_ROPE_DIM = 64
 _ARENA_BLOCK_SIZE = 128
 _ARENA_LEGACY_LENGTH = 16384
 _ARENA_LONG_LENGTH = 153600
-_QUERY_OVERLAP_ROWS = (6, 12)
-_QUERY_OVERLAP_LAYOUT = (4, 5120, 1280, 64, 512)
+_QUERY_OVERLAP_ROWS = (3, 6, 12)
+_QUERY_OVERLAP_LAYOUT = (5120, 1280, 64, 512)
+_QUERY_OVERLAP_TP_SIZES = (4, 8)
 _QUERY_OVERLAP_QUERY_WIDTH = 6
 
 
@@ -671,7 +672,7 @@ def _disjoint_cache_fields(raw, compressed):
 def _supports_arena_metadata(md, device, rows):
     if not (
         isinstance(md, DeepseekV41DecodeMetadata)
-        and rows in (6, 12)
+        and rows in (3, 6, 12)
         and type(md.max_model_len) is int
         and md.max_model_len in (_ARENA_LEGACY_LENGTH, _ARENA_LONG_LENGTH)
     ):
@@ -681,7 +682,7 @@ def _supports_arena_metadata(md, device, rows):
     return (
         md.query_width == 6
         and type(md.grouped_row_start) is int
-        and md.grouped_row_start in range(0, 4 * rows, rows)
+        and md.grouped_row_start in range(0, 24 if rows == 3 else 48, rows)
         and md.seq_lens.device == md.active.device == table.device == device
         and md.seq_lens.dtype == torch.int64
         and md.active.dtype == torch.bool
@@ -820,7 +821,8 @@ class DeepseekV41Attention(nn.Module):
         self._query_overlap_stream = None
         if (
             self.dsa_cp
-            and (tp, config.hidden_size, config.q_lora_rank, self.heads, self.dim) == _QUERY_OVERLAP_LAYOUT
+            and tp in _QUERY_OVERLAP_TP_SIZES
+            and (config.hidden_size, config.q_lora_rank, self.heads, self.dim) == _QUERY_OVERLAP_LAYOUT
             and self.wq_a.weight.device.type == "npu"
             and get_ascend_device_type() == AscendDeviceType.A3
         ):
@@ -1047,7 +1049,7 @@ class DeepseekV41Attention(nn.Module):
         scores = None
         if (
             q.device.type == "npu"
-            and self.tp == 4
+            and self.tp in _QUERY_OVERLAP_TP_SIZES
             and self.dsa_cp
             and torch.is_inference_mode_enabled()
             and paged_index_scores is not None
@@ -1138,10 +1140,10 @@ class DeepseekV41Attention(nn.Module):
         if not (
             q.device.type == "npu"
             and extra == 512
-            and rows in (6, 12)
+            and rows in (3, 6, 12)
             and q.shape == (rows, 64, 512)
             and q.dtype == torch.bfloat16
-            and self.tp == 4
+            and self.tp in _QUERY_OVERLAP_TP_SIZES
             and self.dsa_cp
             and self.uses_local_kv
             and self.config.sliding_window == 128
@@ -1153,7 +1155,7 @@ class DeepseekV41Attention(nn.Module):
             and enable_custom_op()
             and isinstance(self.attention_kernel, DeepseekV41NativeAttention)
             and (q.device, 64, rows, 640) in self.attention_kernel.decode_plans
-            and runtime.decode.active.shape == (4 * rows,)
+            and runtime.decode.active.shape == (self.tp * rows,)
             and arena.source_generation > 0
             and arena.index_generation > 0
         ):
@@ -1251,9 +1253,11 @@ class DeepseekV41Attention(nn.Module):
         stream = getattr(self, "_query_overlap_stream", None)
         if stream is None or metadata is None:
             return None
-        tp, hidden, q_rank, heads, dim = _QUERY_OVERLAP_LAYOUT
+        hidden, q_rank, heads, dim = _QUERY_OVERLAP_LAYOUT
+        tp = self.tp
         if not (
             self.dsa_cp
+            and tp in _QUERY_OVERLAP_TP_SIZES
             and self.sequence_group is not None
             and self.sequence_group.world_size == tp
             and (self.heads, self.dim) == (heads, dim)

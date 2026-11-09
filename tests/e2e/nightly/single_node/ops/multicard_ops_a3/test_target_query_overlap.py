@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Real TP4 query/rotary overlap through the raw-cache join and native consumers."""
+"""Real TP4/TP8 query/rotary overlap through the raw-cache join and native consumers."""
 
 import argparse
 import json
@@ -29,7 +29,7 @@ from vllm_ascend.quantization.method_adapters import AscendLinearMethod
 from vllm_ascend.quantization.methods.w8a8.w8a8_dynamic import AscendW8A8DynamicLinearMethod
 from vllm_ascend.utils import enable_custom_op, npu_stream_switch, shared_experts_calculation_stream
 
-TP = 4
+SUPPORTED_TP = (4, 8)
 HIDDEN = 5120
 QUERY_RANK = 1280
 HEADS = 64
@@ -56,7 +56,10 @@ class NativeQuantConfig:
 
 
 class TPGroup:
-    world_size = TP
+    @property
+    def world_size(self):
+        return dist.get_world_size()
+
     device_group = None
 
     @property
@@ -65,13 +68,13 @@ class TPGroup:
 
     def all_gather(self, value, dim):
         assert dim == 0
-        result = value.new_empty(value.shape[0] * TP, *value.shape[1:])
+        result = value.new_empty(value.shape[0] * dist.get_world_size(), *value.shape[1:])
         dist.all_gather_into_tensor(result, value.contiguous())
         return result
 
     def reduce_scatter(self, value, dim):
         assert dim == 0 and value.dtype == torch.float32
-        result = value.new_empty(value.shape[0] // TP, value.shape[1])
+        result = value.new_empty(value.shape[0] // dist.get_world_size(), value.shape[1])
         dist.reduce_scatter_tensor(result, value.contiguous())
         return result
 
@@ -90,8 +93,8 @@ def make_layer(path):
     nn.Module.__init__(layer)
     layer.config = SimpleNamespace(o_lora_rank=OUTPUT_RANK)
     layer.layer_id = CHECKPOINT_LAYER
-    layer.tp, layer.heads, layer.dim, layer.rope_dim = TP, HEADS, HEAD_DIM, ROPE_DIM
-    layer.local_heads, layer.groups = HEADS // TP, GROUPS // TP
+    layer.tp, layer.heads, layer.dim, layer.rope_dim = dist.get_world_size(), HEADS, HEAD_DIM, ROPE_DIM
+    layer.local_heads, layer.groups = HEADS // dist.get_world_size(), GROUPS // dist.get_world_size()
     layer.ratio, layer.owns_kv, layer.dsa_cp = 0, False, True
     layer.sequence_group = TPGroup()
     layer.attention_kernel = DeepseekV41NativeAttention()
@@ -101,11 +104,11 @@ def make_layer(path):
         "wq_a": (HIDDEN, QUERY_RANK),
         "wq_b": (QUERY_RANK, HEADS * HEAD_DIM),
         "wkv": (HIDDEN, HEAD_DIM),
-        "wo_a": (HEADS * HEAD_DIM // GROUPS, GROUPS * OUTPUT_RANK // TP),
-        "wo_b": (GROUPS * OUTPUT_RANK // TP, HIDDEN),
+        "wo_a": (HEADS * HEAD_DIM // GROUPS, GROUPS * OUTPUT_RANK // dist.get_world_size()),
+        "wo_b": (GROUPS * OUTPUT_RANK // dist.get_world_size(), HIDDEN),
     }
     rank = dist.get_rank()
-    shard = GROUPS * OUTPUT_RANK // TP
+    shard = GROUPS * OUTPUT_RANK // dist.get_world_size()
     for name, (input_size, output_size) in dimensions.items():
         with torch.device("npu"):
             linear = ReplicatedLinear(
@@ -181,7 +184,7 @@ def stage_cache(layer, query, metadata, runtime, extra):
     columns = metadata.seq_lens[:, None] - 1 - torch.arange(SELECTED_WIDTH, device="npu")
     valid = (columns >= 0) & metadata.active[:, None]
     slots = torch.where(valid, row[:, None] * MAX_LENGTH + columns, -1).int().unsqueeze(1)
-    pages = layer.cache.kv_cache[0].reshape(rows, TP * MAX_LENGTH, HEAD_DIM)
+    pages = layer.cache.kv_cache[0].reshape(rows, dist.get_world_size() * MAX_LENGTH, HEAD_DIM)
     return pages, slots, True
 
 
@@ -219,7 +222,7 @@ def run_case(layer, rows):
     rank = dist.get_rank()
     torch.manual_seed(811 + rank)
     states = torch.randn(rows, HIDDEN, device="npu", dtype=torch.bfloat16)
-    metadata = make_metadata(rows * TP)
+    metadata = make_metadata(rows * dist.get_world_size())
     runtime = SimpleNamespace(decode=metadata)
     caches = [make_cache(metadata) for _ in range(2)]
     stream = layer._query_overlap_stream
@@ -265,7 +268,7 @@ def run_case(layer, rows):
         exact(eager_parts[1][name], eager_parts[0][name])
     for case in range(4):
         states.copy_(torch.randn_like(states) * (0.0, 0.01, 1.0, 8.0)[case])
-        index = torch.arange(rows * TP, device="npu", dtype=torch.int64)
+        index = torch.arange(rows * dist.get_world_size(), device="npu", dtype=torch.int64)
         pos = (index * 37 + case * 127) % MAX_LENGTH
         metadata.seq_lens.copy_(pos + 1)
         metadata.slot_mapping.copy_(index * MAX_LENGTH + pos)
@@ -315,7 +318,7 @@ def run_case(layer, rows):
                 {
                     "status": "PASS",
                     "rows": rows,
-                    "world_size": TP,
+                    "world_size": dist.get_world_size(),
                     "calls": TIMED_CALLS,
                     "parent": medians[0],
                     "candidate": medians[1],
@@ -339,15 +342,15 @@ if __name__ == "__main__":
     torch.npu.config.allow_internal_format = True
     dist.init_process_group("hccl")
     try:
-        assert dist.get_world_size() == TP
+        assert dist.get_world_size() in SUPPORTED_TP
         enable_custom_op()
         with pytest.MonkeyPatch.context() as patch, torch.inference_mode():
             patch.setattr("vllm_ascend.utils.get_ascend_config", lambda: SimpleNamespace(weight_nz_mode=1))
             patch.setattr("vllm.model_executor.parameter.get_tensor_model_parallel_rank", dist.get_rank)
-            patch.setattr("vllm.model_executor.parameter.get_tensor_model_parallel_world_size", lambda: TP)
+            patch.setattr("vllm.model_executor.parameter.get_tensor_model_parallel_world_size", dist.get_world_size)
             patch.setattr("vllm_ascend.quantization.method_adapters.get_tensor_model_parallel_rank", dist.get_rank)
             model = make_layer(args.checkpoint)
-            for rows in (6, 12):
+            for rows in (6, 12) if dist.get_world_size() == 4 else (6,):
                 run_case(model, rows)
     finally:
         dist.destroy_process_group()

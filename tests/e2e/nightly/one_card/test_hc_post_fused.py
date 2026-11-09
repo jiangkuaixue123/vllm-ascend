@@ -34,7 +34,7 @@ def exact_output(actual, expected):
     assert torch.equal(actual.view(torch.int16)[~both_nan], expected.view(torch.int16)[~both_nan])
 
 
-@pytest.mark.parametrize("rows", [6, 12])
+@pytest.mark.parametrize("rows", [3, 6, 12])
 @torch.inference_mode()
 def test_reference_order_and_finite_boundaries(rows):
     torch.npu.set_device(0)
@@ -55,7 +55,7 @@ def test_reference_order_and_finite_boundaries(rows):
     exact_output(hc_post_fused(sub, residual, post, comb), hc_post(sub, residual, post, comb))
 
 
-@pytest.mark.parametrize("rows", [6, 12])
+@pytest.mark.parametrize("rows", [3, 6, 12])
 @torch.inference_mode()
 def test_graph_replay_refreshes_every_input(rows):
     torch.npu.set_device(0)
@@ -104,7 +104,7 @@ def timed_graph(function, args):
     return statistics.median(elapsed)
 
 
-@pytest.mark.parametrize("rows", [6, 12])
+@pytest.mark.parametrize("rows", [3, 6, 12])
 @torch.inference_mode()
 def test_graph_component_latency(rows):
     torch.npu.set_device(0)

@@ -9,7 +9,7 @@ import pytest
 import torch
 from torch import nn
 
-from vllm_ascend.models.deepseek_v41 import attention
+from vllm_ascend.models.deepseek_v41 import attention, native_attention
 from vllm_ascend.models.deepseek_v41.config import DeepseekV41TextConfig
 from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
 
@@ -18,8 +18,9 @@ PHYS = 4096
 
 
 class Fixture:
-    def __init__(self, rows, alias, max_model_len=16384, shard=1, module=attention):
+    def __init__(self, rows, alias, max_model_len=16384, shard=1, module=attention, tp=4):
         self.rows = rows
+        self.tp = tp
         self.offset = rows * shard
         self.max_model_len = max_model_len
         self.module = module
@@ -30,7 +31,7 @@ class Fixture:
             if max_model_len == 16384
             else tuple(i for i in range(config.num_hidden_layers) if config.compress_ratios[i])
         )
-        full = rows * 4
+        full = rows * tp
         self.values = torch.empty(full, 512, device="npu", dtype=torch.bfloat16)
         self.layers = []
         self.metadata = {}
@@ -46,7 +47,7 @@ class Fixture:
             layer.owns_kv = layer_id in config.kv_source_layer_ids
             layer.owns_index = layer_id in config.index_source_layer_ids
             layer.ratio = config.compress_ratios[layer_id]
-            layer.tp, layer.dsa_cp, layer.uses_local_kv = 4, True, True
+            layer.tp, layer.dsa_cp, layer.uses_local_kv = tp, True, True
             layer.heads, layer.dim, layer.index_heads, layer.rope_dim = 64, 512, 32, 64
             layer.config = SimpleNamespace(
                 sliding_window=128,
@@ -94,7 +95,7 @@ class Fixture:
             if layer_id == 21 and alias:
                 key = source20  # Raw writes now overlap the existing source's compressed field.
             cache.kv_cache = (key, value)
-            cache.native_layout = (layer.attention_kernel, 64, 4, 640)
+            cache.native_layout = (layer.attention_kernel, 64, tp, 640)
             layer.cache = cache
             builder = module.DeepseekV41MetadataBuilder.__new__(module.DeepseekV41MetadataBuilder)
             builder.decode_graph_enabled = True
@@ -126,7 +127,7 @@ class Fixture:
             self.layers.append(layer)
 
     def update(self, step):
-        full = self.rows * 4
+        full = self.rows * self.tp
         gen = torch.Generator().manual_seed(901 + step)
         x = torch.randn(full, 512, generator=gen).bfloat16()
         if step == 3:
@@ -197,16 +198,19 @@ class Fixture:
 
 def equal(left, right):
     assert len(left) == len(right)
-    for a, b in zip(left, right):
-        assert torch.equal(a.view(torch.int16), b.view(torch.int16))
+    for index, (a, b) in enumerate(zip(left, right)):
+        assert torch.equal(a.view(torch.int16), b.view(torch.int16)), f"output {index} differs"
 
 
 @torch.inference_mode()
-def check_graph_case(rows, alias, max_model_len, shard, reference=attention, observations=None):
+@patch.object(native_attention, "try_selected_fia", lambda *args, **kwargs: None)
+def check_graph_case(rows, alias, max_model_len, shard, reference=attention, observations=None, tp=4):
+    # Isolate arena addressing by using the same shared-KV operator on both sides.
+    # FIA uses different arithmetic; its real TP consumers have separate coverage.
     init_device_properties_triton()
     assert attention.enable_custom_op()
     # Eager parent/child and independently captured parent/child carry independent evolving K/V states.
-    engines = [Fixture(rows, alias, max_model_len, shard, module) for module in (reference, attention) * 2]
+    engines = [Fixture(rows, alias, max_model_len, shard, module, tp) for module in (reference, attention) * 2]
     for f in engines:
         f.update(0)
     graphs = {}
@@ -217,7 +221,7 @@ def check_graph_case(rows, alias, max_model_len, shard, reference=attention, obs
     for i, f in enumerate(engines):
         events = []
         original = f.module.stage_decode_arena
-        # A separately supplied 9be3 parent makes its own long-context guard decision.
+        # A separately supplied parent makes its own long-context guard decision.
         observe_real = bool(i % 2) or reference is not attention
 
         def observe(*args, events=events, fixture=f, stage=original):
@@ -288,3 +292,11 @@ def test_slot_arena_real_decode_graph(rows, alias, max_model_len, shard):
     if attention.stage_decode_arena is None or attention.get_ascend_device_type() != attention.AscendDeviceType.A3:
         pytest.skip("A3 with standard Triton required")
     check_graph_case(rows, alias, max_model_len, shard)
+
+
+@pytest.mark.parametrize("rows,shard", [(3, 0), (3, 1), (3, 6), (3, 7), (6, 7)])
+@pytest.mark.parametrize("alias", [False, True])
+def test_tp8_half_and_full_query_groups(rows, shard, alias):
+    if attention.stage_decode_arena is None or attention.get_ascend_device_type() != attention.AscendDeviceType.A3:
+        pytest.skip("A3 with standard Triton required")
+    check_graph_case(rows, alias, 153600, shard, tp=8)

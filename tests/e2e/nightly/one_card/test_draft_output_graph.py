@@ -10,7 +10,7 @@ import pytest
 import torch
 from torch import nn
 
-from tests.e2e.nightly.one_card.test_draft_attention_graph import DIM, HEADS, HIDDEN, QuantLinear, elapsed, inputs
+from tests.e2e.nightly.one_card.test_draft_attention_graph import DIM, HIDDEN, QuantLinear, elapsed, inputs
 from tests.e2e.nightly.one_card.test_draft_device_history import common_metadata
 from vllm_ascend.models.common.ops.draft_attention_graph import DraftAttentionGraph
 from vllm_ascend.models.deepseek_v41 import dspark
@@ -26,14 +26,18 @@ REPEATS = 5
 def full_model(model, monkeypatch):
     monkeypatch.setattr(dspark, "is_draft_dummy", lambda: False)
     monkeypatch.setattr(model, "config", SimpleNamespace(**vars(model.config), o_lora_rank=OUTPUT_RANK))
-    monkeypatch.setattr(model, "groups", OUTPUT_GROUPS, raising=False)
-    monkeypatch.setattr(model, "local_heads", HEADS, raising=False)
+    monkeypatch.setattr(model, "groups", 8 // model.tp, raising=False)
+    monkeypatch.setattr(model, "local_heads", model.heads, raising=False)
     monkeypatch.setattr(model, "sequence_group", None, raising=False)
     with torch.inference_mode():
         wo_a = nn.Linear(
-            DIM * HEADS // OUTPUT_GROUPS, OUTPUT_RANK * OUTPUT_GROUPS, bias=False, device="npu", dtype=torch.bfloat16
+            DIM * model.heads // model.groups,
+            OUTPUT_RANK * model.groups,
+            bias=False,
+            device="npu",
+            dtype=torch.bfloat16,
         )
-        wo_b = QuantLinear(OUTPUT_RANK * OUTPUT_GROUPS, HIDDEN)
+        wo_b = QuantLinear(OUTPUT_RANK * model.groups, HIDDEN)
         wo_b.reduce_results = False
     monkeypatch.setattr(model, "wo_a", wo_a, raising=False)
     monkeypatch.setattr(model, "wo_b", wo_b, raising=False)
@@ -47,7 +51,7 @@ def full_model(model, monkeypatch):
         if observed.record:
             observed.partials.append(output.clone())
         # Nonidentity reduction also verifies the final cast occurs after the sum.
-        return output * 4 + 0.375
+        return output * model.tp + 0.375
 
     monkeypatch.setattr(dspark, "tensor_model_parallel_all_reduce", collective)
     monkeypatch.setattr("vllm_ascend.models.deepseek_v41.attention.tensor_model_parallel_all_reduce", collective)
@@ -69,7 +73,7 @@ def exact(actual, expected):
     torch.testing.assert_close(actual.view(words), expected.view(words), rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("batch", [1, 4])
+@pytest.mark.parametrize("batch", [1, 2, 4])
 @pytest.mark.parametrize("position_dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize("length_dtype", [torch.int32, torch.int64])
 @torch.inference_mode()
@@ -95,8 +99,8 @@ def test_complete_outputs_and_collective_inputs_match_retained(full_model, batch
         exact(observed.partials[0], observed.partials[1])
         exact(actual, expected)
         assert actual.shape == hidden.shape
-        assert not metadata.requests.materialized
-        assert set(candidate.entries) == {batch}
+        assert metadata.requests.materialized == (batch == 2 and model.tp == 4)
+        assert set(candidate.entries) == ({batch} if batch != 2 or model.tp == 8 else set())
 
 
 @pytest.mark.parametrize("module,name", [("wo_a", "weight"), ("wo_b", "weight"), ("wo_b", "weight_scale")])
@@ -155,11 +159,11 @@ def test_batch_transitions_and_unsupported_batch_keep_exact_outputs(full_model):
         expected = model(hidden, positions).clone()
         model._attention_graph = candidate
         exact(model(hidden, positions), expected)
-        assert metadata.requests.materialized == (batch == 2)
-    assert set(candidate.entries) == {1, 4}
+        assert metadata.requests.materialized == (batch == 2 and model.tp == 4)
+    assert set(candidate.entries) == ({1, 2, 4} if model.tp == 8 else {1, 4})
 
 
-@pytest.mark.parametrize("batch", [1, 4])
+@pytest.mark.parametrize("batch", [1, 2, 4])
 @torch.inference_mode()
 def test_complete_attention_and_projection_latency(full_model, batch):
     model, observed = full_model

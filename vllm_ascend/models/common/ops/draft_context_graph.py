@@ -14,7 +14,9 @@ CONTEXT_ROWS = (6, 24)
 HIDDEN_SIZE = 5120
 KV_WIDTH = 512
 ROPE_DIM = 64
-TENSOR_PARALLEL_SIZE = 4
+TENSOR_PARALLEL_SIZES = (4, 8)
+TP8_SIZE = 8
+TP8_CONTEXT_ROWS = (6, 12, 24)
 ND_FORMAT = 2
 
 
@@ -25,7 +27,7 @@ def supports_draft_context_graph(attention, states, positions, slots, field):
         and torch.is_inference_mode_enabled()
         and not attention.training
         and states.ndim == 2
-        and states.shape[0] in CONTEXT_ROWS
+        and states.shape[0] in (TP8_CONTEXT_ROWS if attention.tp == TP8_SIZE else CONTEXT_ROWS)
         and states.shape[1] == HIDDEN_SIZE
         and states.dtype == field.dtype == torch.bfloat16
         and states.is_contiguous()
@@ -43,7 +45,7 @@ def supports_draft_context_graph(attention, states, positions, slots, field):
         and all(not tensor.is_neg() and not tensor.is_conj() for tensor in (states, positions, slots, field))
         and attention.dim == KV_WIDTH
         and attention.rope_dim == ROPE_DIM
-        and attention.tp == TENSOR_PARALLEL_SIZE
+        and attention.tp in TENSOR_PARALLEL_SIZES
         and not getattr(attention.wkv, "gather_output", False)
         and get_ascend_device_type() == AscendDeviceType.A3
     )
@@ -78,7 +80,7 @@ class _ContextGraphEntry:
 
 
 class DraftContextGraph:
-    """Two entries per layer; all collectives and draft attention stay outside."""
+    """Bounded per-row entries; collectives and draft attention stay outside."""
 
     def __init__(self):
         self.entries = {}

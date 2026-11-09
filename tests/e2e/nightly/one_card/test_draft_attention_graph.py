@@ -52,20 +52,20 @@ class QuantLinear(nn.Module):
         return self.method.apply(self, hidden), None
 
 
-@pytest.fixture(scope="module")
-def model():
+@pytest.fixture(scope="module", params=[4, 8])
+def model(request):
     torch.npu.set_device(0)
     init_device_properties_triton()
     torch.manual_seed(708)
     with torch.inference_mode():
         layer = dspark.DSparkAttention.__new__(dspark.DSparkAttention)
         nn.Module.__init__(layer)
-        layer.tp, layer.heads, layer.dim, layer.rope_dim = 4, HEADS, DIM, 64
+        layer.tp, layer.heads, layer.dim, layer.rope_dim = request.param, 64 // request.param, DIM, 64
         layer.dsa_cp = False
         layer.config = SimpleNamespace(dspark_block_size=ROWS, sliding_window=WINDOW)
         layer.wq_a, layer.wq_b, layer.wkv = (
             QuantLinear(HIDDEN, LATENT),
-            QuantLinear(LATENT, HEADS * DIM),
+            QuantLinear(LATENT, layer.heads * DIM),
             QuantLinear(HIDDEN, DIM),
         )
         layer.q_norm, layer.kv_norm = DeepseekV41RMSNorm(LATENT, 1e-20), DeepseekV41RMSNorm(DIM, 1e-20)
@@ -73,7 +73,7 @@ def model():
             norm.weight = nn.Parameter(
                 torch.ones_like(norm.weight, dtype=torch.bfloat16, device="npu"), requires_grad=False
             )
-        layer.attn_sink = nn.Parameter(torch.linspace(-1, 1, HEADS, device="npu"), requires_grad=False)
+        layer.attn_sink = nn.Parameter(torch.linspace(-1, 1, layer.heads, device="npu"), requires_grad=False)
         layer.register_buffer("frequencies", torch.linspace(0.01, 1, 32, device="npu"))
         layer.attention_kernel = DeepseekV41NativeAttention()
         layer._staging_b4_witness_pending = False
@@ -220,14 +220,14 @@ def test_batch_transitions_isolate_requests_and_bound_graph_storage(model, monke
         hidden, positions, metadata = inputs(model, batch=batch)
         expected = parent(model, hidden, positions)
         same(model(hidden, positions), expected)
-        assert set(replay.entries).issubset({1, 4})
+        assert set(replay.entries).issubset({1, 2, 4} if model.tp == 8 else {1, 4})
         if batch == 4:
             original = expected.clone()
             hidden[:ROWS].add_(1)
             changed = model(hidden, positions)
             same(changed, parent(model, hidden, positions))
             same(changed[ROWS:], original[ROWS:])
-    assert set(replay.entries) == {1, 4}
+    assert set(replay.entries) == ({1, 2, 4} if model.tp == 8 else {1, 4})
 
 
 def elapsed(function):

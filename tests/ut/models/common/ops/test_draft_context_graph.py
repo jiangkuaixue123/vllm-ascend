@@ -103,7 +103,7 @@ def test_unsupported_layouts_keep_parent(case, index, updates):
     assert not namespace["supports_draft_context_graph"](attention, *tensors)
 
 
-@pytest.mark.parametrize("name,value", [("training", True), ("dim", 128), ("rope_dim", 32), ("tp", 8)])
+@pytest.mark.parametrize("name,value", [("training", True), ("dim", 128), ("rope_dim", 32), ("tp", 2)])
 def test_unsupported_model_geometry_keeps_parent(case, name, value):
     namespace, attention, tensors = case
     setattr(attention, name, value)
@@ -123,3 +123,13 @@ def test_missing_kernel_cpu_autograd_and_hardware_keep_parent(case):
     namespace["torch"].is_inference_mode_enabled = lambda: True
     namespace["get_ascend_device_type"] = lambda: "a2"
     assert not namespace["supports_draft_context_graph"](attention, *tensors)
+
+
+@pytest.mark.parametrize("rows", [6, 12, 24])
+def test_tp8_context_rows(case, rows):
+    namespace, attention, tensors = case
+    attention.tp = 8
+    tensors[0] = replace(tensors[0], shape=(rows, 5120))
+    tensors[1] = replace(tensors[1], shape=(rows,))
+    tensors[2] = replace(tensors[2], shape=(rows,))
+    assert namespace["supports_draft_context_graph"](attention, *tensors)

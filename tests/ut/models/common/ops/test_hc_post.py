@@ -63,7 +63,7 @@ def inputs(rows=6):
     ]
 
 
-@pytest.mark.parametrize("rows", [6, 12])
+@pytest.mark.parametrize("rows", [3, 6, 12])
 def test_supported_inputs_preserve_operand_order(rows):
     env, calls, output = load_dispatcher()
     args = inputs(rows)

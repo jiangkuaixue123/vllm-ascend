@@ -9,8 +9,9 @@ from types import SimpleNamespace
 import pytest
 
 
+@pytest.mark.parametrize("tp", [4, 8])
 @pytest.mark.parametrize("unsupported", [None, "tp", "sequence", "groups", "heads", "rank", "reduce"])
-def test_output_capture_requires_the_local_tp4_projection(unsupported):
+def test_output_capture_requires_the_local_tp_projection(unsupported, tp):
     source = Path(__file__).resolve().parents[5] / "vllm_ascend/models/common/ops/draft_attention_graph.py"
     tree = ast.parse(source.read_text())
     nodes = [
@@ -23,10 +24,10 @@ def test_output_capture_requires_the_local_tp4_projection(unsupported):
     namespace = {}
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(source), "exec"), namespace)
     attention = SimpleNamespace(
-        tp=4,
+        tp=tp,
         sequence_group=None,
-        groups=2,
-        local_heads=16,
+        groups=8 // tp,
+        local_heads=64 // tp,
         config=SimpleNamespace(o_lora_rank=1024),
         wo_b=SimpleNamespace(reduce_results=False),
     )

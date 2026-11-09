@@ -16,8 +16,8 @@ inline void check_hc_pre_delayed(const at::Tensor &x, const at::Tensor &fn,
     double normEps)
 {
     TORCH_CHECK(x.dim() == 3, "HC delayed-pre requires x[T,4,5120].");
-    TORCH_CHECK((x.size(0) == 6 || x.size(0) == 12) && x.size(1) == HC_DELAYED_WIDTH &&
-        x.size(2) == HC_DELAYED_HIDDEN, "HC delayed-pre supports T=6/12, H=4, D=5120.");
+    TORCH_CHECK((x.size(0) == 3 || x.size(0) == 6 || x.size(0) == 12) && x.size(1) == HC_DELAYED_WIDTH &&
+        x.size(2) == HC_DELAYED_HIDDEN, "HC delayed-pre supports T=3/6/12, H=4, D=5120.");
     TORCH_CHECK(fn.dim() == 2 && fn.size(0) == HC_DELAYED_MIX &&
         fn.size(1) == HC_DELAYED_WIDTH * HC_DELAYED_HIDDEN, "HC fn must be [24,20480].");
     TORCH_CHECK(scale.dim() == 1 && scale.size(0) == 3, "HC scale must be [3].");

@@ -38,7 +38,15 @@ class KernelLaunches:
 
 
 @pytest.mark.parametrize(
-    "shape,tiles,groups", [((24, 2, 4096), 96, 64), ((48, 2, 4096), 192, 64), ((24, 512), 48, 8), ((48, 512), 48, 16)]
+    "shape,tiles,groups",
+    [
+        ((24, 2, 4096), 96, 64),
+        ((48, 2, 4096), 192, 64),
+        ((24, 1, 4096), 48, 64),
+        ((48, 1, 4096), 96, 64),
+        ((24, 512), 48, 8),
+        ((48, 512), 48, 16),
+    ],
 )
 @pytest.mark.parametrize("inplace", [False, True])
 def test_actual_single_pass_replay(shape, tiles, groups, inplace):

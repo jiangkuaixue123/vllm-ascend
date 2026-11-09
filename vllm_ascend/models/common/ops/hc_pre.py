@@ -12,7 +12,7 @@ from vllm_ascend.device.hardware import AscendDeviceType
 _HC_WIDTH = 4
 _HIDDEN_SIZE = 5120
 _MIX_WIDTH = 24
-_DECODE_ROWS = (6, 12)
+_DECODE_ROWS = (3, 6, 12)
 _SINKHORN_ROUNDS = 20
 _HC_EPS = 1e-6
 _ND_FORMAT = 2

@@ -7,7 +7,7 @@ import torch
 from vllm_ascend.device.device_config import get_ascend_device_type
 from vllm_ascend.device.hardware import AscendDeviceType
 
-_DECODE_ROWS = (6, 12)
+_DECODE_ROWS = (3, 6, 12)
 _HC_WIDTH = 4
 _HIDDEN_SIZE = 5120
 _ND_FORMAT = 2

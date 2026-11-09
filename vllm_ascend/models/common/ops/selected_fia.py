@@ -7,7 +7,7 @@ import torch
 from vllm_ascend.device.device_config import get_ascend_device_type
 from vllm_ascend.device.hardware import AscendDeviceType
 
-TARGET_ROWS = (6, 12)
+TARGET_ROWS = (3, 6, 12)
 TARGET_HEADS = 64
 LATENT_DIM = 512
 SELECTED_WIDTH = 640

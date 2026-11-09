@@ -58,6 +58,7 @@ def case():
         cache=SimpleNamespace(block_size=128),
         dim=512,
         heads=16,
+        tp=4,
         dsa_cp=False,
         wq_b=SimpleNamespace(gather_output=False),
     )
@@ -96,10 +97,11 @@ class DeviceSpans:
         raise AssertionError("Graph eligibility must not resolve device lengths on the host")
 
 
-@pytest.mark.parametrize("batch", [1, 4])
+@pytest.mark.parametrize("tp,batch", [(4, 1), (4, 4), (8, 1), (8, 2), (8, 4)])
 @pytest.mark.parametrize("dtype", ["int32", "int64"])
-def test_device_history_geometry_avoids_host_span_access(case, batch, dtype):
+def test_device_history_geometry_avoids_host_span_access(case, tp, batch, dtype):
     namespace, attention, hidden, positions, metadata = case
+    attention.tp, attention.heads = tp, 64 // tp
     hidden = replace(hidden, shape=(batch * 5, 5120))
     positions = replace(positions, shape=(batch * 5,))
     metadata.requests = DeviceSpans(batch, TensorMetadata((batch,), dtype, hidden.device))

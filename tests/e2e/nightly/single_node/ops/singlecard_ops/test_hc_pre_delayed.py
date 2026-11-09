@@ -42,7 +42,7 @@ def make_inputs(rows):
     return tuple(t.npu() for t in (x, fn, scale, base, previous))
 
 
-@pytest.mark.parametrize("rows", [6, 12])
+@pytest.mark.parametrize("rows", [3, 6, 12])
 @torch.inference_mode()
 def test_delayed_pre_keeps_first_gate_and_returns_real_fp32_intermediates(native_op, rows):
     x, fn, scale, base, previous = make_inputs(rows)

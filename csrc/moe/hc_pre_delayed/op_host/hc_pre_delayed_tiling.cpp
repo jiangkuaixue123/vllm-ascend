@@ -81,7 +81,7 @@ ge::graphStatus TilingForHcPreDelayed(gert::TilingContext *context)
         return ge::GRAPH_FAILED;
     }
     int64_t rows = x->GetStorageShape().GetDim(0);
-    if ((rows != 6 && rows != 12) || !ShapeMatches(x, {rows, HC_WIDTH, HIDDEN_SIZE}) ||
+    if ((rows != 3 && rows != 6 && rows != 12) || !ShapeMatches(x, {rows, HC_WIDTH, HIDDEN_SIZE}) ||
         !ShapeMatches(context->GetInputShape(1), {MIX_WIDTH, HC_WIDTH * HIDDEN_SIZE}) ||
         !ShapeMatches(context->GetInputShape(2), {3}) ||
         !ShapeMatches(context->GetInputShape(3), {MIX_WIDTH}) ||

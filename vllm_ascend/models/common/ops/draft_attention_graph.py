@@ -14,23 +14,21 @@ from vllm_ascend.device.hardware import AscendDeviceType
 DRAFT_ROWS = 5
 HIDDEN_SIZE = 5120
 HEAD_DIM = 512
-# The checkpoint has 64 global heads; TP4 owns 16 heads per worker.
-LOCAL_HEADS = 16
+# Each TP rank owns its checkpoint head and output-group slices.
+SUPPORTED_TP_HEADS_GROUPS = ((4, 16, 2), (8, 8, 1))
+TP8_SIZE = 8
+TP8_BATCHES = (1, 2, 4)
 WINDOW = 128
 ND_FORMAT = 2
 SUPPORTED_BATCHES = (1, 4)
-OUTPUT_GROUPS = 2
 OUTPUT_RANK = 1024
-TENSOR_PARALLEL_SIZE = 4
 
 
 def supports_draft_output_graph(attention):
     """Capture only local projection; no collective may run during recording."""
     return (
-        attention.tp == TENSOR_PARALLEL_SIZE
+        (attention.tp, attention.local_heads, attention.groups) in SUPPORTED_TP_HEADS_GROUPS
         and attention.sequence_group is None
-        and attention.groups == OUTPUT_GROUPS
-        and attention.local_heads == LOCAL_HEADS
         and attention.config.o_lora_rank == OUTPUT_RANK
         and not attention.wo_b.reduce_results
     )
@@ -55,14 +53,14 @@ def supports_draft_attention_graph(attention, hidden, positions, metadata):
         or not positions.is_contiguous()
         or positions.is_neg()
         or positions.is_conj()
-        or len(metadata.requests) not in SUPPORTED_BATCHES
+        or len(metadata.requests) not in (TP8_BATCHES if attention.tp == TP8_SIZE else SUPPORTED_BATCHES)
         or hidden.shape[0] != len(metadata.requests) * DRAFT_ROWS
         or metadata.num_actual_tokens != hidden.shape[0]
         or attention.config.dspark_block_size != DRAFT_ROWS
         or attention.config.sliding_window != WINDOW
         or attention.cache.block_size != WINDOW
         or attention.dim != HEAD_DIM
-        or attention.heads != LOCAL_HEADS
+        or not any(attention.tp == tp and attention.heads == heads for tp, heads, _ in SUPPORTED_TP_HEADS_GROUPS)
         or attention.dsa_cp
         or getattr(attention.wq_b, "gather_output", False)
         or get_ascend_device_type() != AscendDeviceType.A3
@@ -139,13 +137,13 @@ def draft_attention_core(attention, hidden, positions, table, start, *, device_h
     else:
         indices = indices.view(1, 1, -1).expand(batch, DRAFT_ROWS, -1)
     attended = attention.attention_kernel(
-        q.view(batch, DRAFT_ROWS, LOCAL_HEADS, HEAD_DIM),
+        q.view(batch, DRAFT_ROWS, attention.heads, HEAD_DIM),
         kv,
         attention.attn_sink,
         indices,
         HEAD_DIM**-0.5,
         mode="SWA draft bidirectional",
-    ).view(-1, LOCAL_HEADS, HEAD_DIM)
+    ).view(-1, attention.heads, HEAD_DIM)
     attention.rotate(attended.unsqueeze(0), positions, inverse=True)
     return attended
 
@@ -162,7 +160,7 @@ class _AttentionGraphEntry:
 
 
 class DraftAttentionGraph:
-    """Bound each layer to two graphs; communication always stays outside."""
+    """Bound each layer to its supported batches; communication stays outside."""
 
     def __init__(self, *, project_output=False):
         self.entries = {}

@@ -44,7 +44,7 @@ def parent_store(model, args):
         model._context_graph = saved
 
 
-@pytest.mark.parametrize("rows", [6, 24])
+@pytest.mark.parametrize("rows", [6, 12, 24])
 @pytest.mark.parametrize("position_dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize("slot_dtype", [torch.int32, torch.int64])
 @torch.inference_mode()
@@ -64,7 +64,9 @@ def test_replay_refreshes_inputs_and_preserves_full_cache_bits(model, rows, posi
             storage.copy_(initial)
             model.store_context(*args)
             torch.testing.assert_close(storage.view(torch.int16), expected.view(torch.int16), rtol=0, atol=0)
-            assert rows in graph.entries
+            assert (rows in graph.entries) == (rows != 12 or model.tp == 8)
+            if rows == 12 and model.tp == 4:
+                continue
             if entry is None:
                 entry = graph.entries[rows]
             else:
@@ -95,7 +97,7 @@ def test_storage_stream_and_integer_dtype_changes_fall_back(model):
     torch.npu.current_stream().wait_stream(stream)
 
 
-@pytest.mark.parametrize("rows", [6, 24])
+@pytest.mark.parametrize("rows", [6, 12, 24])
 @torch.inference_mode()
 def test_actual_1024_column_cache_stride_preserves_neighbor_fields(model, rows):
     original = model.cache.kv_cache
@@ -109,7 +111,7 @@ def test_actual_1024_column_cache_stride_preserves_neighbor_fields(model, rows):
         expected = storage.clone()
         storage.copy_(initial)
         model.store_context(*args)
-        assert rows in model._context_graph.entries
+        assert (rows in model._context_graph.entries) == (rows != 12 or model.tp == 8)
         torch.testing.assert_close(storage.view(torch.int16), expected.view(torch.int16), rtol=0, atol=0)
     finally:
         model.cache.kv_cache = original
@@ -144,7 +146,7 @@ def test_outer_capture_does_not_nest_context_graph(model):
     assert not candidate.entries
 
 
-@pytest.mark.parametrize("rows", [6, 24])
+@pytest.mark.parametrize("rows", [6, 12, 24])
 @torch.inference_mode()
 def test_complete_context_graph_latency(model, rows):
     args = inputs(rows)

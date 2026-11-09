@@ -134,7 +134,7 @@ def inputs(rows=6):
     ]
 
 
-@pytest.mark.parametrize("rows", [6, 12])
+@pytest.mark.parametrize("rows", [3, 6, 12])
 def test_native_uses_previous_pre_and_exposes_only_model_outputs(rows):
     env, calls, outputs = load_dispatcher()
     args = inputs(rows)
@@ -317,7 +317,7 @@ def test_two_blocks_preserve_previous_pre_timing_and_norm_module_calls(native_av
     assert hidden is outputs[-1]
 
 
-@pytest.mark.parametrize("rows", [6, 12])
+@pytest.mark.parametrize("rows", [3, 6, 12])
 @pytest.mark.parametrize("runtime", [SimpleNamespace(decode=None), SimpleNamespace(), object()])
 def test_prefill_and_draft_never_call_native_even_at_decode_shapes(rows, runtime):
     def unexpected(*args):

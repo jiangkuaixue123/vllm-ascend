@@ -62,10 +62,11 @@ def test_actual_tp_shard_preserves_origin(start):
 
 
 @pytest.mark.parametrize("max_model_len", [16384, 153600])
-@pytest.mark.parametrize("full", [24, 48])
-@pytest.mark.parametrize("rank", range(4))
-def test_both_builder_tables_reach_last_page_on_each_shard(max_model_len, full, rank):
-    rows = full // 4
+@pytest.mark.parametrize(
+    "full,tp,rank", [(full, tp, rank) for full, tp in [(24, 4), (48, 4), (24, 8), (48, 8)] for rank in range(tp)]
+)
+def test_both_builder_tables_reach_last_page_on_each_shard(max_model_len, full, tp, rank):
+    rows = full // tp
     start = rank * rows
     shard_tables = []
     for page_offset in (0, 11):
@@ -81,8 +82,11 @@ def test_both_builder_tables_reach_last_page_on_each_shard(max_model_len, full, 
         assert not captured.active.any()
         assert b._update_decode(common, bounds=list(range(0, full + 1, 6))) is captured
         md = captured.shard(start, rows)
-        assert md.grouped_row_start == start and md.active[1] and not md.active[0]
-        assert torch.equal(md.seq_lens, torch.arange(max_model_len - 5, max_model_len + 1).repeat(rows // 6))
+        assert md.grouped_row_start == start
+        assert torch.equal(md.active, common.slot_mapping[start : start + rows] >= 0)
+        assert torch.equal(
+            md.seq_lens, torch.arange(max_model_len - 5, max_model_len + 1).repeat(full // 6)[start : start + rows]
+        )
         assert torch.equal(
             md.block_table_tensor[:, -1], common.block_table_tensor[:, -1].repeat_interleave(6)[start : start + rows]
         )
