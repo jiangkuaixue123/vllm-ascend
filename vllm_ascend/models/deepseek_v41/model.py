@@ -33,6 +33,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.model_executor.models.interfaces import SupportsMultiModal
 from vllm.model_executor.models.utils import _merge_multimodal_embeddings
 
+from vllm_ascend.ascend_config import validate_additional_config_bool
 from vllm_ascend.models.common.ops.sequence_parallel import sp_all_gather, sp_shard
 from vllm_ascend.models.deepseek_v41.attention import (
     DeepseekV41Attention,
@@ -309,6 +310,14 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsMultiModal):
                 )
         self.engram_layer_ids = tuple(config.engram_layer_ids)
         self._weights_loaded = False
+        if validate_additional_config_bool(
+            (getattr(vllm_config, "additional_config", None) or {}).get("deepseek_v41_flatten", False),
+            "additional_config.deepseek_v41_flatten",
+        ):
+            from .flatten import install_flattened_forward
+
+            install_flattened_forward(self, DeepseekV41Block.forward)
+            logger.info("V4.1 source-derived flattened backbone enabled (%d layers)", len(self.layers))
 
     def get_eagle3_default_aux_hidden_state_layers(self) -> tuple[int, ...]:
         # vLLM passes one-based boundaries. DSpark reads the layer input

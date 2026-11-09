@@ -16,6 +16,7 @@ from vllm_ascend.models.deepseek_v41 import dspark, moe
 from vllm_ascend.models.deepseek_v41.attention import DeepseekV41Metadata, RequestSpan
 from vllm_ascend.models.deepseek_v41.attention_ops import fp8_quant_dequant
 from vllm_ascend.models.deepseek_v41.core import hc_mixes
+from vllm_ascend.models.deepseek_v41.flatten import install_flattened_forward
 
 
 @pytest.mark.parametrize("length, expected", [(0, []), (3, [0, 1, 2]), (4, [0, 1, 2, 3]), (6, [4, 5, 2, 3])])
@@ -283,7 +284,10 @@ def dense_three_stage_hidden(model, ids, aux):
 
 
 @torch.no_grad()
-def test_three_stage_dense_oracle_after_rejected_tail_and_markov_chain(draft):
+@pytest.mark.parametrize("flatten", [False, True])
+def test_three_stage_dense_oracle_after_rejected_tail_and_markov_chain(draft, flatten):
+    if flatten:
+        install_flattened_forward(draft, dspark.DeepseekV41Block.forward, draft=True)
     generator = torch.Generator().manual_seed(174)
     aux = torch.randn(9, 96, generator=generator).bfloat16()
     context = draft.combine_hidden_states(aux)

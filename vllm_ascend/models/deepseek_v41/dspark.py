@@ -16,6 +16,8 @@ from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead, VocabParallelEmbedding
 from vllm.v1.attention.backend import AttentionCGSupport, AttentionMetadataBuilder
 
+from vllm_ascend.ascend_config import validate_additional_config_bool
+
 from .attention import (
     DeepseekV41Attention,
     DeepseekV41Backend,
@@ -281,6 +283,13 @@ class DeepseekV41DSparkForCausalLM(nn.Module):
         self.logits_processor = LogitsProcessor(config.vocab_size)
         self.model_path = Path(vllm_config.model_config.model)
         self.original_fp8 = getattr(vllm_config.model_config, "quantization", None) == "deepseek_v4_fp8"
+        if validate_additional_config_bool(
+            (getattr(vllm_config, "additional_config", None) or {}).get("deepseek_v41_flatten", False),
+            "additional_config.deepseek_v41_flatten",
+        ):
+            from .flatten import install_flattened_forward
+
+            install_flattened_forward(self, DeepseekV41Block.forward, draft=True)
 
     def embed_input_ids(self, input_ids):
         return self.mtp[0].embed(input_ids)
