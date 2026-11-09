@@ -417,3 +417,13 @@ Before merging, verify:
 - [vLLM Hardware Plugin RFC](https://github.com/vllm-project/vllm/issues/11162)
 - [Documentation](https://docs.vllm.ai/projects/ascend/en/latest/)
 - [Contributors Guide](https://docs.vllm.ai/projects/ascend/en/latest/community/contributors.html)
+
+## Local DeepSeek V4.1 performance regression
+
+For this deployment, the user selected `v41-c8-i100-o256-v1` as the required workload for subsequent performance validation.
+Run `python3 examples/deepseek_v41_a5/benchmark-fixed.py` against the running four-card A5 TP4/EP4 service after inference
+or serving changes. Keep the eight fixed prompts, 256 output tokens per request, one 64-token warmup, sampling parameters,
+and zero-prefix-cache-hit policy unchanged. The scenario and checksum live under
+`examples/deepseek_v41_a5/fixed-throughput/`. Compare valid results with its `baseline.json`; record changed service settings.
+Never silently replace the baseline or change the workload to improve reported throughput. The earlier 46.1295 token/s
+random-ID run is a historical reference, not an exact-input replay baseline.

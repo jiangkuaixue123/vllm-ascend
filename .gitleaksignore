@@ -1,0 +1,11 @@
+# Public SHA256 fingerprints of the frozen benchmark input token IDs.
+# Verified against /tokenize; these nine values are checksums, not credentials.
+examples/deepseek_v41_a5/fixed-throughput/scenario.json:generic-api-key:37
+examples/deepseek_v41_a5/fixed-throughput/scenario.json:generic-api-key:50
+examples/deepseek_v41_a5/fixed-throughput/scenario.json:generic-api-key:61
+examples/deepseek_v41_a5/fixed-throughput/scenario.json:generic-api-key:72
+examples/deepseek_v41_a5/fixed-throughput/scenario.json:generic-api-key:83
+examples/deepseek_v41_a5/fixed-throughput/scenario.json:generic-api-key:94
+examples/deepseek_v41_a5/fixed-throughput/scenario.json:generic-api-key:105
+examples/deepseek_v41_a5/fixed-throughput/scenario.json:generic-api-key:116
+examples/deepseek_v41_a5/fixed-throughput/scenario.json:generic-api-key:127

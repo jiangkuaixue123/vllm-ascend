@@ -1,0 +1,130 @@
+{
+  "scenario_id": "v41-c8-i100-o256-v1",
+  "model": "deepseek-v4.1",
+  "concurrency": 8,
+  "requests": 8,
+  "output_tokens": 256,
+  "temperature": 0,
+  "seed": 0,
+  "min_tokens": 256,
+  "ignore_eos": true,
+  "stream": true,
+  "chat_template_kwargs": {
+    "thinking_mode": "chat"
+  },
+  "cache_policy": "unique cache_salt per request; cached_tokens must be zero",
+  "metric": "total completion tokens / batch wall seconds, including prefill and decode",
+  "hardware": {
+    "physical_devices": [
+      4,
+      5,
+      6,
+      7
+    ],
+    "tensor_parallel_size": 4,
+    "expert_parallel_size": 4,
+    "checkpoint": "/mnt/weight/DeepSeek-V4.1-Flash-1017"
+  },
+  "warmup": {
+    "id": "warmup",
+    "messages": [
+      {
+        "role": "user",
+        "content": "任务编号 7a41514e219bc8155f351ec4f55931a8。请用中文写一篇关于城市公共图书馆的详细介绍。依次说明它的日常服务、适合学生使用的资源、数字借阅方式，以及第一次到访的实用建议。写成连贯的完整段落，使用自然语言，不要表格、代码或重复句子。内容尽量充分，至少写八百字。不要在回答中提及任务编号。"
+      }
+    ],
+    "prompt_tokens": 96,
+    "prompt_token_ids_sha256": "e2b8fec06128cd4a342c34397d21f334bb914b2cb25983c4a6d1e080c9b594ec",
+    "output_tokens": 64
+  },
+  "samples": [
+    {
+      "id": "request-0",
+      "messages": [
+        {
+          "role": "user",
+          "content": "任务编号 e7e955a53bcdddfe62b9088cb2f70624。请用中文写一篇关于城市公共图书馆的详细介绍。依次说明它的日常服务、适合学生使用的资源、数字借阅方式，以及第一次到访的实用建议。写成连贯的完整段落，使用自然语言，不要表格、代码或重复句子。内容尽量充分，至少写八百字。不要在回答中提及任务编号。"
+        }
+      ],
+      "prompt_tokens": 97,
+      "prompt_token_ids_sha256": "27b5b54608f928621fa777dba44450174986971f75bec40f83e6ed0dc10edec6"
+    },
+    {
+      "id": "request-1",
+      "messages": [
+        {
+          "role": "user",
+          "content": "任务编号 5c5f530aae2e0f6106e35ff1ae6d8008。请用中文写一篇关于城市公共图书馆的详细介绍。依次说明它的日常服务、适合学生使用的资源、数字借阅方式，以及第一次到访的实用建议。写成连贯的完整段落，使用自然语言，不要表格、代码或重复句子。内容尽量充分，至少写八百字。不要在回答中提及任务编号。"
+        }
+      ],
+      "prompt_tokens": 100,
+      "prompt_token_ids_sha256": "3edb9d6d06402b4c34ab8955b235f42c82c88677665c0c7bfaab9e2ac3b3e7c9"
+    },
+    {
+      "id": "request-2",
+      "messages": [
+        {
+          "role": "user",
+          "content": "任务编号 2406f2d80557d4310753c9e4334e1e97。请用中文写一篇关于城市公共图书馆的详细介绍。依次说明它的日常服务、适合学生使用的资源、数字借阅方式，以及第一次到访的实用建议。写成连贯的完整段落，使用自然语言，不要表格、代码或重复句子。内容尽量充分，至少写八百字。不要在回答中提及任务编号。"
+        }
+      ],
+      "prompt_tokens": 98,
+      "prompt_token_ids_sha256": "c8dd215bf5099e1053f814100b9e76702c7a5199726bfb66e308a09d34b872cc"
+    },
+    {
+      "id": "request-3",
+      "messages": [
+        {
+          "role": "user",
+          "content": "任务编号 d664cc88ffd8d8de6635246df8b89906。请用中文写一篇关于城市公共图书馆的详细介绍。依次说明它的日常服务、适合学生使用的资源、数字借阅方式，以及第一次到访的实用建议。写成连贯的完整段落，使用自然语言，不要表格、代码或重复句子。内容尽量充分，至少写八百字。不要在回答中提及任务编号。"
+        }
+      ],
+      "prompt_tokens": 95,
+      "prompt_token_ids_sha256": "b308ee7c678baf28d31b6c988b80c436991068ba01f0f25ebce7adb6b5c4d48d"
+    },
+    {
+      "id": "request-4",
+      "messages": [
+        {
+          "role": "user",
+          "content": "任务编号 d5a3b896285efbda31cd2369fc7ce0bd。请用中文写一篇关于城市公共图书馆的详细介绍。依次说明它的日常服务、适合学生使用的资源、数字借阅方式，以及第一次到访的实用建议。写成连贯的完整段落，使用自然语言，不要表格、代码或重复句子。内容尽量充分，至少写八百字。不要在回答中提及任务编号。"
+        }
+      ],
+      "prompt_tokens": 96,
+      "prompt_token_ids_sha256": "bf48e8e103e339a4628389270913b0f0b5f79a278c30dc9c285641067f6b1bcf"
+    },
+    {
+      "id": "request-5",
+      "messages": [
+        {
+          "role": "user",
+          "content": "任务编号 55693527c1fdc3390775e9d08e1df403。请用中文写一篇关于城市公共图书馆的详细介绍。依次说明它的日常服务、适合学生使用的资源、数字借阅方式，以及第一次到访的实用建议。写成连贯的完整段落，使用自然语言，不要表格、代码或重复句子。内容尽量充分，至少写八百字。不要在回答中提及任务编号。"
+        }
+      ],
+      "prompt_tokens": 96,
+      "prompt_token_ids_sha256": "de48a3121775235d389d3b2bd457b8b09d2bcd8026a12a7643295fdb0867ca39"
+    },
+    {
+      "id": "request-6",
+      "messages": [
+        {
+          "role": "user",
+          "content": "任务编号 012942f76c5d4d0cec4b09372f8cc042。请用中文写一篇关于城市公共图书馆的详细介绍。依次说明它的日常服务、适合学生使用的资源、数字借阅方式，以及第一次到访的实用建议。写成连贯的完整段落，使用自然语言，不要表格、代码或重复句子。内容尽量充分，至少写八百字。不要在回答中提及任务编号。"
+        }
+      ],
+      "prompt_tokens": 98,
+      "prompt_token_ids_sha256": "b97ba09970427310bb137146b2d0b5195bc4cac6425e1e63a4cd177c0121cbe8"
+    },
+    {
+      "id": "request-7",
+      "messages": [
+        {
+          "role": "user",
+          "content": "任务编号 90ac13e5b7f9c2871a40b04780f4c1b5。请用中文写一篇关于城市公共图书馆的详细介绍。依次说明它的日常服务、适合学生使用的资源、数字借阅方式，以及第一次到访的实用建议。写成连贯的完整段落，使用自然语言，不要表格、代码或重复句子。内容尽量充分，至少写八百字。不要在回答中提及任务编号。"
+        }
+      ],
+      "prompt_tokens": 101,
+      "prompt_token_ids_sha256": "f0242f9c825b795f6a35b6385f65af81a8a8e14ebd77a881c32b31756f2c96e5"
+    }
+  ]
+}

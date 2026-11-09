@@ -1,0 +1,17 @@
+{
+  "concurrency": 8,
+  "requests": 8,
+  "wall_seconds": 44.39671875000931,
+  "total_output_tokens": 2048,
+  "aggregate_output_tokens_per_second": 46.129535192272975,
+  "mean_request_e2e_tokens_per_second": 5.989860291509251,
+  "mean_request_decode_tokens_per_second": 7.0589228121032805,
+  "mean_ttft_seconds": 6.551895512522606,
+  "mean_latency_seconds": 42.781446233762836,
+  "draft_acceptance_ratio": 0.17940630797773655,
+  "kind": "historical_reference_not_exact_replay",
+  "recorded_at": "2026-11-09T14:10:33.570049+08:00",
+  "adaptation_commit": "253e2853b7753facb62c37ce7a28b71b6a756f40",
+  "original_artifact": "logs/throughput-d4ac431-253e285-baseline-20261109.json",
+  "limitation": "Original random task IDs were not saved. Fixed prompts preserve the same body and per-request token counts; establish a new exact-input baseline with this scenario."
+}

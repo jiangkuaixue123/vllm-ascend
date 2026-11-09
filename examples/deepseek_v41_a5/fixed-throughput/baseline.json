@@ -1,0 +1,221 @@
+{
+  "scenario_id": "v41-c8-i100-o256-v1",
+  "scenario_sha256": "e9e065fbbd62a22800b0869a1942979a69e37f0054674f1613e257030a4093d0",
+  "started_at": "2026-11-09T14:25:55.328354+08:00",
+  "status": "valid",
+  "output": "logs/fixed-throughput-initial.json",
+  "runtime": {
+    "container": "jojo-v41-d4ac431",
+    "image_id": "sha256:70586cf570b3780fdb5c3c8a23e5e4c250d397240abf4df79e25f86292ac1e8e",
+    "settings": {
+      "--tensor-parallel-size": "4",
+      "--quantization": "deepseek_v4_fp8",
+      "--dtype": "bfloat16",
+      "--max-model-len": "65536",
+      "--block-size": "128",
+      "--max-num-batched-tokens": "512",
+      "--max-num-seqs": "16",
+      "--gpu-memory-utilization": "0.93",
+      "--speculative-config": "{\"method\":\"dspark\",\"num_speculative_tokens\":5}",
+      "--compilation-config": "{\"mode\":0,\"cudagraph_mode\":\"FULL_DECODE_ONLY\",\"cudagraph_capture_sizes\":[24,48]}",
+      "--additional-config": "{\"enable_dsa_cp\":true,\"enable_flashcomm1\":false,\"enable_shared_expert_dp\":true}",
+      "--chat-template": "/deployment/reference/chat_template.jinja",
+      "--chat-template-content-format": "openai",
+      "--enable-expert-parallel": true,
+      "--enforce-eager": false
+    },
+    "labels": {
+      "source.adaptation": "253e2853b7753facb62c37ce7a28b71b6a756f40",
+      "source.base": "d4ac4319acdaf480689c39b6320a998712f80523"
+    }
+  },
+  "warmup": {
+    "id": "warmup",
+    "usage": {
+      "prompt_tokens": 96,
+      "total_tokens": 160,
+      "completion_tokens": 64,
+      "prompt_tokens_details": {
+        "cached_tokens": 0,
+        "created_cache_tokens": 0
+      }
+    },
+    "finish_reason": "length",
+    "response_text": "城市公共图书馆是面向所有市民开放的知识空间，日常服务远不止借书还书那么简单。大多数馆舍都提供成人、少儿和期刊阅览区，读者可以凭身份证或读者证免费入馆阅读当天的报纸、杂志和参考工具书。借阅服务通常允许每次借出数",
+    "ttft_seconds": 0.471579400007613,
+    "latency_seconds": 4.812842670013197,
+    "decode_tokens_per_second": 14.51190496445496
+  },
+  "samples": [
+    {
+      "id": "request-0",
+      "usage": {
+        "prompt_tokens": 97,
+        "total_tokens": 353,
+        "completion_tokens": 256,
+        "prompt_tokens_details": {
+          "cached_tokens": 0,
+          "created_cache_tokens": 0
+        }
+      },
+      "finish_reason": "length",
+      "response_text": "城市公共图书馆是面向所有市民开放的知识空间，日常服务远不止借书还书那么简单。大多数馆舍都提供成人、少儿和参考咨询等分区服务，读者可以凭身份证或市民卡免费办理借阅证，一次借阅数册图书，期限通常为几周，还能在线续借。馆内一般设有阅览座位、自习区、报刊阅览室和电子阅览室，部分场馆提供免费Wi-Fi、饮水、存包和复印打印服务。参考咨询台的工作人员可以帮助查找资料、解答检索问题，有的馆还提供政府信息公开查询、社区活动预告和公益讲座报名。针对儿童和老年人，图书馆常有绘本故事会、亲子阅读活动、老年电脑培训等特色服务；对残障读者，不少馆配备盲文读物、有声资源和无障碍通道。此外，公共图书馆往往承担着社区文化中心的功能，举办展览、读书沙龙、公益电影放映和各类讲座，读者可以通过官网或公众号了解活动安排并预约参加。需要注意的是，不同馆的开放时间、借阅册数和逾期规则会有差异，第一次去之前最好先查一下目标馆的具体规定。\n\n对于学生群体来说，公共图书馆是课堂之外非常重要的学习支持空间。首先，馆藏的中外文",
+      "ttft_seconds": 2.9064436799963005,
+      "latency_seconds": 35.69650494999951,
+      "decode_tokens_per_second": 7.776746676386282
+    },
+    {
+      "id": "request-1",
+      "usage": {
+        "prompt_tokens": 100,
+        "total_tokens": 356,
+        "completion_tokens": 256,
+        "prompt_tokens_details": {
+          "cached_tokens": 0,
+          "created_cache_tokens": 0
+        }
+      },
+      "finish_reason": "length",
+      "response_text": "城市公共图书馆是面向所有市民开放的知识空间，日常服务涵盖借阅、阅览、咨询、自习和公共文化活动等多个方面。读者凭有效证件即可办理借书证，在开架书库中自由挑选纸质图书带回家阅读，借期通常为几周，到期前可续借；馆内设有综合阅览区和报刊阅览区，提供当天的报纸、流行杂志和参考工具书供现场翻阅。服务台的工作人员会解答关于馆藏位置、借阅规则和设施使用的疑问，许多图书馆还提供打印复印、免费Wi-Fi、储物柜和饮水设施，方便读者长时间停留。针对儿童和青少年，少儿阅览区通常配有绘本、拼音读物和亲子共读空间，周末常举办故事会、手工活动和科普讲座；成人读者则可以参加读书沙龙、公益讲座、展览和电影放映等文化活动，这些服务大多免费，部分活动需要提前在图书馆官网或公众号预约。\n\n对于学生群体来说，公共图书馆是课堂之外非常重要的学习支持场所。馆内通常设有专门的自习区或安静阅读区，桌椅宽敞、照明充足，部分图书馆还提供带电源插座的自习位和独立研讨间，适合写作业、备考和小组讨论。学习类馆藏",
+      "ttft_seconds": 5.3320176300476305,
+      "latency_seconds": 36.05720845999895,
+      "decode_tokens_per_second": 8.299378884619413
+    },
+    {
+      "id": "request-2",
+      "usage": {
+        "prompt_tokens": 98,
+        "total_tokens": 354,
+        "completion_tokens": 256,
+        "prompt_tokens_details": {
+          "cached_tokens": 0,
+          "created_cache_tokens": 0
+        }
+      },
+      "finish_reason": "length",
+      "response_text": "城市公共图书馆是城市文化服务体系中的重要一环，既是市民获取知识与信息的公共空间，也是社区学习、交流与休闲的综合性场所。它通常由政府财政支持，面向所有居民免费开放，承担着保障信息公平、推广阅读文化、提供终身学习支持的职能。下面从日常服务、学生资源、数字借阅和首次到访建议几个方面作一介绍。\n\n在日常服务方面，城市公共图书馆提供的基础功能相当丰富。最核心的是借阅服务：持有效读者证的市民可以借阅纸质图书、期刊、报纸和部分音像资料，借期和册数依各馆规定有所不同，一般支持续借和预约。阅览区通常按功能划分，设有成人阅览区、报刊阅览区、少儿阅览区、参考咨询区等，读者可自由取阅开架书刊。图书馆还提供自习座位和安静阅读空间，部分馆舍设有研讨室、多媒体室和小型报告厅，供读者预约使用。参考咨询服务帮助读者查找资料、解答检索问题；不少图书馆定期举办讲座、展览、读书会、亲子故事会和公益培训课程，形成常态化的公共文化活动。此外，馆内一般配备自助借还机、复印打印设备、饮水区和无障碍设施，",
+      "ttft_seconds": 5.332460800011177,
+      "latency_seconds": 36.057541990012396,
+      "decode_tokens_per_second": 8.299408500277094
+    },
+    {
+      "id": "request-3",
+      "usage": {
+        "prompt_tokens": 95,
+        "total_tokens": 351,
+        "completion_tokens": 256,
+        "prompt_tokens_details": {
+          "cached_tokens": 0,
+          "created_cache_tokens": 0
+        }
+      },
+      "finish_reason": "length",
+      "response_text": "城市公共图书馆是城市文化服务体系中的重要组成部分，承担着知识传播、阅读推广和公共文化服务的多重功能。对于普通市民而言，它首先是一个开放、平等、免费的知识空间。日常服务方面，公共图书馆通常提供图书借阅、阅览自习、参考咨询、报刊阅读、亲子阅读、公益讲座与展览等基础服务。读者可以凭身份证或当地借阅卡借书，借阅期限一般为数周，部分图书馆还支持续借和预约取书。馆内通常设有成人阅览区、少儿阅览区、报刊区和自习区，空调、照明、饮水等设施较为完善，适合长时间停留。许多图书馆还提供免费Wi-Fi、储物柜、复印打印等便利服务，并定期举办读书会、作家见面会、科普讲座和亲子故事会，使图书馆不仅是借书的地方，也是社区交流和文化活动的场所。工作人员一般可以协助办理借阅证、查找资料、使用自助设备，读者遇到问题可随时到服务台咨询。\n\n对于学生群体来说，公共图书馆的资源尤为实用。首先是大规模的馆藏图书，包括教材教辅、文学名著、科普读物、历史社科类书籍以及各类考试用书，能够满足从小学到大学不同阶段的学习需求",
+      "ttft_seconds": 2.90604443999473,
+      "latency_seconds": 33.76688362000277,
+      "decode_tokens_per_second": 8.262899090741238
+    },
+    {
+      "id": "request-4",
+      "usage": {
+        "prompt_tokens": 96,
+        "total_tokens": 352,
+        "completion_tokens": 256,
+        "prompt_tokens_details": {
+          "cached_tokens": 0,
+          "created_cache_tokens": 0
+        }
+      },
+      "finish_reason": "length",
+      "response_text": "城市公共图书馆是城市公共文化服务体系的重要组成部分，面向所有市民开放，通常提供免费或低收费的基础服务。日常服务方面，图书馆一般设有综合阅览区、报刊阅览区、自习区和儿童阅读区，读者可以凭有效证件办理借阅证，借阅纸质图书、期刊和部分音像资料。馆内通常提供咨询导引、图书检索、自助借还、复印打印、无线网络和饮水等便利设施，部分场馆还设有讲座厅、展览区和亲子活动空间，定期举办读书分享、公益讲座、少儿故事会和文化展览等活动。图书馆的工作人员会协助读者查找资料、办理证件和处理借阅问题，许多馆还提供预约座位、馆际互借和参考咨询服务，帮助读者更高效地利用馆藏资源。对于需要安静环境的读者，自习区通常有明确的管理规则，保持低声交谈、手机静音等基本礼仪是共同维护阅读氛围的前提。\n\n对于学生群体来说，公共图书馆是课堂之外非常重要的学习支持空间。馆内通常收藏有各学科的教辅资料、考试用书、科普读物和文学经典，能够满足从小学到大学不同阶段的学习需求。自习区提供相对安静、稳定的学习环境，适合写作业、备考和阅读",
+      "ttft_seconds": 0.45624547998886555,
+      "latency_seconds": 35.209188879991416,
+      "decode_tokens_per_second": 7.33750799363893
+    },
+    {
+      "id": "request-5",
+      "usage": {
+        "prompt_tokens": 96,
+        "total_tokens": 352,
+        "completion_tokens": 256,
+        "prompt_tokens_details": {
+          "cached_tokens": 0,
+          "created_cache_tokens": 0
+        }
+      },
+      "finish_reason": "length",
+      "response_text": "城市公共图书馆是面向所有市民开放的知识空间，日常服务远不止借书还书那么简单。走进任何一家中等规模以上的城市图书馆，你首先会看到总服务台，那里可以办理借书证、咨询馆藏位置、预约活动，也能处理丢失图书或逾期罚款等事务。阅览区通常按楼层或区域划分：一层多为新书推荐和报刊阅览，摆放着当天的日报、周刊和热门杂志，读者可以自由取阅；二层以上往往是社会科学、自然科学、文学艺术等分类书架，开架借阅意味着你可以自己从架上取书，在旁边的阅览桌坐下翻看，决定是否借走。许多图书馆还设有自习区、公共电脑区和无线网络，供自带设备的读者使用。针对儿童和青少年，少儿阅览室会配置低矮书架、绘本区和亲子共读角，周末常有故事会或手工活动。此外，公共图书馆普遍提供免费存包柜、饮水机、复印打印服务，部分馆还有盲文阅览室、地方文献室和政府信息公开查询点。参考咨询台的工作人员可以帮助读者查找特定资料，甚至通过馆际互借从其他图书馆调取书籍。日常服务中还包括公益讲座、展览、读书会等文化活动，",
+      "ttft_seconds": 5.3312051899847575,
+      "latency_seconds": 38.844121839967556,
+      "decode_tokens_per_second": 7.609006481389941
+    },
+    {
+      "id": "request-6",
+      "usage": {
+        "prompt_tokens": 98,
+        "total_tokens": 354,
+        "completion_tokens": 256,
+        "prompt_tokens_details": {
+          "cached_tokens": 0,
+          "created_cache_tokens": 0
+        }
+      },
+      "finish_reason": "length",
+      "response_text": "城市公共图书馆是面向所有市民开放的知识空间，它不只是借书还书的地方，更承担着阅读推广、信息服务和公共文化教育的功能。日常服务方面，图书馆通常提供成人、少儿和报刊等分区阅览，读者可凭身份证或借阅卡借书，多数城市支持通借通还，在任一成员馆借的书能就近归还到其他馆。馆内一般设有自习座位、免费无线网络和公共电脑，供查询目录、浏览数据库或处理文档。参考咨询台可帮助查找资料、代查文献或指导使用数据库；不少馆还举办讲座、展览、亲子故事会和公益培训，部分提供打印复印、存包、饮水等便利设施。对老年人、残障读者等群体，通常有无障碍通道、大字本和送书上门等服务，体现公共图书馆的普惠性。\n\n对学生来说，公共图书馆是课堂之外的重要学习支撑。馆内通常有分学段的藏书：低龄学生可读绘本、拼音读物和科普图画书，中学生能借到教辅、名著、学科拓展读物和期刊。自习区是学生写作业、备考的常用空间，考试季座位紧张，建议提前到馆或留意预约规则。很多馆购置了",
+      "ttft_seconds": 2.9050197799806483,
+      "latency_seconds": 39.39743203000398,
+      "decode_tokens_per_second": 6.987754009049839
+    },
+    {
+      "id": "request-7",
+      "usage": {
+        "prompt_tokens": 101,
+        "total_tokens": 357,
+        "completion_tokens": 256,
+        "prompt_tokens_details": {
+          "cached_tokens": 0,
+          "created_cache_tokens": 0
+        }
+      },
+      "finish_reason": "length",
+      "response_text": "城市公共图书馆是面向所有市民开放的知识空间，日常服务涵盖借阅、阅览、咨询与公共文化活动等多个层面。读者凭有效证件即可办理借书证，在开架书库中自由挑选图书，通过自助借还机或服务台完成借阅手续，通常一次可借数册，借期数周，还可在线续借。阅览区提供当日报纸、期刊和工具书，供馆内查阅；参考咨询台的工作人员会帮助读者查找资料、解答检索问题。许多图书馆还定期举办讲座、读书会、亲子故事会、展览和公益培训，部分场馆设有自习区、报刊区、少儿区和无障碍设施，为老年人、残障读者等群体提供辅助服务。馆内一般提供免费无线网络、饮水、储物和打印复印等便利，开放时间覆盖工作日与周末，部分城市还设有24小时自助还书点或城市书房，让公共文化服务延伸到社区。\n\n对学生而言，公共图书馆是课堂之外的重要学习支撑。馆内通常设有专门的自习区域，环境安静、桌椅充足，考试季还会延长开放时间。学习类藏书覆盖各学科的基础读物、教辅资料、外语学习书、考试用书和科普读物，中小学",
+      "ttft_seconds": 2.907135749992449,
+      "latency_seconds": 36.05994169000769,
+      "decode_tokens_per_second": 7.691656641714797
+    }
+  ],
+  "concurrency": 8,
+  "requests": 8,
+  "total_output_tokens": 2048,
+  "wall_seconds": 39.40532819001237,
+  "aggregate_output_tokens_per_second": 51.9726669988523,
+  "mean_latency_seconds": 36.386102932498034,
+  "mean_ttft_seconds": 3.5095715937495697,
+  "mean_decode_tokens_per_second": 7.783044784727192,
+  "draft_acceptance_ratio": 0.18532455315145813,
+  "metrics_delta": {
+    "vllm:spec_decode_num_drafts_total": 1063.0,
+    "vllm:spec_decode_num_draft_tokens_total": 5315.0,
+    "vllm:spec_decode_num_accepted_tokens_total": 985.0,
+    "vllm:spec_decode_num_accepted_tokens_per_pos_total": 985.0,
+    "vllm:estimated_flops_per_gpu_total": 0.0,
+    "vllm:estimated_read_bytes_per_gpu_total": 0.0,
+    "vllm:estimated_write_bytes_per_gpu_total": 0.0,
+    "vllm:prefix_cache_queries_total": 781.0,
+    "vllm:prefix_cache_hits_total": 0.0,
+    "vllm:external_prefix_cache_queries_total": 0.0,
+    "vllm:external_prefix_cache_hits_total": 0.0,
+    "vllm:mm_cache_queries_total": 0.0,
+    "vllm:mm_cache_hits_total": 0.0,
+    "vllm:num_preemptions_total": 0.0,
+    "vllm:prompt_tokens_total": 781.0,
+    "vllm:prompt_tokens_by_source_total": 781.0,
+    "vllm:prompt_tokens_cached_total": 0.0,
+    "vllm:generation_tokens_total": 2048.0,
+    "vllm:request_success_total": 8.0
+  },
+  "finished_at": "2026-11-09T14:26:39.818178+08:00",
+  "baseline_kind": "first_valid_run_of_fixed_inputs",
+  "historical_reference_output_tokens_per_second": 46.129535192272975,
+  "note": "The historical random-ID run is not the same exact input. Differences from 46.1295 are not optimization gains."
+}
