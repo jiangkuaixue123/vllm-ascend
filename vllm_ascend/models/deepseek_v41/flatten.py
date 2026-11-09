@@ -277,11 +277,51 @@ def load_forward_source(directory, config, name, *, draft=False):
     if manifest.get("specialization") != specialization(config):
         raise ValueError("Flattened bundle specialization does not match this checkpoint")
     filename = ("draft_" if draft else "target_") + name + ".py"
+    return _load_bundle_file(directory, manifest, filename)
+
+
+def _load_bundle_file(directory, manifest, filename):
+    if Path(filename).name != filename or not filename.endswith(".py"):
+        raise ValueError("Flattened source files must be Python files within the bundle")
     source = (directory / filename).read_text()
     digest = hashlib.sha256(source.encode()).hexdigest()
     if manifest["files"][filename]["sha256"] != digest:
         raise ValueError(f"Flattened source checksum mismatch: {filename}; record edits in a new experiment manifest")
     return source, str(directory / filename)
+
+
+def install_leaf_overrides(model, directory, *, draft=False):
+    """Expose selected effectful boundaries as explicit per-instance callbacks.
+
+    An override never changes a module class or global function used by another
+    model. Each callback keeps the globals of its original method, plus the
+    imports/helpers explicitly supplied by its checksum-checked source file.
+    """
+    directory = Path(directory)
+    manifest = json.loads((directory / "manifest.json").read_text())
+    if manifest.get("specialization") != specialization(model.config):
+        raise ValueError("Flattened bundle specialization does not match this checkpoint")
+    entries = manifest.get("method_overrides", {}).get("draft" if draft else "target", [])
+    loaded = {}
+    for entry in entries:
+        targets = [model]
+        for component in entry["path"].split("."):
+            if component == "*":
+                targets = [child for target in targets for child in target]
+            else:
+                targets = [getattr(target, component) for target in targets]
+        source, filename = _load_bundle_file(directory, manifest, entry["file"])
+        code = compile(source, filename, "exec")
+        for target in targets:
+            for method in entry["methods"]:
+                original = getattr(type(target), method)
+                namespace = dict(original.__globals__, torch=torch, F=F)
+                exec(code, namespace)
+                if not inspect.isfunction(namespace.get(method)):
+                    raise ValueError(f"Flattened callback file does not define {method}")
+                setattr(target, method, MethodType(namespace[method], target))
+        loaded[entry["file"]] = source
+    model.flattened_leaf_sources = loaded
 
 
 def install_flattened_forward(model, block_forward, *, draft=False, source_dir=None):
@@ -301,3 +341,5 @@ def install_flattened_forward(model, block_forward, *, draft=False, source_dir=N
         setattr(model, name, MethodType(namespace[name], model))
         sources[name] = source
     model.flattened_forward_sources = sources
+    if source_dir is not None:
+        install_leaf_overrides(model, source_dir, draft=draft)

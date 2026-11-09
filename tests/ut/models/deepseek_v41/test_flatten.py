@@ -13,7 +13,12 @@ from torch import nn
 
 from vllm_ascend.models.deepseek_v41.attention import DeepseekV41RMSNorm
 from vllm_ascend.models.deepseek_v41.core import make_identity_pre_mix
-from vllm_ascend.models.deepseek_v41.flatten import generate_forward, load_forward_source, specialization
+from vllm_ascend.models.deepseek_v41.flatten import (
+    generate_forward,
+    install_leaf_overrides,
+    load_forward_source,
+    specialization,
+)
 from vllm_ascend.models.deepseek_v41.model import DeepseekV41Block, DeepseekV41ForCausalLM
 
 
@@ -143,3 +148,26 @@ def test_editable_bundle_requires_matching_specialization_and_recorded_source(tm
     config.hc_mult = 2
     with pytest.raises(ValueError, match="specialization"):
         load_forward_source(tmp_path, config, "forward")
+
+
+def test_bundle_leaf_callbacks_are_instance_local_and_use_their_manifest(tmp_path):
+    model = Backbone(torch.float32)
+    model.config.num_hidden_layers = 3
+    model.config.compress_ratios = [0] * 6
+    other = Backbone(torch.float32)
+    source = "def forward(self, states, runtime=None, image_mask=None):\n    return states + 7\n"
+    (tmp_path / "attention.py").write_text(source)
+    manifest = {
+        "specialization": specialization(model.config),
+        "files": {"attention.py": {"sha256": hashlib.sha256(source.encode()).hexdigest()}},
+        "method_overrides": {"target": [{"path": "layers.*.attn", "file": "attention.py", "methods": ["forward"]}]},
+    }
+    (tmp_path / "manifest.json").write_text(json.dumps(manifest))
+    install_leaf_overrides(model, tmp_path)
+    states = torch.zeros(1, 12)
+    for block in model.layers:
+        torch.testing.assert_close(block.attn(states), states + 7)
+    torch.testing.assert_close(other.layers[0].attn(states), states)
+    (tmp_path / "attention.py").write_text(source + "# changed\n")
+    with pytest.raises(ValueError, match="checksum mismatch"):
+        install_leaf_overrides(model, tmp_path)
