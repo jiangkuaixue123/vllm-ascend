@@ -112,3 +112,5 @@ python examples/deepseek_v41_a5/export-flat-forward.py \
 本次实验的完整生成代码、原始 A/B 结果、采集脚本和 trace 位于部署根目录
 `experiments/flatten-20261109/`。正式计时使用固定场景，profiling 另行运行；
 不得将 profiler 开启期间的吞吐与无采集结果直接比较。
+
+详细性能证据、可直接执行的源码入口、融合候选及验证顺序见 [展平与融合实验](FLATTENING.md)。
