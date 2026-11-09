@@ -394,6 +394,9 @@ class AscendConfig:
     # Expand V4.1 target/draft backbone and HC primitives from their source.
     # Keeps native attention, quantized MoE, cache and communication boundaries.
     deepseek_v41_flatten: bool = False
+    # Optional exported source bundle. Files and specialization must match its
+    # manifest; use a new bundle for each subsequent fusion experiment.
+    deepseek_v41_flatten_source_dir: str | None = None
     draft_window_size: int | None = None
     mix_placement: bool = False
     pa_shape_list: list[Any] = dataclasses.field(default_factory=list)

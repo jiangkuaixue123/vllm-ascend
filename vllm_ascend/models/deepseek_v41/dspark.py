@@ -289,7 +289,12 @@ class DeepseekV41DSparkForCausalLM(nn.Module):
         ):
             from .flatten import install_flattened_forward
 
-            install_flattened_forward(self, DeepseekV41Block.forward, draft=True)
+            install_flattened_forward(
+                self,
+                DeepseekV41Block.forward,
+                draft=True,
+                source_dir=vllm_config.additional_config.get("deepseek_v41_flatten_source_dir"),
+            )
 
     def embed_input_ids(self, input_ids):
         return self.mtp[0].embed(input_ids)

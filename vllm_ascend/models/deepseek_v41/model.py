@@ -316,7 +316,11 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsMultiModal):
         ):
             from .flatten import install_flattened_forward
 
-            install_flattened_forward(self, DeepseekV41Block.forward)
+            install_flattened_forward(
+                self,
+                DeepseekV41Block.forward,
+                source_dir=vllm_config.additional_config.get("deepseek_v41_flatten_source_dir"),
+            )
             logger.info("V4.1 source-derived flattened backbone enabled (%d layers)", len(self.layers))
 
     def get_eagle3_default_aux_hidden_state_layers(self) -> tuple[int, ...]:

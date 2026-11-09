@@ -73,3 +73,42 @@ tokenizer/模板改变输入、短输出、缓存命中、请求失败、并行�
 一次结果存在波动；需要判断较小差异时，重复相同命令并保留所有结果。
 固定版首次有效结果为 51.9727 token/s，复跑为 56.7803 token/s；两次服务参数相同，
 这约 9.25% 的变化体现了短测波动，不能作为代码优化收益。基线仍保留首次结果，未替换为更高值。
+
+## 推理主干展平实验
+
+参考 `jojoinfra/Agentic-Compiler` 的 `c237f86844598388d2d20d5782344bd538bf617e`，
+采用从源码内联、展开静态循环、验证数值等价的方法。该仓库的 DeepSeek 样例是小配置训练模型，
+本实现直接处理当前 d4ac431 适配后的推理代码，不替换权重、量化格式或服务框架。
+
+`vllm_ascend/models/deepseek_v41/flatten.py` 从当前方法的 AST 生成前向：
+
+- 展开 40 个目标模型 block 和 3 个 DSpark stage，内联 block 的 HC 与 RMSNorm 计算。
+- 展开每个 HC 的 20 次 Sinkhorn 归一化，保持张量操作顺序、FP32 中间结果和 BF16 转换。
+- 保留 attention/KV cache、Engram、量化 MoE、TP/EP 通信及服务元数据接口。
+- 保留空批次参与专家通信、图像路由、decode active mask、DSpark 辅助状态的语义。
+- 在内联结束后删除局部临时引用，避免将所有层的临时张量延长到整个前向结束。
+
+这是推理主干的源码展平，尚不是所有 attention/MoE 内部算子的纯 Torch 展平，
+也没有新增融合算子、自动微分或训练支持。ACLGraph 的捕获和重放保持原样。
+只对当前模型实例绑定生成的方法，原来的模块、参数所有权和 checkpoint 加载接口保持不变。
+
+在原有 `--additional-config` 字典中添加 `"deepseek_v41_flatten":true` 可启用；默认关闭。
+在已有运行环境中导出实际检查点对应的显式代码，不需要加载权重：
+
+```bash
+python examples/deepseek_v41_a5/export-flat-forward.py \
+  --config /models/deepseek-v41/config.json \
+  --output /tmp/v41-flat-review
+```
+
+输出包含目标模型 prefill/decode、draft 前向及 SHA256 清单。
+这些文件是以原模块 globals 和原模型实例执行的回调源码，不是独立模型检查点。
+将 `"deepseek_v41_flatten_source_dir":"/tmp/v41-flat-review"` 一并加入 `--additional-config`，
+即可直接执行该目录中的代码，作为后续融合实验的入口。路径必须在容器内可访问。
+加载时检查静态配置和每个源文件的 SHA256；后续优化应复制出新目录，修改代码、更新实验清单，
+保留原始展平版本用于 A/B 对照。不要重新生成并覆盖已经手动优化过的版本。
+每次改变模型静态配置都要重新生成；每次改变代码都要重新验证。
+
+本次实验的完整生成代码、原始 A/B 结果、采集脚本和 trace 位于部署根目录
+`experiments/flatten-20261109/`。正式计时使用固定场景，profiling 另行运行；
+不得将 profiler 开启期间的吞吐与无采集结果直接比较。

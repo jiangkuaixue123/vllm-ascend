@@ -9,7 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from vllm_ascend.models.deepseek_v41.dspark import DeepseekV41DSparkForCausalLM
-from vllm_ascend.models.deepseek_v41.flatten import generate_forward
+from vllm_ascend.models.deepseek_v41.flatten import generate_forward, specialization
 from vllm_ascend.models.deepseek_v41.model import DeepseekV41Block, DeepseekV41ForCausalLM
 
 
@@ -24,6 +24,7 @@ def main():
         "method": "source-derived backbone inlining; no tensor algebra changes",
         "reference": "jojoinfra/Agentic-Compiler@c237f86844598388d2d20d5782344bd538bf617e",
         "config_sha256": hashlib.sha256(args.config.read_bytes()).hexdigest(),
+        "specialization": specialization(config),
         "boundaries": ["attention and KV cache", "Engram", "quantized MoE and TP/EP communication", "serving metadata"],
         "files": {},
     }

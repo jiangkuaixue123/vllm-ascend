@@ -9,8 +9,11 @@ This is deliberately not the training compiler's pure-Torch normal form.
 
 import ast
 import copy
+import hashlib
 import inspect
+import json
 import textwrap
+from pathlib import Path
 from types import MethodType
 
 import torch
@@ -259,16 +262,42 @@ def generate_forward(function, block_forward, config, layer_count, *, draft=Fals
     return ast.unparse(tree) + "\n"
 
 
-def install_flattened_forward(model, block_forward, *, draft=False):
+def specialization(config):
+    """Configuration constants baked into this pass, including loop extents."""
+    return {
+        name: getattr(config, name)
+        for name in ("num_hidden_layers", "hc_mult", "hc_sinkhorn_iters", "rms_norm_eps", "hc_eps")
+    } | {"draft_layers": len(config.compress_ratios) - config.num_hidden_layers}
+
+
+def load_forward_source(directory, config, name, *, draft=False):
+    """Load an explicitly selected, integrity-checked editable source bundle."""
+    directory = Path(directory)
+    manifest = json.loads((directory / "manifest.json").read_text())
+    if manifest.get("specialization") != specialization(config):
+        raise ValueError("Flattened bundle specialization does not match this checkpoint")
+    filename = ("draft_" if draft else "target_") + name + ".py"
+    source = (directory / filename).read_text()
+    digest = hashlib.sha256(source.encode()).hexdigest()
+    if manifest["files"][filename]["sha256"] != digest:
+        raise ValueError(f"Flattened source checksum mismatch: {filename}; record edits in a new experiment manifest")
+    return source, str(directory / filename)
+
+
+def install_flattened_forward(model, block_forward, *, draft=False, source_dir=None):
     """Bind only this instance; parameter ownership and state_dict stay intact."""
     names = ("forward",) if draft else ("forward", "_forward_decode")
     layer_count = len(model.mtp if draft else model.layers)
     sources = {}
     for name in names:
         original = getattr(type(model), name)
-        source = generate_forward(original, block_forward, model.config, layer_count, draft=draft)
+        if source_dir is None:
+            source = generate_forward(original, block_forward, model.config, layer_count, draft=draft)
+            filename = f"<v41-flat-{name}>"
+        else:
+            source, filename = load_forward_source(source_dir, model.config, name, draft=draft)
         namespace = dict(original.__globals__, torch=torch, F=F)
-        exec(compile(source, f"<v41-flat-{name}>", "exec"), namespace)
+        exec(compile(source, filename, "exec"), namespace)
         setattr(model, name, MethodType(namespace[name], model))
         sources[name] = source
     model.flattened_forward_sources = sources

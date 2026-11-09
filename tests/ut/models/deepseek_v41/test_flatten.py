@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import ast
+import hashlib
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -11,7 +13,7 @@ from torch import nn
 
 from vllm_ascend.models.deepseek_v41.attention import DeepseekV41RMSNorm
 from vllm_ascend.models.deepseek_v41.core import make_identity_pre_mix
-from vllm_ascend.models.deepseek_v41.flatten import generate_forward
+from vllm_ascend.models.deepseek_v41.flatten import generate_forward, load_forward_source, specialization
 from vllm_ascend.models.deepseek_v41.model import DeepseekV41Block, DeepseekV41ForCausalLM
 
 
@@ -119,3 +121,25 @@ def test_invalid_static_specialization_is_rejected():
     config.hc_sinkhorn_iters = 0
     with pytest.raises(ValueError, match="positive"):
         generate_forward(Backbone.forward, DeepseekV41Block.forward, config, 3)
+
+
+def test_editable_bundle_requires_matching_specialization_and_recorded_source(tmp_path):
+    config = Backbone(torch.float32).config
+    config.num_hidden_layers = 3
+    config.compress_ratios = [0] * 6
+    source = generate_forward(Backbone.forward, DeepseekV41Block.forward, config, 3)
+    path = tmp_path / "target_forward.py"
+    path.write_text(source)
+    manifest = {
+        "specialization": specialization(config),
+        "files": {path.name: {"sha256": hashlib.sha256(source.encode()).hexdigest()}},
+    }
+    (tmp_path / "manifest.json").write_text(json.dumps(manifest))
+    loaded, filename = load_forward_source(tmp_path, config, "forward")
+    assert loaded == source and filename == str(path)
+    path.write_text(source + "\n# new experiment\n")
+    with pytest.raises(ValueError, match="checksum mismatch"):
+        load_forward_source(tmp_path, config, "forward")
+    config.hc_mult = 2
+    with pytest.raises(ValueError, match="specialization"):
+        load_forward_source(tmp_path, config, "forward")
