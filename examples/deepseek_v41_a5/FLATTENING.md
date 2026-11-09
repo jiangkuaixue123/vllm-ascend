@@ -2,7 +2,9 @@
 
 本次以 `d4ac431` 的 A5 FP8/FP4 适配为基础，借鉴
 [Agentic-Compiler](https://github.com/jojoinfra/Agentic-Compiler/tree/c237f86844598388d2d20d5782344bd538bf617e)
-的源码内联与等价性验证方法。展平是后续优化的起点，本轮没有新增融合算子。
+的源码内联与等价性验证方法。展平是后续优化的起点；仅展平阶段没有新增融合算子。
+后续 Triton 实施状态见 [FUSION_QUEUE.md](FUSION_QUEUE.md)，实测与默认组合见
+[FUSION_RESULTS.md](FUSION_RESULTS.md)。
 
 ## 可执行源码
 
@@ -50,9 +52,10 @@ attention/KV、Engram、量化 MoE、通信接口仍是明确的调用边界，�
 
 最终可编辑源码版本三轮为 **53.620 / 56.013 / 55.147 token/s**，平均 **54.927 token/s**，
 相对本轮展平前均值为 **-5.97%**，相对原固定基线为 **+5.68%**。
-两种比较都保留，不能选择有利的参照宣称优化成功。当前版本作为后续融合优化的起点保持运行。
+两种比较都保留，不能选择有利的参照宣称优化成功。这个版本作为后续融合优化的不可变参照保留。
 完整信息见 `experiments/flatten-20261109/final-results.json`。
-部署根目录 `start.sh` 默认启动这个版本，仍使用原来的 4 张卡、FP8/FP4、DSpark5 和 ACLGraph。
+展平阶段的启动脚本保存在实验目录，后续默认入口以部署根目录 `start.sh` 和
+`deployment-state.json` 的实际记录为准。融合实验保留原来的 4 张卡、FP8/FP4、DSpark5 和 ACLGraph。
 
 ## 设备证据与覆盖
 
