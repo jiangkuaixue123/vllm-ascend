@@ -1,0 +1,20 @@
+# Run with tests/e2e/models/eval_v41_api.py against an already running service.
+# This bounded API regression is not a registered lm-eval task or a full benchmark.
+model_name: /mnt/weight/DeepSeek-V4.1-Flash-1017
+model_type: v41-api-regression
+hardware: Ascend950DT_9582 (4 x 96 GiB)
+serve:
+  tensor_parallel_size: 4
+  enable_expert_parallel: true
+  quantization: deepseek_v4_fp8
+  dtype: bfloat16
+tasks:
+  - name: gsm8k_first8_api
+    metrics:
+      - name: numeric_exact_match
+        value: 1.0
+num_fewshot: 0
+limit: 8
+batch_size: 4
+apply_chat_template: true
+dataset_sha256: 3730d312f6e3440559ace48831e51066acaca737f6eabec99bccb9e4b3c39d14
