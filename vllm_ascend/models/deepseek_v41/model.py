@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""DeepSeek V4.1 text inference for indexed Ascend W8A8 checkpoints.
+"""DeepSeek V4.1 inference for indexed W8A8 and original FP8/FP4 checkpoints.
 
 The model equations derive only from the official HF reference revision
 314113f8a7dadb388215396ba5fbee2c610a04d6. Text inference keeps Engram
@@ -24,7 +24,7 @@ from vllm.distributed import (
 )
 from vllm.forward_context import get_forward_context
 from vllm.logger import logger
-from vllm.model_executor.layers.linear import ColumnParallelLinear, RowParallelLinear
+from vllm.model_executor.layers.linear import ColumnParallelLinear, ReplicatedLinear, RowParallelLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -170,7 +170,7 @@ def read_parameter_slice(reader, key, parameter, module, tp_rank, tp_size):
     else:
         if isinstance(module, ColumnParallelLinear):
             axis = 0
-        elif isinstance(module, RowParallelLinear) and key.endswith(".weight"):
+        elif isinstance(module, RowParallelLinear) and key.endswith((".weight", ".scale")):
             axis = 1
         elif key.endswith(".attn_sink"):
             axis = 0
@@ -182,6 +182,26 @@ def read_parameter_slice(reader, key, parameter, module, tp_rank, tp_size):
         value = source[tuple(slices)]
     if value.shape != parameter.shape:
         raise ValueError(f"Checkpoint shape mismatch for {key}: {value.shape} != {parameter.shape}")
+    if value.dtype == torch.float8_e4m3fn and parameter.dtype != value.dtype:
+        # Small unquantized projections (e.g. grouped wo_a) keep BF16 storage.
+        # Original checkpoints pair FP8 blocks with E8M0 scale tiles.
+        scale_key = key.removesuffix(".weight") + ".scale"
+        if not key.endswith(".weight") or scale_key not in reader.keys():  # noqa: SIM118 (safe_open is not a mapping)
+            raise ValueError(f"Unpaired original FP8 weight: {key}")
+        scales = reader.get_slice(scale_key)
+        block = 32
+        scale_slices = []
+        for dim, selected in zip(source_shape, slices):
+            lo, hi, step = selected.indices(dim)
+            if step != 1 or lo % block or hi % block:
+                raise ValueError(f"Unaligned original FP8 TP slice: {key}")
+            scale_slices.append(slice(lo // block, hi // block))
+        scale = scales[tuple(scale_slices)].float()
+        value = (
+            (value.float().unflatten(0, (-1, block)).unflatten(-1, (-1, block)) * scale[:, None, :, None])
+            .flatten(0, 1)
+            .flatten(-2)
+        )
     parameter.copy_(value)
 
 
@@ -264,11 +284,21 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsMultiModal):
                     tp_size=get_tensor_model_parallel_world_size(),
                     tp_group=get_tp_group(),
                 )
-                projection = nn.Linear(
-                    layout.hash_columns * layout.head_dim,
-                    (config.hc_mult + 1) * config.hidden_size,
-                    bias=False,
-                )
+                if vllm_config.model_config.quantization == "deepseek_v4_fp8":
+                    projection = ReplicatedLinear(
+                        layout.hash_columns * layout.head_dim,
+                        (config.hc_mult + 1) * config.hidden_size,
+                        bias=False,
+                        return_bias=False,
+                        quant_config=vllm_config.quant_config,
+                        prefix=prefix + ".wkv",
+                    )
+                else:
+                    projection = nn.Linear(
+                        layout.hash_columns * layout.head_dim,
+                        (config.hc_mult + 1) * config.hidden_size,
+                        bias=False,
+                    )
                 self.layers[layer_id].engram = DeepseekV41Engram(
                     embedding,
                     projection,
@@ -301,6 +331,10 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsMultiModal):
         if not self.engram_layer_ids:
             return
         contract = getattr(self.vllm_config.model_config.hf_config, "engram_rotation_config", None)
+        if contract is None and self.vllm_config.model_config.quantization == "deepseek_v4_fp8":
+            for layer_id in self.engram_layer_ids:
+                self.layers[layer_id].engram.set_rotation_contract("unrotated")
+            return
         if contract is None:
             raise ValueError("Indexed INT8 Engram requires an explicit rotation contract")
         if contract == {

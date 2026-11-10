@@ -43,6 +43,15 @@ class TestDynamicMxQuantScaleAlg(TestBase):
         mock_profile.return_value = get_hardware_profile(AscendDeviceType.A3)
         self.assertEqual(get_dynamic_mx_quant_scale_alg(minimax_config), 0)
 
+    @patch("vllm_ascend.quantization.utils.get_current_hardware_profile")
+    def test_native_v41_uses_reference_upward_rounded_scales(self, mock_profile):
+        config = self._config("DeepseekV41ForCausalLM", "deepseek_v41_text")
+        config.model_config.quantization = "deepseek_v4_fp8"
+        mock_profile.return_value = get_hardware_profile(AscendDeviceType.A5)
+        self.assertEqual(get_dynamic_mx_quant_scale_alg(config), 1)
+        config.model_config.quantization = "ascend"
+        self.assertEqual(get_dynamic_mx_quant_scale_alg(config), 0)
+
     @patch(
         "vllm_ascend.quantization.utils.get_current_hardware_profile",
         return_value=get_hardware_profile(AscendDeviceType.A5),

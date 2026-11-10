@@ -3,11 +3,21 @@
 """Original checkpoint contracts: raw FP4 bits, block scales and FP8 Engram rows."""
 
 import json
+from types import SimpleNamespace
 
+import pytest
 import torch
+import torch_npu
+from safetensors import safe_open
+from safetensors.torch import save_file
+from torch import nn
+from vllm.model_executor.layers.linear import ColumnParallelLinear, RowParallelLinear
 
 from tests.ut.models.deepseek_v41.test_engram import write_shard
+from vllm_ascend.models.deepseek_v41.attention_ops import fp8_quant_dequant
 from vllm_ascend.models.deepseek_v41.engram import IndexedMmapStore, MmapEngramEmbedding
+from vllm_ascend.models.deepseek_v41.model import read_parameter_slice
+from vllm_ascend.quantization.methods.w8a8.w8a8_mxfp8 import AscendW8A8MXFP8DSDynamicLinearMethod
 
 
 def test_original_fp8_engram_index_and_shards_preserve_fractional_values(tmp_path):
@@ -28,3 +38,70 @@ def test_original_fp8_engram_index_and_shards_preserve_fractional_values(tmp_pat
         parts = [MmapEngramEmbedding(store, prefix, tp_rank=i, tp_size=2)(ids, device="cpu") for i in range(2)]
     expected = torch.tensor([1.5, 0.5, -3.0, 1.5]).repeat_interleave(32).reshape(4, 32).bfloat16()
     torch.testing.assert_close(sum(parts), expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("axis,kind", [(0, ColumnParallelLinear), (1, RowParallelLinear)])
+def test_fp8_dense_projection_dequantizes_only_local_tp_blocks(tmp_path, axis, kind):
+    weight = torch.arange(128 * 128).remainder(11).reshape(128, 128).to(torch.float8_e4m3fn)
+    scale = torch.arange(121, 137).to(torch.uint8).reshape(4, 4).view(torch.float8_e8m0fnu)
+    path = tmp_path / "dense.safetensors"
+    save_file({"proj.weight": weight, "proj.scale": scale}, str(path))
+    layer = object.__new__(kind)
+    shape = [128, 128]
+    shape[axis] //= 2
+    parameter = torch.empty(shape, dtype=torch.bfloat16)
+    with safe_open(str(path), framework="pt") as reader:
+        read_parameter_slice(reader, "proj.weight", parameter, layer, 1, 2)
+    full = weight.float() * scale.float().repeat_interleave(32, 0).repeat_interleave(32, 1)
+    torch.testing.assert_close(parameter, full.chunk(2, dim=axis)[1].bfloat16(), rtol=0, atol=0)
+
+
+def test_fp8_dense_projection_requires_paired_scale(tmp_path):
+    path = tmp_path / "missing.safetensors"
+    save_file({"proj.weight": torch.ones(32, 32).to(torch.float8_e4m3fn)}, str(path))
+    with safe_open(str(path), framework="pt") as reader, pytest.raises(ValueError, match="Unpaired"):
+        read_parameter_slice(reader, "proj.weight", torch.empty(32, 32), nn.Linear(32, 32), 0, 1)
+
+
+@pytest.mark.parametrize("block", [32, 128])
+def test_native_linear_scale_expansion_matches_checkpoint_tiles(block):
+    method = object.__new__(AscendW8A8MXFP8DSDynamicLinearMethod)
+    method.block_size, method.group_size = block, 32
+    raw = torch.arange(121, 121 + (256 // block) ** 2).reshape(256 // block, -1).to(torch.uint8)
+    layer = SimpleNamespace(
+        prefix="layers.0.attn.wq_a",
+        weight=nn.Parameter(torch.ones(256, 256, dtype=torch.float8_e4m3fn), requires_grad=False),
+        weight_scale=nn.Parameter(raw.view(torch.float8_e8m0fnu), requires_grad=False),
+    )
+    method.process_weights_after_loading(layer)
+    actual = layer.weight_scale.transpose(0, 1).reshape(256, 8)
+    expected = raw.repeat_interleave(block, 0).repeat_interleave(block // 32, 1)
+    assert torch.equal(actual, expected)
+
+
+def test_original_fp8_activation_and_linear_on_npu():
+    if not torch.npu.is_available() or "950" not in torch.npu.get_device_name(0):
+        pytest.skip("Requires native A5 MXFP8")
+    torch.npu.set_device(0)
+    generator = torch.Generator().manual_seed(71)
+    x = torch.randn(8, 256, generator=generator).bfloat16().npu()
+    q, scale = torch_npu.npu_dynamic_mx_quant(x, dst_type=torch.float8_e4m3fn, scale_alg=1)
+    decoded = (
+        q.cpu().float().reshape(8, 8, 32)
+        * torch.exp2(scale.cpu().view(torch.uint8).float().reshape(8, 8) - 127)[..., None]
+    )
+    torch.testing.assert_close(decoded.flatten(1).bfloat16(), fp8_quant_dequant(x.cpu()), rtol=0, atol=0)
+    weight = torch.randn(128, 256, generator=generator).to(torch.float8_e4m3fn)
+    raw_scale = torch.arange(32).remainder(5).add(125).to(torch.uint8).reshape(4, 8)
+    scale_value = raw_scale.view(torch.float8_e8m0fnu).float()
+    layer = SimpleNamespace(
+        prefix="layers.0.attn.wq_a",
+        weight=nn.Parameter(weight.npu(), requires_grad=False),
+        weight_scale=nn.Parameter(scale_value.npu(), requires_grad=False),
+    )
+    method = object.__new__(AscendW8A8MXFP8DSDynamicLinearMethod)
+    method.block_size, method.group_size, method.dynamic_mx_quant_scale_alg = 32, 32, 1
+    method.process_weights_after_loading(layer)
+    result = method.apply(layer, x).cpu()
+    expected = decoded.flatten(1) @ (weight.float() * scale_value.repeat_interleave(32, 0).repeat_interleave(32, 1)).T
+    torch.testing.assert_close(result.float(), expected.bfloat16().float(), rtol=0.01, atol=0.125)
