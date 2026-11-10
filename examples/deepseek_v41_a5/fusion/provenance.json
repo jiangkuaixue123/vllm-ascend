@@ -1,0 +1,99 @@
+{
+  "original_source_commit": "a739259cdf7d9445f3fde28e672f2778b414407b",
+  "original_kernel_commit": "10bfed22d3399958f094bccad8f07a3330c5f4af",
+  "migrated_source_commit": "7cfa7732424d472354ee57b93aa47bace86ffd35",
+  "original_deployment_root": "/home/jojo/vllm-ascend-d4ac431",
+  "callback_changes": "Comments and formatting only. Canonical ASTs match; normalize equivalent del a,b and del (a,b) grouping introduced by Ruff.",
+  "profiles": {
+    "selected": {
+      "original_bundle": "pool-v1",
+      "files": {
+        "target_forward.py": {
+          "original_sha256": "e5ab9cda12b7ba145677c4210eb911e5d4d0742ac1db167fb66cd91949d974c4",
+          "ast_sha256": "51600574e1bd2050cffbda9f0b8e4c94cd1e333a6ed770d68b9820d25185705e"
+        },
+        "target__forward_decode.py": {
+          "original_sha256": "d4bfcce2b04e2dd1cc1dac7ccf8ee6523e3c0da04234dbdbab1a6cc233da4268",
+          "ast_sha256": "ea2e25cbfed12ff7822251035dca9dbcd4443af92dd5cb77bfa955956fbc93ed"
+        },
+        "draft_forward.py": {
+          "original_sha256": "c69918769da53c96dc973efb02034cb4da1cf37059b41393903cf96d76f8027b",
+          "ast_sha256": "baa111e37fac3fa1d75d84612fad6849fa6b19993b40bd04dc96e13b533c29ac"
+        },
+        "target_attention.py": {
+          "original_sha256": "3b98ead3d454e8a0d19e460841f8ea547d89aba28bb52554b5889d8b301155ce",
+          "ast_sha256": "a228d0dfedd146b6b0f97bd0cdc33980475f3686938aca7598ece9804a6b592d"
+        },
+        "draft_attention.py": {
+          "original_sha256": "7ff0bc91663e8c240d2c38d0cf93fccfa075c33b243d9058e76638f8100e447a",
+          "ast_sha256": "ceffda598bf1f58b8155611bda811fbab22071ced577025fbc6e6fe6664ba1ae"
+        },
+        "cache.py": {
+          "original_sha256": "3229908b54522d027d3525eb92ee67b8df8fb98bf74b8a633f71800af8f92b81",
+          "ast_sha256": "f851da3da82708da4e9612648bb3dd32fe4db10bc0cd9f89745c8fc628325af9"
+        },
+        "routed_mlp.py": {
+          "original_sha256": "653b4e9cdaf39cbdbf3521d1fd9202d8cd89dddd40edc5a620d79e4a052b235c",
+          "ast_sha256": "8873d6e72fc543e948986b5f6301b9cb5ba45c8a2df08b2c9d62b07b8b46737f"
+        },
+        "shared_mlp.py": {
+          "original_sha256": "e8a3eb9290dd07e5fa2f597269e014fa503ac33659460876f6d8b562dd4b1832",
+          "ast_sha256": "38d83f256078a1780cd92f3a4bd3bf0ed7fdcceffa4cd3bc943fde5e49077df2"
+        }
+      }
+    },
+    "optional": {
+      "original_bundle": "confidence-v1",
+      "files": {
+        "target_forward.py": {
+          "original_sha256": "e5ab9cda12b7ba145677c4210eb911e5d4d0742ac1db167fb66cd91949d974c4",
+          "ast_sha256": "51600574e1bd2050cffbda9f0b8e4c94cd1e333a6ed770d68b9820d25185705e"
+        },
+        "target__forward_decode.py": {
+          "original_sha256": "d4bfcce2b04e2dd1cc1dac7ccf8ee6523e3c0da04234dbdbab1a6cc233da4268",
+          "ast_sha256": "ea2e25cbfed12ff7822251035dca9dbcd4443af92dd5cb77bfa955956fbc93ed"
+        },
+        "draft_forward.py": {
+          "original_sha256": "c69918769da53c96dc973efb02034cb4da1cf37059b41393903cf96d76f8027b",
+          "ast_sha256": "baa111e37fac3fa1d75d84612fad6849fa6b19993b40bd04dc96e13b533c29ac"
+        },
+        "target_attention.py": {
+          "original_sha256": "3b98ead3d454e8a0d19e460841f8ea547d89aba28bb52554b5889d8b301155ce",
+          "ast_sha256": "a228d0dfedd146b6b0f97bd0cdc33980475f3686938aca7598ece9804a6b592d"
+        },
+        "draft_attention.py": {
+          "original_sha256": "7ff0bc91663e8c240d2c38d0cf93fccfa075c33b243d9058e76638f8100e447a",
+          "ast_sha256": "ceffda598bf1f58b8155611bda811fbab22071ced577025fbc6e6fe6664ba1ae"
+        },
+        "cache.py": {
+          "original_sha256": "3229908b54522d027d3525eb92ee67b8df8fb98bf74b8a633f71800af8f92b81",
+          "ast_sha256": "f851da3da82708da4e9612648bb3dd32fe4db10bc0cd9f89745c8fc628325af9"
+        },
+        "routed_mlp.py": {
+          "original_sha256": "653b4e9cdaf39cbdbf3521d1fd9202d8cd89dddd40edc5a620d79e4a052b235c",
+          "ast_sha256": "8873d6e72fc543e948986b5f6301b9cb5ba45c8a2df08b2c9d62b07b8b46737f"
+        },
+        "shared_mlp.py": {
+          "original_sha256": "e8a3eb9290dd07e5fa2f597269e014fa503ac33659460876f6d8b562dd4b1832",
+          "ast_sha256": "38d83f256078a1780cd92f3a4bd3bf0ed7fdcceffa4cd3bc943fde5e49077df2"
+        },
+        "engram.py": {
+          "original_sha256": "c428379d1d247ee7489d77c811358baae254052bf93a305e6d514e819373af22",
+          "ast_sha256": "15e9d66000cad5c42f0fbb40938761102c5271c3ad5435be27755f4ca4265307"
+        },
+        "native_sink.py": {
+          "original_sha256": "252a3b4c3f92a7c7e8938ed73962c90154be8685f30546066393622cfd8f635e",
+          "ast_sha256": "e8b146479610589de7934648992a23ad76070340d49cffd845b6fa1c6bcf16a3"
+        },
+        "router.py": {
+          "original_sha256": "210570bbc596dc65c2fda706cbe4872b67378471e35f81ae098a08015112f1b2",
+          "ast_sha256": "b3cb2d734ef220b94eff41eb8817829826e35f562b38c29c327d858cb960f2f9"
+        },
+        "confidence.py": {
+          "original_sha256": "5cdecd053a4bca6828ab5555b0eee20ea3287bad55be452d8de9926a0a9962ff",
+          "ast_sha256": "c64bb958c6af4d705d378bd98da7b9bcb8af152e5ad0a98e5a5f44b200c972f3"
+        }
+      }
+    }
+  }
+}

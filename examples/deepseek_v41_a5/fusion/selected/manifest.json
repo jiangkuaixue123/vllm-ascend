@@ -1,0 +1,148 @@
+{
+  "method": "source-derived backbone inlining; no tensor algebra changes",
+  "reference": "jojoinfra/Agentic-Compiler@c237f86844598388d2d20d5782344bd538bf617e",
+  "config_sha256": "8be45ce0476004a3f529fd896115a4a2e800a129ad2d3ec05b16050f52e21879",
+  "specialization": {
+    "num_hidden_layers": 40,
+    "hc_mult": 4,
+    "hc_sinkhorn_iters": 20,
+    "rms_norm_eps": 1e-20,
+    "hc_eps": 1e-06,
+    "draft_layers": 3
+  },
+  "boundaries": [
+    "attention and KV cache",
+    "Engram",
+    "quantized MoE and TP/EP communication",
+    "serving metadata"
+  ],
+  "files": {
+    "target_forward.py": {
+      "sha256": "175c601c14851de9a3073e9dd77e7e2d6767307711e212d052f465643848fd32",
+      "lines": 9278
+    },
+    "target__forward_decode.py": {
+      "sha256": "d27b0ac23a7efd59696bfc0d887ff6a94f410144203eb6c1a0e0ac3c48adb0fe",
+      "lines": 4558
+    },
+    "draft_forward.py": {
+      "sha256": "6e047d7d459f05aa0e690f5061bb8c06d4ff0474ad63b30d315805f8881dda44",
+      "lines": 324
+    },
+    "target_attention.py": {
+      "sha256": "614f152754f7e364b3a91922f9784d155c7f24bc1db5f9e47f1630c8094d0a1a",
+      "lines": 339
+    },
+    "draft_attention.py": {
+      "sha256": "08498d1ac4f6058ce6d803c6c93170bf7ad040be7d6675f8efaa1410e38774db",
+      "lines": 48
+    },
+    "cache.py": {
+      "sha256": "4a98780e9955f415acf31ccbaa91517f9a9dd48f54cb203b3ffb30ba606be414",
+      "lines": 16
+    },
+    "routed_mlp.py": {
+      "sha256": "95f606ee0072330a76016d1120b94560cfc57c6658baa1d6ca8f4e049c111684",
+      "lines": 50
+    },
+    "shared_mlp.py": {
+      "sha256": "dfb4e3b443b8e167fe466a6511e6bf98906cbccf748c6d56db94dd2863bf2df3",
+      "lines": 17
+    }
+  },
+  "optimization": {
+    "name": "Prior fusions plus ratio-two compressor pooling/RMSNorm",
+    "reference_bundle": "/home/jojo/vllm-ascend-d4ac431/experiments/fusion-20261109/indexer-v1",
+    "replacement_counts": {
+      "target_forward.py": 160,
+      "target__forward_decode.py": 80,
+      "draft_forward.py": 6
+    },
+    "cache_selection": "Fused writes; short reads <=8 and large FP32 compressor field reads; native large raw/index reads based on microbenchmark.",
+    "hc_mixing_counts": {
+      "target_forward.py": {
+        "pre_norm": 160,
+        "post": 160
+      },
+      "target__forward_decode.py": {
+        "pre_norm": 80,
+        "post": 80
+      },
+      "draft_forward.py": {
+        "pre_norm": 6,
+        "post": 6
+      }
+    }
+  },
+  "method_overrides": {
+    "target": [
+      {
+        "path": "layers.*.attn",
+        "file": "target_attention.py",
+        "methods": [
+          "forward",
+          "_decode_forward",
+          "_compressed",
+          "_decode_compressed",
+          "_index",
+          "_decode_index",
+          "_project_output"
+        ]
+      },
+      {
+        "path": "layers.*.attn.cache",
+        "file": "cache.py",
+        "methods": [
+          "decode_read",
+          "decode_write"
+        ]
+      },
+      {
+        "path": "layers.*.ffn.experts.v41_comm",
+        "file": "routed_mlp.py",
+        "methods": [
+          "_apply_mlp"
+        ]
+      },
+      {
+        "path": "layers.*.ffn.shared_experts",
+        "file": "shared_mlp.py",
+        "methods": [
+          "forward"
+        ]
+      }
+    ],
+    "draft": [
+      {
+        "path": "mtp.*.attn",
+        "file": "draft_attention.py",
+        "methods": [
+          "project_kv",
+          "_project_output"
+        ]
+      },
+      {
+        "path": "mtp.*.attn.cache",
+        "file": "cache.py",
+        "methods": [
+          "decode_read",
+          "decode_write"
+        ]
+      },
+      {
+        "path": "mtp.*.ffn.experts.v41_comm",
+        "file": "routed_mlp.py",
+        "methods": [
+          "_apply_mlp"
+        ]
+      },
+      {
+        "path": "mtp.*.ffn.shared_experts",
+        "file": "shared_mlp.py",
+        "methods": [
+          "forward"
+        ]
+      }
+    ]
+  }
+}
