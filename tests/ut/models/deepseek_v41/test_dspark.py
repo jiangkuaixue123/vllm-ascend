@@ -362,3 +362,21 @@ def test_loader_reads_authoritative_draft_tensors_and_rejects_missing(draft, tmp
     path.write_text(json.dumps({"weight_map": index}))
     with pytest.raises(KeyError, match="confidence_head"):
         draft.load_weights(forbidden_iterator())
+
+
+@torch.no_grad()
+def test_original_fp8_draft_loads_shared_embedding_and_head(draft, tmp_path):
+    draft.original_fp8 = True
+    params = dict(draft.named_parameters())
+    expected = {k: v.detach().clone() for k, v in params.items()}
+    aliases = {"mtp.0.embed.weight": "embed.weight", "mtp.2.head.weight": "head.weight"}
+    saved = {aliases.get(k, k): v for k, v in expected.items()}
+    save_file(saved, str(tmp_path / "draft.safetensors"))
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": dict.fromkeys(saved, "draft.safetensors")})
+    )
+    for parameter in params.values():
+        parameter.zero_()
+    assert draft.load_weights(iter(())) == set(params)
+    for name, parameter in params.items():
+        torch.testing.assert_close(parameter, expected[name], rtol=0, atol=0)

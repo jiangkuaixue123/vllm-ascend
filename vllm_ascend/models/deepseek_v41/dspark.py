@@ -280,6 +280,7 @@ class DeepseekV41DSparkForCausalLM(nn.Module):
         self.mtp[-1].confidence_head = DSparkConfidence(config)
         self.logits_processor = LogitsProcessor(config.vocab_size)
         self.model_path = Path(vllm_config.model_config.model)
+        self.original_fp8 = getattr(vllm_config.model_config, "quantization", None) == "deepseek_v4_fp8"
 
     def embed_input_ids(self, input_ids):
         return self.mtp[0].embed(input_ids)
@@ -345,6 +346,11 @@ class DeepseekV41DSparkForCausalLM(nn.Module):
                 get_tensor_model_parallel_rank(),
                 get_tensor_model_parallel_world_size(),
                 read_parameter_slice,
+                source_aliases=(
+                    {"mtp.0.embed.weight": "embed.weight", f"mtp.{len(self.mtp) - 1}.head.weight": "head.weight"}
+                    if self.original_fp8
+                    else None
+                ),
             )
         logger.info("Loaded %d indexed V4.1 DSpark parameters on this TP/EP rank", len(loaded))
         return loaded

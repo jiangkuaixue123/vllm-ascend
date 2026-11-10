@@ -423,7 +423,8 @@ class AscendDSparkProposer(AscendDflashProposer):
 class AscendDeepseekV41DSparkProposer(AscendDSparkProposer):
     """Reuse the block proposer and Markov sampler with the embedded V4.1 draft."""
 
-    # mtp.0.embed and the FP32 mtp.2.head are distinct checkpoint tensors.
+    # W8A8 owns distinct draft tensors. Original FP8 loads the shared source
+    # names into draft parameters, preserving this draft's FP32 output head.
     share_target_weights = False
 
     def __init__(self, vllm_config, device, runner=None):

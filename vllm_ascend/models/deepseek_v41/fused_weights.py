@@ -83,12 +83,14 @@ def _load_expert_tensor(reader, part, parameter, config):
 
 
 @torch.no_grad()
-def load_indexed_v41_weights(model, weight_map, tp_rank, tp_size, read_parameter_slice):
+def load_indexed_v41_weights(model, weight_map, tp_rank, tp_size, read_parameter_slice, source_aliases=None):
     """Return loaded parameter names only after every required source part was read."""
     parameters = dict(model.named_parameters())
     modules = dict(model.named_modules())
     by_shard = defaultdict(list)
     for part in _list_parts(parameters, modules):
+        if part.source not in weight_map and source_aliases and part.source in source_aliases:
+            part = replace(part, source=source_aliases[part.source])
         if part.source.endswith(".weight_scale"):
             native_scale = part.source.removesuffix(".weight_scale") + ".scale"
             if part.source not in weight_map and native_scale in weight_map:
