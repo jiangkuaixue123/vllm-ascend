@@ -5,7 +5,7 @@
 
 Hashing and gating follow the permitted DeepSeek-V4.1-Flash reference at
 314113f8a7dadb388215396ba5fbee2c610a04d6, inference/engram.py and model.py.
-The INT8/E8M0 storage path is for the separately supplied local checkpoint.
+Host tables support the local INT8/E8M0 and original FP8/E8M0 checkpoints.
 
 MIT permission notice for the adapted reference:
 Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -370,10 +370,14 @@ class IndexedMmapStore:
         self,
         model_path: str | Path,
         *,
-        index_name: str = "quant_model_weights.safetensors.index.json",
+        index_name: str | None = None,
         max_rows_per_read: int = DEFAULT_LOOKUP_CHUNK_ROWS,
     ):
         self.root = Path(model_path).resolve()
+        if index_name is None:
+            index_name = "quant_model_weights.safetensors.index.json"
+            if not (self.root / index_name).is_file():
+                index_name = "model.safetensors.index.json"
         index = json.loads((self.root / index_name).read_text(), object_pairs_hook=_unique_object)
         if not isinstance(index.get("weight_map"), dict) or max_rows_per_read < 1:
             raise ValueError("Invalid tensor index or row read bound")
@@ -501,17 +505,17 @@ def decode_int8_e8m0_rows(
     *,
     output_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
-    """Decode selected rows with the exact bit path verified on the target NPU."""
+    """Decode INT8 or original FP8 rows paired with group-32 E8M0 scales."""
     if (
         weights.ndim != 2
         or scales.ndim != 2
-        or weights.dtype != torch.int8
+        or weights.dtype not in (torch.int8, torch.float8_e4m3fn)
         or scales.dtype != torch.uint8
         or weights.device != scales.device
         or weights.shape[1] % E8M0_BLOCK_SIZE
         or scales.shape != (weights.shape[0], weights.shape[1] // E8M0_BLOCK_SIZE)
     ):
-        raise ValueError("Invalid INT8/E8M0 row layout")
+        raise ValueError("Invalid INT8 or FP8/E8M0 row layout")
     raw = scales.to(torch.int32)
     bits = torch.bitwise_left_shift(raw, FP32_EXPONENT_SHIFT)
     bits = bits.masked_fill(raw == 0, FP32_E8M0_ZERO_BITS)
@@ -545,7 +549,7 @@ class MmapEngramEmbedding(nn.Module):
         weight = store.describe(prefix + ".weight")
         scale = store.describe(prefix + ".scale")
         if (
-            weight.dtype != "I8"
+            weight.dtype not in ("I8", "F8_E4M3")
             or scale.dtype != "F8_E8M0"
             or len(weight.shape) != 2
             or weight.shape[0] < 1
@@ -553,8 +557,9 @@ class MmapEngramEmbedding(nn.Module):
             or weight.shape[1] % E8M0_BLOCK_SIZE
             or scale.shape != (weight.shape[0], weight.shape[1] // E8M0_BLOCK_SIZE)
         ):
-            raise ValueError("Indexed table is not row-major INT8/E8M0 group32")
+            raise ValueError("Indexed table is not row-major INT8 or FP8/E8M0 group32")
         self.store, self.prefix = store, prefix
+        self.weight_dtype = torch.int8 if weight.dtype == "I8" else torch.float8_e4m3fn
         self.tp_rank, self.tp_size, self.tp_group = tp_rank, tp_size, tp_group
         self.num_embeddings, self.embedding_dim = weight.shape
         self.shard_rows = (self.num_embeddings + tp_size - 1) // tp_size
@@ -578,7 +583,7 @@ class MmapEngramEmbedding(nn.Module):
             positions, row_ids = zip(*chunk)
             weight_bytes = self.store.read_rows(self.prefix + ".weight", row_ids)
             scale_bytes = self.store.read_rows(self.prefix + ".scale", row_ids)
-            weights = torch.frombuffer(bytearray(weight_bytes), dtype=torch.int8)
+            weights = torch.frombuffer(bytearray(weight_bytes), dtype=self.weight_dtype)
             scales = torch.frombuffer(bytearray(scale_bytes), dtype=torch.uint8)
             values = decode_int8_e8m0_rows(
                 weights.reshape(len(chunk), self.embedding_dim).to(device),
