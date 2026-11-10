@@ -1,0 +1,527 @@
+{
+  "created_at": "2026-11-09T09:23:46.967828+00:00",
+  "scenario_id": "v41-c8-i100-o256-v1",
+  "scenario_sha256": "e9e065fbbd62a22800b0869a1942979a69e37f0054674f1613e257030a4093d0",
+  "fixed_baseline_tokens_per_second": 51.9726669988523,
+  "editable_flat_mean_tokens_per_second": 54.926606914957155,
+  "selected": {
+    "bundle": "/home/jojo/vllm-ascend-d4ac431/experiments/fusion-20261109/pool-v1",
+    "stages": [
+      "attention",
+      "attention-confirm"
+    ],
+    "kernel_implementation_commit": "10bfed22d3399958f094bccad8f07a3330c5f4af",
+    "selection_basis": "Highest initial three-run mean; retain all three restart-confirmation runs separately and combined.",
+    "runs": 6,
+    "mean": 97.8444827913643,
+    "range": [
+      91.62570909097471,
+      102.73738721658002
+    ],
+    "relative_fixed_percent": 88.26142363162734,
+    "relative_flat_percent": 78.1367688392929
+  },
+  "measurement_status": "Historical results from 2026-11-09; branch packaging did not rerun the service benchmark.",
+  "original_report_sha256": "248ce9210451462c1fe5347cc94cbe13f23513e9b76ed67bf42c221555d81b7c",
+  "stages": {
+    "hc": {
+      "bundle": "/home/jojo/vllm-ascend-d4ac431/experiments/fusion-20261109/hc-v1",
+      "result_files": [
+        "logs/fusion-hc-throughput-1.json",
+        "logs/fusion-hc-throughput-2.json",
+        "logs/fusion-hc-throughput-3.json"
+      ],
+      "complete": true,
+      "correctness": {
+        "api": {
+          "passed": 10,
+          "total": 10
+        },
+        "gsm8k": {
+          "passed": 8,
+          "total": 8,
+          "scope": "First eight test samples; integration regression, not a full GSM8K benchmark."
+        },
+        "vision": {
+          "answer": "5"
+        }
+      },
+      "first_three_mean": 70.03353587838207,
+      "all_runs_mean": 70.03353587838207,
+      "all_runs_range": [
+        63.21132897961467,
+        73.58604946710746
+      ],
+      "first_three_relative_fixed_percent": 34.75070632786385,
+      "first_three_relative_flat_percent": 27.50384524355376,
+      "runs": [
+        {
+          "result_file": "logs/fusion-hc-throughput-1.json",
+          "status": "valid",
+          "aggregate_output_tokens_per_second": 63.21132897961467
+        },
+        {
+          "result_file": "logs/fusion-hc-throughput-2.json",
+          "status": "valid",
+          "aggregate_output_tokens_per_second": 73.30322918842408
+        },
+        {
+          "result_file": "logs/fusion-hc-throughput-3.json",
+          "status": "valid",
+          "aggregate_output_tokens_per_second": 73.58604946710746
+        }
+      ]
+    },
+    "qdq": {
+      "bundle": "/home/jojo/vllm-ascend-d4ac431/experiments/fusion-20261109/hc-qdq-v1",
+      "result_files": [
+        "logs/fusion-qdq-throughput-1.json",
+        "logs/fusion-qdq-throughput-2.json",
+        "logs/fusion-qdq-throughput-3.json"
+      ],
+      "complete": true,
+      "correctness": {
+        "api": {
+          "passed": 10,
+          "total": 10
+        },
+        "gsm8k": {
+          "passed": 8,
+          "total": 8,
+          "scope": "First eight test samples; integration regression, not a full GSM8K benchmark."
+        },
+        "vision": {
+          "answer": "5"
+        }
+      },
+      "first_three_mean": 81.69025388667644,
+      "all_runs_mean": 81.69025388667644,
+      "all_runs_range": [
+        71.68096141371667,
+        87.3062368574855
+      ],
+      "first_three_relative_fixed_percent": 57.17926095360932,
+      "first_three_relative_flat_percent": 48.72619751144911,
+      "runs": [
+        {
+          "result_file": "logs/fusion-qdq-throughput-1.json",
+          "status": "valid",
+          "aggregate_output_tokens_per_second": 71.68096141371667
+        },
+        {
+          "result_file": "logs/fusion-qdq-throughput-2.json",
+          "status": "valid",
+          "aggregate_output_tokens_per_second": 87.3062368574855
+        },
+        {
+          "result_file": "logs/fusion-qdq-throughput-3.json",
+          "status": "valid",
+          "aggregate_output_tokens_per_second": 86.08356338882717
+        }
+      ]
+    },
+    "cache": {
+      "bundle": "/home/jojo/vllm-ascend-d4ac431/experiments/fusion-20261109/hc-qdq-cache-v2",
+      "result_files": [
+        "logs/fusion-cache-throughput-1.json",
+        "logs/fusion-cache-throughput-2.json",
+        "logs/fusion-cache-throughput-3.json"
+      ],
+      "complete": true,
+      "correctness": {
+        "api": {
+          "passed": 10,
+          "total": 10
+        },
+        "gsm8k": {
+          "passed": 8,
+          "total": 8,
+          "scope": "First eight test samples; integration regression, not a full GSM8K benchmark."
+        },
+        "vision": {
+          "answer": "5"
+        }
+      },
+      "first_three_mean": 84.10351386229968,
+      "all_runs_mean": 84.10351386229968,
+      "all_runs_range": [
+        70.07809116164557,
+        91.76991959984628
+      ],
+      "first_three_relative_fixed_percent": 61.82258621470573,
+      "first_three_relative_flat_percent": 53.119805839303204,
+      "runs": [
+        {
+          "result_file": "logs/fusion-cache-throughput-1.json",
+          "status": "valid",
+          "aggregate_output_tokens_per_second": 70.07809116164557
+        },
+        {
+          "result_file": "logs/fusion-cache-throughput-2.json",
+          "status": "valid",
+          "aggregate_output_tokens_per_second": 90.46253082540717
+        },
+        {
+          "result_file": "logs/fusion-cache-throughput-3.json",
+          "status": "valid",
+          "aggregate_output_tokens_per_second": 91.76991959984628
+        }
+      ]
+    },
+    "mixing": {
+      "bundle": "/home/jojo/vllm-ascend-d4ac431/experiments/fusion-20261109/hc-qdq-cache-mixing-v2",
+      "result_files": [
+        "logs/fusion-mixing-throughput-1.json",
+        "logs/fusion-mixing-throughput-2.json",
+        "logs/fusion-mixing-throughput-3.json",
+        "logs/fusion-mixing-throughput-4.json",
+        "logs/fusion-mixing-throughput-5.json",
+        "logs/fusion-mixing-throughput-6.json"
+      ],
+      "complete": true,
+      "correctness": {
+        "api": {
+          "passed": 10,
+          "total": 10
+        },
+        "gsm8k": {
+          "passed": 8,
+          "total": 8,
+          "scope": "First eight test samples; integration regression, not a full GSM8K benchmark."
+        },
+        "vision": {
+          "answer": "5"
+        }
+      },
+      "first_three_mean": 82.13381006118581,
+      "all_runs_mean": 86.97334475234145,
+      "all_runs_range": [
+        63.104232403894635,
+        93.80995312852144
+      ],
+      "followup_mean": 91.81287944349708,
+      "first_three_relative_fixed_percent": 58.03270219517416,
+      "first_three_relative_flat_percent": 49.533740885093366,
+      "runs": [
+        {
+          "result_file": "logs/fusion-mixing-throughput-1.json",
+          "status": "valid",
+          "aggregate_output_tokens_per_second": 63.104232403894635
+        },
+        {
+          "result_file": "logs/fusion-mixing-throughput-2.json",
+          "status": "valid",
+          "aggregate_output_tokens_per_second": 89.48724465114134
+        },
+        {
+          "result_file": "logs/fusion-mixing-throughput-3.json",
+          "status": "valid",
+          "aggregate_output_tokens_per_second": 93.80995312852144
+        },
+        {
+          "result_file": "logs/fusion-mixing-throughput-4.json",
+          "status": "valid",
+          "aggregate_output_tokens_per_second": 93.73443192602895
+        },
+        {
+          "result_file": "logs/fusion-mixing-throughput-5.json",
+          "status": "valid",
+          "aggregate_output_tokens_per_second": 92.05557112904522
+        },
+        {
+          "result_file": "logs/fusion-mixing-throughput-6.json",
+          "status": "valid",
+          "aggregate_output_tokens_per_second": 89.64863527541706
+        }
+      ]
+    },
+    "moe": {
+      "bundle": "/home/jojo/vllm-ascend-d4ac431/experiments/fusion-20261109/hc-qdq-cache-mixing-moe-v1",
+      "result_files": [
+        "logs/fusion-moe-throughput-1.json",
+        "logs/fusion-moe-throughput-2.json",
+        "logs/fusion-moe-throughput-3.json"
+      ],
+      "complete": true,
+      "correctness": {
+        "api": {
+          "passed": 10,
+          "total": 10
+        },
+        "gsm8k": {
+          "passed": 8,
+          "total": 8,
+          "scope": "First eight test samples; integration regression, not a full GSM8K benchmark."
+        },
+        "vision": {
+          "answer": "5"
+        }
+      },
+      "first_three_mean": 78.6116078148497,
+      "all_runs_mean": 78.6116078148497,
+      "all_runs_range": [
+        59.48081500297525,
+        97.40316869543271
+      ],
+      "first_three_relative_fixed_percent": 51.255674096127635,
+      "first_three_relative_flat_percent": 43.121179752763595,
+      "runs": [
+        {
+          "result_file": "logs/fusion-moe-throughput-1.json",
+          "status": "valid",
+          "aggregate_output_tokens_per_second": 59.48081500297525
+        },
+        {
+          "result_file": "logs/fusion-moe-throughput-2.json",
+          "status": "valid",
+          "aggregate_output_tokens_per_second": 97.40316869543271
+        },
+        {
+          "result_file": "logs/fusion-moe-throughput-3.json",
+          "status": "valid",
+          "aggregate_output_tokens_per_second": 78.95083974614116
+        }
+      ]
+    },
+    "runtime": {
+      "bundle": "/home/jojo/vllm-ascend-d4ac431/experiments/fusion-20261109/hc-qdq-cache-mixing-moe-v1",
+      "result_files": [
+        "logs/fusion-runtime-throughput-1.json",
+        "logs/fusion-runtime-throughput-2.json",
+        "logs/fusion-runtime-throughput-3.json"
+      ],
+      "complete": true,
+      "correctness": {
+        "api": {
+          "passed": 10,
+          "total": 10
+        },
+        "gsm8k": {
+          "passed": 8,
+          "total": 8,
+          "scope": "First eight test samples; integration regression, not a full GSM8K benchmark."
+        },
+        "vision": {
+          "answer": "5"
+        }
+      },
+      "first_three_mean": 94.05890996614391,
+      "all_runs_mean": 94.05890996614391,
+      "all_runs_range": [
+        92.8727523043907,
+        95.48658237284302
+      ],
+      "first_three_relative_fixed_percent": 80.97764728567999,
+      "first_three_relative_flat_percent": 71.24471226080884,
+      "runs": [
+        {
+          "result_file": "logs/fusion-runtime-throughput-1.json",
+          "status": "valid",
+          "aggregate_output_tokens_per_second": 95.48658237284302
+        },
+        {
+          "result_file": "logs/fusion-runtime-throughput-2.json",
+          "status": "valid",
+          "aggregate_output_tokens_per_second": 92.8727523043907
+        },
+        {
+          "result_file": "logs/fusion-runtime-throughput-3.json",
+          "status": "valid",
+          "aggregate_output_tokens_per_second": 93.81739522119803
+        }
+      ]
+    },
+    "attention": {
+      "bundle": "/home/jojo/vllm-ascend-d4ac431/experiments/fusion-20261109/pool-v1",
+      "result_files": [
+        "logs/fusion-attention-throughput-1.json",
+        "logs/fusion-attention-throughput-2.json",
+        "logs/fusion-attention-throughput-3.json"
+      ],
+      "complete": true,
+      "correctness": {
+        "api": {
+          "passed": 10,
+          "total": 10
+        },
+        "gsm8k": {
+          "passed": 8,
+          "total": 8,
+          "scope": "First eight test samples; integration regression, not a full GSM8K benchmark."
+        },
+        "vision": {
+          "answer": "5"
+        }
+      },
+      "first_three_mean": 97.38646625202053,
+      "all_runs_mean": 97.38646625202053,
+      "all_runs_range": [
+        91.62570909097471,
+        101.01005323330162
+      ],
+      "first_three_relative_fixed_percent": 87.38015937140784,
+      "first_three_relative_flat_percent": 77.3028987623502,
+      "runs": [
+        {
+          "result_file": "logs/fusion-attention-throughput-1.json",
+          "status": "valid",
+          "aggregate_output_tokens_per_second": 91.62570909097471
+        },
+        {
+          "result_file": "logs/fusion-attention-throughput-2.json",
+          "status": "valid",
+          "aggregate_output_tokens_per_second": 99.52363643178525
+        },
+        {
+          "result_file": "logs/fusion-attention-throughput-3.json",
+          "status": "valid",
+          "aggregate_output_tokens_per_second": 101.01005323330162
+        }
+      ]
+    },
+    "all": {
+      "bundle": "/home/jojo/vllm-ascend-d4ac431/experiments/fusion-20261109/confidence-v1",
+      "result_files": [
+        "logs/fusion-all-throughput-1.json",
+        "logs/fusion-all-throughput-2.json",
+        "logs/fusion-all-throughput-3.json"
+      ],
+      "complete": true,
+      "correctness": {
+        "api": {
+          "passed": 10,
+          "total": 10
+        },
+        "gsm8k": {
+          "passed": 8,
+          "total": 8,
+          "scope": "First eight test samples; integration regression, not a full GSM8K benchmark."
+        },
+        "vision": {
+          "answer": "5"
+        }
+      },
+      "first_three_mean": 94.15413536256187,
+      "all_runs_mean": 94.15413536256187,
+      "all_runs_range": [
+        85.56803751130902,
+        100.70785842443753
+      ],
+      "first_three_relative_fixed_percent": 81.16086935588866,
+      "first_three_relative_flat_percent": 71.41808069145921,
+      "runs": [
+        {
+          "result_file": "logs/fusion-all-throughput-1.json",
+          "status": "valid",
+          "aggregate_output_tokens_per_second": 85.56803751130902
+        },
+        {
+          "result_file": "logs/fusion-all-throughput-2.json",
+          "status": "valid",
+          "aggregate_output_tokens_per_second": 96.18651015193906
+        },
+        {
+          "result_file": "logs/fusion-all-throughput-3.json",
+          "status": "valid",
+          "aggregate_output_tokens_per_second": 100.70785842443753
+        }
+      ]
+    },
+    "ablation": {
+      "bundle": "/home/jojo/vllm-ascend-d4ac431/experiments/fusion-20261109/without-mixing-moe-v1",
+      "result_files": [
+        "logs/fusion-ablation-throughput-1.json",
+        "logs/fusion-ablation-throughput-2.json",
+        "logs/fusion-ablation-throughput-3.json"
+      ],
+      "complete": true,
+      "correctness": {
+        "api": {
+          "passed": 10,
+          "total": 10
+        },
+        "gsm8k": {
+          "passed": 8,
+          "total": 8,
+          "scope": "First eight test samples; integration regression, not a full GSM8K benchmark."
+        },
+        "vision": {
+          "answer": "5"
+        }
+      },
+      "first_three_mean": 92.7727541720529,
+      "all_runs_mean": 92.7727541720529,
+      "all_runs_range": [
+        89.50460387870866,
+        99.09974333372709
+      ],
+      "first_three_relative_fixed_percent": 78.5029699824748,
+      "first_three_relative_flat_percent": 68.90312251709435,
+      "runs": [
+        {
+          "result_file": "logs/fusion-ablation-throughput-1.json",
+          "status": "valid",
+          "aggregate_output_tokens_per_second": 89.50460387870866
+        },
+        {
+          "result_file": "logs/fusion-ablation-throughput-2.json",
+          "status": "valid",
+          "aggregate_output_tokens_per_second": 99.09974333372709
+        },
+        {
+          "result_file": "logs/fusion-ablation-throughput-3.json",
+          "status": "valid",
+          "aggregate_output_tokens_per_second": 89.71391530372296
+        }
+      ]
+    },
+    "attention-confirm": {
+      "bundle": "/home/jojo/vllm-ascend-d4ac431/experiments/fusion-20261109/pool-v1",
+      "result_files": [
+        "logs/fusion-attention-confirm-throughput-1.json",
+        "logs/fusion-attention-confirm-throughput-2.json",
+        "logs/fusion-attention-confirm-throughput-3.json"
+      ],
+      "complete": true,
+      "correctness": {
+        "api": {
+          "passed": 10,
+          "total": 10
+        },
+        "gsm8k": {
+          "passed": 8,
+          "total": 8,
+          "scope": "First eight test samples; integration regression, not a full GSM8K benchmark."
+        },
+        "vision": {
+          "answer": "5"
+        }
+      },
+      "first_three_mean": 98.30249933070809,
+      "all_runs_mean": 98.30249933070809,
+      "all_runs_range": [
+        94.19724251679025,
+        102.73738721658002
+      ],
+      "first_three_relative_fixed_percent": 89.14268789184685,
+      "first_three_relative_flat_percent": 78.97063891623563,
+      "runs": [
+        {
+          "result_file": "logs/fusion-attention-confirm-throughput-1.json",
+          "status": "valid",
+          "aggregate_output_tokens_per_second": 94.19724251679025
+        },
+        {
+          "result_file": "logs/fusion-attention-confirm-throughput-2.json",
+          "status": "valid",
+          "aggregate_output_tokens_per_second": 97.97286825875399
+        },
+        {
+          "result_file": "logs/fusion-attention-confirm-throughput-3.json",
+          "status": "valid",
+          "aggregate_output_tokens_per_second": 102.73738721658002
+        }
+      ]
+    }
+  }
+}

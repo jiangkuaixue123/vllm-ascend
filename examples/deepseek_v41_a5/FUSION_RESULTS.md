@@ -1,5 +1,8 @@
 # V4.1 A5 Triton 融合实测
 
+下文记录原始实验。迁入本分支后的回调、镜像构建及验证入口见
+[fusion/README.md](fusion/README.md)，并附带原始提交和文件指纹；迁移不表示重新测量性能。
+
 统一机会分析及实现前排序见 [FUSION_QUEUE.md](FUSION_QUEUE.md)。本轮在可编辑展平源码上
 实施 13 类候选中的可验证向量链，逐项做真实 NPU 数值、ACLGraph、微基准与服务验证。
 GEMM、原生 SFA 主体、MXFP8 动态量化、通信和 host Engram 读取仍保留原接口。

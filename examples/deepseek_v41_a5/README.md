@@ -1,5 +1,8 @@
 # 本机 A5 FP8/FP4 部署脚本
 
+首轮 Triton 融合的版本化回调、构建/启动入口和候选验证流水见
+[fusion/README.md](fusion/README.md)。该目录对应历史六轮平均 97.84 token/s 的组合。
+
 这些脚本是本次部署目录中入口的版本化副本，部署布局为：
 
 ```text
