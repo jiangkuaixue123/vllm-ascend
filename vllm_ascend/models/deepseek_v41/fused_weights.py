@@ -3,7 +3,7 @@
 """Load indexed V4.1 tensors into regular layers and Ascend routed experts."""
 
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import torch
@@ -62,9 +62,12 @@ def _load_expert_tensor(reader, part, parameter, config):
     is_weight = part.source.endswith(".weight")
     h, i = config.hidden_size, config.moe_intermediate_size
     out_dim, in_dim = (h, i) if part.projection == "w2" else (i, h)
-    expected = (out_dim, in_dim if is_weight else 1)
+    native_fp4 = parameter.dtype == torch.uint8 if is_weight else part.source.endswith(".scale")
+    expected = (out_dim, in_dim // (2 if is_weight else 32)) if native_fp4 else (out_dim, in_dim if is_weight else 1)
     if tuple(source.shape) != expected:
         raise ValueError(f"Invalid V4.1 expert tensor shape for {part.source}: {source.shape} != {expected}")
+    if native_fp4 and is_weight and source.dtype == torch.int8:
+        source = source.view(torch.uint8)
     if (is_weight and source.dtype != parameter.dtype) or (not is_weight and not source.is_floating_point()):
         raise ValueError(f"Invalid V4.1 expert tensor dtype for {part.source}: {source.dtype}")
     loaded = parameter.weight_loader(
@@ -86,6 +89,10 @@ def load_indexed_v41_weights(model, weight_map, tp_rank, tp_size, read_parameter
     modules = dict(model.named_modules())
     by_shard = defaultdict(list)
     for part in _list_parts(parameters, modules):
+        if part.source.endswith(".weight_scale"):
+            native_scale = part.source.removesuffix(".weight_scale") + ".scale"
+            if part.source not in weight_map and native_scale in weight_map:
+                part = replace(part, source=native_scale)
         if part.source not in weight_map:
             raise KeyError(f"Required V4.1 parameter absent from index: {part.source}")
         by_shard[weight_map[part.source]].append(part)

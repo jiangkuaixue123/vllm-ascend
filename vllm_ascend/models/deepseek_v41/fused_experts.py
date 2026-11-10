@@ -54,10 +54,20 @@ class DeepseekV41Dispatcher(TokenDispatcherWithAllGather):
         return replace(output, topk_scales=scales, combine_metadata=replace(meta, topk_weights=owned.float()))
 
 
-def _grouped_projection(states, weights, groups, group_type, weight_scale=None, token_scale=None):
+def _grouped_projection(states, weights, groups, group_type, weight_scale=None, token_scale=None, *, mxfp=False):
     options = {}
     if weight_scale is not None:
-        options = dict(scale=[weight_scale], per_token_scale=[token_scale.reshape(-1)])
+        if mxfp:
+            options = dict(
+                # A5 W4A8 uses the antiquant scale slot for packed FP4.
+                antiquant_scale=[weight_scale],
+                per_token_scale=[token_scale.unflatten(-1, (-1, 2)) if token_scale.ndim == 2 else token_scale],
+                per_token_scale_dtype=torch_npu.float8_e8m0fnu,
+                x_dtype=torch.float8_e4m3fn,
+                weight_dtype=torch_npu.float4_e2m1fn_x2,
+            )
+        else:
+            options = dict(scale=[weight_scale], per_token_scale=[token_scale.reshape(-1)])
     return torch_npu.npu_grouped_matmul(
         x=[states],
         weight=[weights],
@@ -158,6 +168,7 @@ class DeepseekV41AllGatherComm(AllGatherCommImpl):
         if inputs.topk_scales is None:
             raise ValueError("V4.1 grouped experts require an FP32 factor per dispatched route")
         quantized = inputs.quant.quant_type == QuantType.W8A8
+        mxfp = inputs.quant.quant_type == QuantType.W4A8MXFP
         if quantized and (inputs.hidden_states.dtype != torch.int8 or inputs.dynamic_scale is None):
             raise ValueError("V4.1 W8A8 grouped experts require dynamically quantized dispatch rows")
         gate_up = _grouped_projection(
@@ -167,6 +178,7 @@ class DeepseekV41AllGatherComm(AllGatherCommImpl):
             inputs.group_list_type,
             weights.w1_scale,
             inputs.dynamic_scale,
+            mxfp=mxfp,
         )
         gate, up = gate_up.chunk(2, dim=-1)
         factor = inputs.topk_scales.unsqueeze(-1)
@@ -176,9 +188,11 @@ class DeepseekV41AllGatherComm(AllGatherCommImpl):
         scale = None
         if quantized:
             activation, scale = torch_npu.npu_dynamic_quant(activation, dst_type=torch.int8)
+        elif mxfp:
+            activation, scale = torch_npu.npu_dynamic_mx_quant(activation, dst_type=torch.float8_e4m3fn, scale_alg=1)
         before_gmm2 = torch.npu.current_stream().record_event()
         output = _grouped_projection(
-            activation, weights.w2, inputs.group_list, inputs.group_list_type, weights.w2_scale, scale
+            activation, weights.w2, inputs.group_list, inputs.group_list_type, weights.w2_scale, scale, mxfp=mxfp
         )
         # GMM need only initialize rows covered by the local expert group list.
         # Clear padding before native unpermute, which can otherwise read NaNs.
@@ -202,6 +216,16 @@ class _RouteBeforeDown:
             # A8W8 grouped matmul with BF16 output requires BF16 channel
             # scales. The FP32 view injected for fused SwiGLU kernels is distinct.
             weights = dict(w1_scale=layer.w13_weight_scale, w2_scale=layer.w2_weight_scale)
+        elif quant == QuantType.W4A8MXFP:
+            weights = dict(
+                w1_scale=layer.w13_weight_scale,
+                w2_scale=layer.w2_weight_scale,
+                mxfp_act_quant_type=torch.float8_e4m3fn,
+                mxfp_weight_quant_type=torch_npu.float4_e2m1fn_x2,
+                mxfp_scale_dtype=torch_npu.float8_e8m0fnu,
+                mxfp_per_token_scale_dtype=torch_npu.float8_e8m0fnu,
+                mxfp_use_bf16=True,
+            )
         elif quant != QuantType.NONE:
             raise ValueError(f"Unsupported V4.1 grouped expert quantization: {quant}")
         return _EXTRA_CTX.moe_comm_method.fused_experts(
@@ -233,7 +257,7 @@ class DeepseekV41RoutedExperts(AscendRoutedExperts):
         if quant_config is not None:
             method = super()._get_quant_method(prefix, quant_config, moe_config)
             if isinstance(method, AscendFusedMoEMethod):
-                if method.quant_method.quant_type != QuantType.W8A8:
+                if method.quant_method.quant_type not in (QuantType.W8A8, QuantType.W4A8MXFP):
                     raise ValueError(f"Unsupported V4.1 grouped quantization for {prefix}")
                 return _V41W8A8Method(method.quant_method, moe_config)
             if not isinstance(method, AscendUnquantizedFusedMoEMethod):

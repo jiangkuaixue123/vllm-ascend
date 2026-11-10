@@ -16,7 +16,10 @@ from vllm.model_executor.layers.linear import ColumnParallelLinear, RowParallelL
 from tests.ut.models.deepseek_v41.test_engram import write_shard
 from vllm_ascend.models.deepseek_v41.attention_ops import fp8_quant_dequant
 from vllm_ascend.models.deepseek_v41.engram import IndexedMmapStore, MmapEngramEmbedding
+from vllm_ascend.models.deepseek_v41.fused_experts import _grouped_projection
+from vllm_ascend.models.deepseek_v41.fused_weights import IndexedPart, _load_expert_tensor
 from vllm_ascend.models.deepseek_v41.model import read_parameter_slice
+from vllm_ascend.quantization.methods.w4a8.w4a8_mxfp4 import AscendW4A8MXFPDSDynamicFusedMoEMethod
 from vllm_ascend.quantization.methods.w8a8.w8a8_mxfp8 import AscendW8A8MXFP8DSDynamicLinearMethod
 
 
@@ -63,6 +66,28 @@ def test_fp8_dense_projection_requires_paired_scale(tmp_path):
         read_parameter_slice(reader, "proj.weight", torch.empty(32, 32), nn.Linear(32, 32), 0, 1)
 
 
+def test_original_fp4_expert_keeps_packed_bits_and_group32_scales(tmp_path):
+    key = "layers.0.ffn.experts.0.w1"
+    packed = torch.arange(64 * 32).remainder(256).to(torch.uint8).reshape(64, 32)
+    scale = torch.full((64, 2), 127, dtype=torch.uint8).view(torch.float8_e8m0fnu)
+    path = tmp_path / "expert.safetensors"
+    save_file({key + ".weight": packed.view(torch.int8), key + ".scale": scale}, str(path))
+    received = []
+
+    def loader(**kwargs):
+        received.append(kwargs["loaded_weight"].clone())
+        return True
+
+    config = SimpleNamespace(hidden_size=64, moe_intermediate_size=64)
+    with safe_open(str(path), framework="pt") as reader:
+        for suffix, dtype in (("weight", torch.uint8), ("scale", torch.float8_e8m0fnu)):
+            parameter = nn.Parameter(torch.empty(1, dtype=dtype), requires_grad=False)
+            parameter.weight_loader = loader
+            _load_expert_tensor(reader, IndexedPart(key + "." + suffix, "packed", "w1", 0), parameter, config)
+    assert torch.equal(received[0], packed)
+    assert torch.equal(received[1].view(torch.uint8), scale.view(torch.uint8))
+
+
 @pytest.mark.parametrize("block", [32, 128])
 def test_native_linear_scale_expansion_matches_checkpoint_tiles(block):
     method = object.__new__(AscendW8A8MXFP8DSDynamicLinearMethod)
@@ -77,6 +102,38 @@ def test_native_linear_scale_expansion_matches_checkpoint_tiles(block):
     actual = layer.weight_scale.transpose(0, 1).reshape(256, 8)
     expected = raw.repeat_interleave(block, 0).repeat_interleave(block // 32, 1)
     assert torch.equal(actual, expected)
+
+
+def test_original_fp4_grouped_gemm_on_npu():
+    if not torch.npu.is_available():
+        pytest.skip("Requires A5")
+    if "950" not in torch.npu.get_device_name(0):
+        pytest.skip("Requires native A5 MXFP4")
+    torch.npu.set_device(0)
+    packed = torch.arange(2 * 64 * 32).remainder(256).to(torch.uint8).reshape(2, 64, 32)
+    scales = torch.arange(2 * 64 * 2).remainder(5).add(125).to(torch.uint8).reshape(2, 64, 2)
+    layer = SimpleNamespace(
+        w13_weight=nn.Parameter(packed.to("npu"), requires_grad=False),
+        w2_weight=nn.Parameter(packed.to("npu"), requires_grad=False),
+        w13_weight_scale=nn.Parameter(scales.view(torch.float8_e8m0fnu).to("npu"), requires_grad=False),
+        w2_weight_scale=nn.Parameter(scales.view(torch.float8_e8m0fnu).to("npu"), requires_grad=False),
+    )
+    method = object.__new__(AscendW4A8MXFPDSDynamicFusedMoEMethod)
+    method.process_weights_after_loading(layer)
+    x = torch.randn(8, 64, generator=torch.Generator().manual_seed(9)).bfloat16().npu()
+    q, scale = torch_npu.npu_dynamic_mx_quant(x, dst_type=torch.float8_e4m3fn, scale_alg=1)
+    result = _grouped_projection(
+        q, layer.w13_weight, torch.tensor([4, 4], device="npu"), 1, layer.w13_weight_scale, scale, mxfp=True
+    ).cpu()
+    decoded_x = (
+        q.cpu().float().reshape(8, 2, 32)
+        * torch.exp2(scale.cpu().view(torch.uint8).float().reshape(8, 2) - 127)[..., None]
+    )
+    lut = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6, 0, -0.5, -1, -1.5, -2, -3, -4, -6])
+    codes = torch.stack((packed & 15, packed >> 4), dim=-1).flatten(-2).long()
+    weights = lut[codes] * torch.exp2(scales.float() - 127).repeat_interleave(32, -1)
+    expected = torch.cat([decoded_x.flatten(1)[i * 4 : (i + 1) * 4] @ weights[i].T for i in range(2)]).bfloat16()
+    torch.testing.assert_close(result, expected, rtol=0.01, atol=0.125)
 
 
 def test_original_fp8_activation_and_linear_on_npu():
