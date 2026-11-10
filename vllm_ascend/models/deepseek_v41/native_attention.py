@@ -1,14 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Execute V4.1's selected latent attention on the A3 shared-KV operator."""
+"""Execute V4.1's selected latent attention on Ascend native operators."""
 
+import importlib
 from functools import lru_cache
 
 import torch
 import torch.nn.functional as F
 from vllm.logger import logger
 
-from vllm_ascend.utils import enable_custom_op
+from vllm_ascend.device.device_config import is_950
+from vllm_ascend.utils import bootstrap_custom_op_env, enable_custom_op
 
 from .attention_ops import sparse_attn
 
@@ -16,6 +18,19 @@ PAGE_SIZE = 16
 SPARSE_ALIGNMENT = 128
 MAX_SPARSE_WIDTH = 2048
 LATENT_DIM = 512
+
+
+@lru_cache(maxsize=1)
+def _enable_a5_attention_ops():
+    # Generic custom ops remain disabled on A5. Load only the extension's
+    # registered CANN wrappers; A2/A3-only Python meta kernels are unavailable.
+    bootstrap_custom_op_env()
+    importlib.import_module("vllm_ascend.vllm_ascend_C")
+    return True
+
+
+def enable_native_attention():
+    return _enable_a5_attention_ops() if is_950() else enable_custom_op()
 
 
 def aligned_length(length, alignment):
@@ -46,6 +61,9 @@ class DeepseekV41NativeAttention:
 
     def pin_decode_plan(self, device, heads, rows, selected_width, shared=None):
         """Hold every address used by the recorded graph for the model's lifetime."""
+        if device.type == "npu" and is_950():
+            # A5 SFA has no AICPU metadata plan; ACLGraph owns its workspaces.
+            return
         width = aligned_length(selected_width, SPARSE_ALIGNMENT)
         key = (device, heads, rows, width)
         if key not in self.decode_plans:
@@ -120,7 +138,7 @@ class DeepseekV41NativeAttention:
     def __call__(self, q, kv, sink, indices, scale, *, mode, swa_window=None, uniform_decode=False):
         if q.device.type == "cpu":
             return sparse_attn(q, kv, sink, indices, scale)
-        if q.device.type != "npu" or not enable_custom_op():
+        if q.device.type != "npu" or not enable_native_attention():
             raise RuntimeError("V4.1 attention requires Ascend's npu_sparse_attn_sharedkv custom operator")
         return self._native(q, kv, sink, indices, scale, mode, swa_window, uniform_decode)
 
@@ -135,6 +153,8 @@ class DeepseekV41NativeAttention:
         length = kv.shape[1]
         if kv.shape != (batch, length, dim) or indices.shape[:2] != (batch, sequence):
             raise ValueError("V4.1 Q, KV and index rows must agree")
+        if q.device.type == "npu" and is_950():
+            return self._native_a5(q, kv, sink, indices, scale, mode)
         stride = aligned_length(length, PAGE_SIZE)
         padded = F.pad(kv, (0, 0, 0, stride - length)) if stride != length else kv
         pages = padded.contiguous().view(-1, PAGE_SIZE, 1, dim)
@@ -177,4 +197,44 @@ class DeepseekV41NativeAttention:
             # Rows masked by the scheduler have no valid slots. Keep their
             # result zero irrespective of how the kernel initializes empty rows.
             result = result.masked_fill((slots[:, 0, 0] < 0).reshape(batch, sequence, 1, 1), 0)
+        return result
+
+    @staticmethod
+    def _native_a5(q, kv, sink, indices, scale, mode):
+        """Use A5 BF16 SFA with explicit slots and merge the zero-value sink.
+
+        V4.1's 512-dimensional latent already contains RoPE. The separate
+        64-dimensional RoPE arguments required by SFA therefore contain zeros.
+        Valid slots form a prefix, preserving duplicates and arbitrary holes.
+        """
+        batch, sequence, heads, dim = q.shape
+        length = kv.shape[1]
+        width = aligned_length(indices.shape[-1], SPARSE_ALIGNMENT)
+        if not 0 < width <= MAX_SPARSE_WIDTH:
+            raise ValueError("A5 sparse attention requires between 1 and 2048 selected slots")
+        slots = physical_indices(indices, 0, length, width).reshape(batch, sequence, 1, width)
+        # SFA caps the selected count at KV length, so reserve capacity even
+        # when a short sequence selects the same key more than once.
+        capacity = max(length, width)
+        keys = F.pad(kv, (0, 0, 0, capacity - length)).unsqueeze(2).contiguous()
+        output, maximum, total = torch.ops._C_ascend.npu_sparse_flash_attention(
+            query=q.contiguous(),
+            key=keys,
+            value=keys,
+            sparse_indices=slots,
+            scale_value=scale,
+            query_rope=q.new_zeros(batch, sequence, heads, 64),
+            key_rope=kv.new_zeros(batch, capacity, 1, 64),
+            layout_query="BSND",
+            layout_kv="BSND",
+            sparse_mode=0,
+            attention_mode=2,
+            return_softmax_lse=True,
+        )
+        lse = (maximum.float() + total.float().log()).reshape(batch, sequence, heads)
+        # The sink contributes exp(sink) to the denominator and zero to V.
+        factor = torch.sigmoid(lse - sink.view(1, 1, heads))
+        result = (output.float() * factor.unsqueeze(-1)).to(q.dtype)
+        result.masked_fill_((slots[..., 0] < 0).unsqueeze(-1), 0)
+        logger.info_once("V4.1 native %s A5 sparse_flash_attention heads=%d", mode, heads, scope="process")
         return result

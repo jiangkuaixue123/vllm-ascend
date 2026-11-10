@@ -128,7 +128,9 @@ def test_real_tp8_verifier_plan_on_npu(rows, width):
     importlib.import_module("torch_npu")
     if not torch.npu.is_available():
         pytest.skip("Requires Ascend A3")
-    assert native.enable_custom_op()
+    if native.is_950():
+        pytest.skip("A5 SFA does not use the A3 metadata operator")
+    assert native.enable_native_attention()
     device = torch.device("npu:0")
     runner = native.DeepseekV41NativeAttention()
     runner.pin_decode_plan(device, 64, rows, width)
@@ -161,6 +163,7 @@ def test_kernel_failure_propagates_and_unsupported_geometry_is_rejected(backend,
         ("SWA target causal prefill", 64),
         ("DSA target indexed decode", 64),
         ("DSA target indexed decode", 8),
+        ("DSA target indexed decode", 16),
         ("SWA draft bidirectional", 8),
     ],
 )
@@ -183,7 +186,7 @@ def test_native_attention_on_npu(mode, heads):
     runner = native.DeepseekV41NativeAttention()
     uniform_decode = mode == "DSA target indexed decode"
     if uniform_decode:
-        assert native.enable_custom_op()
+        assert native.enable_native_attention()
         runner.pin_decode_plan(q.device, heads, batch * rows, ids.shape[-1])
 
     def execute():
@@ -204,3 +207,15 @@ def test_native_attention_on_npu(mode, heads):
         ids[1, 2, 0] = 4
     graph.replay()
     verify(output)
+
+
+def test_a5_duplicate_slots_can_exceed_kv_length_on_npu():
+    if not torch.npu.is_available() or not native.is_950():
+        pytest.skip("Requires A5")
+    assert native.enable_native_attention()
+    q, kv, sink = inputs(1, 1, 2, heads=16)
+    indices = torch.zeros(1, 1, 129, dtype=torch.int32)
+    expected = sparse_attn(q, kv, sink, indices, 512**-0.5)
+    runner = native.DeepseekV41NativeAttention()
+    actual = runner(q.npu(), kv.npu(), sink.npu(), indices.npu(), 512**-0.5, mode="duplicate regression")
+    torch.testing.assert_close(actual.float().cpu(), expected.float(), rtol=0.025, atol=0.02)

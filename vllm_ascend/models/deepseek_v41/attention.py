@@ -36,7 +36,7 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 
-from vllm_ascend.utils import enable_custom_op, enable_dsa_cp, enable_sp
+from vllm_ascend.utils import enable_dsa_cp, enable_sp
 
 from .attention_ops import (
     apply_rotary_emb_real,
@@ -44,7 +44,7 @@ from .attention_ops import (
     fp8_quant_dequant,
 )
 from .core import rms_norm
-from .native_attention import DeepseekV41NativeAttention
+from .native_attention import DeepseekV41NativeAttention, enable_native_attention
 
 # Bound the per-head score tensor for eager prefill; cached candidates span the whole request.
 _INDEX_SCORE_TILE_BYTES = 32 * 1024 * 1024
@@ -148,7 +148,7 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
         width = math.ceil(self.max_model_len / self.block_size)
         if rows not in self.decode_buffers:
             if device.type == "npu" and self.native_layers:
-                if not enable_custom_op():
+                if not enable_native_attention():
                     raise RuntimeError("V4.1 graph decode requires the Ascend shared-KV custom operator")
                 for layer in self.native_layers:
                     if layer.native_layout is not None:
