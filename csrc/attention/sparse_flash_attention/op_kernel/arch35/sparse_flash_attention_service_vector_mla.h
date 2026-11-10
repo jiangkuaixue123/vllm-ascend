@@ -803,7 +803,9 @@ TEMPLATES_DEF_NO_DEFAULT __aicore__ inline void SFAVectorService<TEMPLATE_ARGS>:
     sharedParams.isActualSeqLengthsNull = sparseAttnSharedkvBaseParams.isActualLenDimsNull;
     sharedParams.isActualSeqLengthsKVNull = sparseAttnSharedkvBaseParams.isActualLenDimsKVNull;
     sharedParams.returnSoftmaxLse = sparseAttnSharedkvBaseParams.returnSoftmaxLse;
-    sharedParams.needInit = 0;
+    // Explicit sparse rows may contain no valid keys even with a nonempty cache.
+    // Initialize skipped rows to zero output and max/sum = 0 (LSE = -inf).
+    sharedParams.needInit = sharedParams.returnSoftmaxLse && sharedParams.oriMaskMode == 0;
     for (uint32_t bIdx = 0; bIdx < sharedParams.bSize; bIdx++) {
         int64_t s2Size;
         if constexpr (KV_LAYOUT_T == SFA_LAYOUT::TND) {
