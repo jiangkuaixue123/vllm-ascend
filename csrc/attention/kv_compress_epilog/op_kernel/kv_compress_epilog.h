@@ -16,6 +16,7 @@
 #ifndef KV_COMPRESS_EPILOG_H
 #define KV_COMPRESS_EPILOG_H
 
+#include <type_traits>
 #include "kernel_operator.h"
 #include "kernel_tiling/kernel_tiling.h"
 #include "kv_compress_epilog_common.h"
@@ -109,7 +110,9 @@ template <typename T0, typename U, typename T1, typename Tiling, typename RowCod
             validIdx = 0;
             for (int64_t rowInnerIdx = 0; rowInnerIdx < curRowFactor; rowInnerIdx++) {
                 int32_t curSlotIdx = GetBlockIdx() * tilingData->rowOfFormerBlock + rowOuterIdx * tilingData->rowFactor + rowInnerIdx;
-                const U slot = slotMappingGm.GetValue(curSlotIdx);
+                // V1 historically interprets the low 32 bits even with int64 slot tensors.
+                using SlotType = typename std::conditional<IsSameType<RowCodec, void>::value, int32_t, U>::type;
+                const SlotType slot = static_cast<SlotType>(slotMappingGm.GetValue(curSlotIdx));
                 if constexpr (!IsSameType<RowCodec, void>::value) {
                     if (slot < 0 || static_cast<uint64_t>(slot) >= static_cast<uint64_t>(tilingData->cacheRows)) {
                         continue;
