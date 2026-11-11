@@ -65,6 +65,24 @@ class NativeRMSNorm(nn.Module):
         return rms_norm(x, self.weight, self.eps)
 
 
+def _quantize_grouped_activation(x):
+    # Bound each full-size FP32 temporary to 8 MiB for the checkpoint's
+    # [tokens, 8, 4096] projection. A group of 32 always stays in one tile.
+    tile_rows = max(1, (2 * 1024 * 1024) // (x.size(1) * x.size(2)))
+    if x.size(0) <= tile_rows:
+        codes, _, raw = quantize_fp8_blocks(x)
+        return codes, raw
+
+    codes = x.new_empty(x.shape, dtype=torch.uint8)
+    raw = x.new_empty((*x.shape[:-1], x.size(-1) // 32), dtype=torch.uint8)
+    for start in range(0, x.size(0), tile_rows):
+        rows = slice(start, start + tile_rows)
+        tile_codes, _, tile_raw = quantize_fp8_blocks(x[rows])
+        codes[rows].copy_(tile_codes.view(torch.uint8))
+        raw[rows].copy_(tile_raw)
+    return codes.view(torch.float8_e4m3fn), raw
+
+
 class NativeGroupedOutputProjection(nn.Module):
     """Block-diagonal wo_a with the checkpoint's E4M3 weights and per-32 UE8M0 scales."""
 
@@ -88,7 +106,7 @@ class NativeGroupedOutputProjection(nn.Module):
         import torch_npu
 
         flat = x.reshape(-1, self.groups, self.width)
-        quant, _, raw = quantize_fp8_blocks(flat)
+        quant, raw = _quantize_grouped_activation(flat)
         activation_scale = raw.reshape(flat.size(0), self.groups, self.width // 64, 2)
         out = torch_npu.npu_transpose_quant_batchmatmul(
             quant,

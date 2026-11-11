@@ -1,6 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
+import sys
+from types import SimpleNamespace
+
 import torch
 
+from vllm_ascend.models.deepseek_v41 import native_ops
+from vllm_ascend.models.deepseek_v41.eager_kernels import quantize_fp8_blocks
 from vllm_ascend.models.deepseek_v41.native_ops import NativeGroupedOutputProjection, grouped_output_projection
 
 
@@ -31,3 +36,35 @@ def test_dense_reference_preserves_group_boundaries_and_batch_dimensions():
     w = proj.weight.detach().view(groups, rank, width)
     expected = torch.stack([x[:, :, g] @ w[g].T for g in range(groups)], dim=2)
     torch.testing.assert_close(grouped_output_projection(x, proj), expected, rtol=0, atol=0)
+
+
+def test_tiled_activation_preserves_bytes_and_single_grouped_projection(monkeypatch):
+    rows, groups, width, rank = 65, 8, 4096, 32
+    x = torch.randn((rows, groups, width), generator=torch.Generator().manual_seed(311)).bfloat16()
+    x[-1, 0, :8] = torch.tensor([0.0, -0.0, 1.0, -1.0, 448.0, 450.0, 1e-6, -1e-6])
+    expected, _, scales = quantize_fp8_blocks(x)
+    calls, tile_sizes = [], []
+
+    def encode(tile):
+        tile_sizes.append(tile.size(0))
+        return quantize_fp8_blocks(tile)
+
+    def matmul(quant, weight, **opts):
+        calls.append(quant.shape)
+        assert weight.shape == (groups, width, rank)
+        assert quant.is_contiguous() and torch.equal(quant.view(torch.uint8), expected.view(torch.uint8))
+        assert torch.equal(opts["x1_scale"].view(torch.uint8), scales.view(rows, groups, width // 64, 2))
+        assert (opts["perm_x1"], opts["perm_x2"], opts["perm_y"], opts["group_sizes"]) == (
+            (1, 0, 2),
+            (0, 1, 2),
+            (1, 0, 2),
+            (0, 0, 32),
+        )
+        return x.new_empty((rows, groups, rank))
+
+    monkeypatch.setattr(native_ops, "quantize_fp8_blocks", encode)
+    monkeypatch.setitem(sys.modules, "torch_npu", SimpleNamespace(npu_transpose_quant_batchmatmul=matmul))
+    layer = NativeGroupedOutputProjection(groups, rank, width)
+    layer.pack_after_loading()
+    assert layer(x).shape == (rows, groups, rank)
+    assert calls == [x.shape] and tile_sizes == [64, 1]
