@@ -124,3 +124,4 @@
 | 2026-11-11 | 已按任务方确认排好 GPQA 与长上下文的执行顺序。全量评分归档后，同一候选依次执行 256K 与 1M 单请求的冷、热和自然停词验证。 | [阶段三验收顺序](PLAN.md#阶段三的服务与验收) |
 | 2026-11-11 | 已冻结六项算子融合的基线、模型和评测协议。接入前的独立八卡服务已完成加载和图预热，正在用官方 GSM8K 前 300 题建立同条件对照。 | [融合计划](PLAN.md#a5-融合算子接入) · [评分与输入校验](../day0_stage2/validator/summarize_gsm8k.py) |
 | 2026-11-11 | 候选已接入六项算子。HcPre 将本层 FP32 门值传给下一子层，分组输出投影直接加载 checkpoint 的 FP8 权重，正、逆 RoPE 在完整的 head 上更新最后 64 维。三种压缩 KV 格式沿用原始字节布局，目标稀疏注意力按各请求的实际页表准备 CANN 输入。指定镜像开始构建完整 wheel，逐项设备数值与 GSM8K 对照待完成。 | [模型调用](../vllm_ascend/models/deepseek_v41/graph_ops.py) · [缓存写入](../vllm_ascend/models/deepseek_v41/compact_kv.py) · [稀疏注意力](../vllm_ascend/models/deepseek_v41/mixed_mla.py) |
+| 2026-11-11 | 修正了压缩缓存处理非有限值和 E4M3 缩放溢出的编码，并恢复旧 V1 的槽位转换行为。A5 现在从仓内模型的扩展注册入口选择实际 Mixed MLA。指定镜像的 74 项模型 CPU 用例通过，已核对原始权重的 43 组输出投影头和长位置的旋转相位。 | [KV 编码](../csrc/attention/kv_compress_epilog_v2/op_kernel/kv_compact_codec.h) · [A5 选择测试](../tests/ut/models/test_deepseek_v41_mixed_mla.py) |
