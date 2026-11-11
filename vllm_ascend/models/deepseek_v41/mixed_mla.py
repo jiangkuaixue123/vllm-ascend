@@ -27,15 +27,17 @@ def _operators(device):
         initialize_native_ops()
         import_module("cann_ops_transformer")
         namespace = torch.ops.cann_ops_transformer
-        metadata = namespace.mixed_quant_sparse_flash_mla_metadata.default
+        # The two 950 MLA kernels use the same 1,024-word FA/FD workload ABI.
+        # The 0.27 image ships the SparseFlashMla AICPU metadata provider.
+        metadata = namespace.sparse_flash_mla_metadata.default
         attention = namespace.mixed_quant_sparse_flash_mla.default
-        writer = torch.ops._C_ascend.kv_compress_epilog.default
+        writer = torch.ops._C_ascend.kv_compress_epilog_v2.default
     except (ImportError, AttributeError):
         return None
     if (metadata._schema.name, attention._schema.name, writer._schema.name) != (
-        "cann_ops_transformer::mixed_quant_sparse_flash_mla_metadata",
+        "cann_ops_transformer::sparse_flash_mla_metadata",
         "cann_ops_transformer::mixed_quant_sparse_flash_mla",
-        "_C_ascend::kv_compress_epilog",
+        "_C_ascend::kv_compress_epilog_v2",
     ):
         return None
     from .compact_kv import store_mixed_kv
@@ -88,8 +90,6 @@ def _attend_tile(q, window_bank, window_ids, compressed_bank, compressed_ids, si
     config = dict(
         cu_seqlens_q=q_ends,
         seqused_ori_kv=raw_length,
-        quant_mode=2,
-        rope_head_dim=ROPE_DIM,
         cmp_ratio=1,
         ori_mask_mode=4,
         cmp_mask_mode=0,
@@ -127,6 +127,8 @@ def _attend_tile(q, window_bank, window_ids, compressed_bank, compressed_ids, si
     )
     output, _ = attention(
         q.contiguous(),
+        quant_mode=2,
+        rope_head_dim=ROPE_DIM,
         sinks=sink,
         metadata=plan,
         softmax_scale=scale,

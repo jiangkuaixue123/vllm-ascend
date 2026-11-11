@@ -30,10 +30,10 @@ def test_a5_selects_registered_mixed_ops_without_generic_custom_op_capability(mo
     def packet(name):
         return SimpleNamespace(default=SimpleNamespace(_schema=torch._C.parse_schema(f"{name}(Tensor x) -> Tensor")))
 
-    meta = packet("cann_ops_transformer::mixed_quant_sparse_flash_mla_metadata")
+    meta = packet("cann_ops_transformer::sparse_flash_mla_metadata")
     main = packet("cann_ops_transformer::mixed_quant_sparse_flash_mla")
-    writer = SimpleNamespace(kv_compress_epilog=packet("_C_ascend::kv_compress_epilog"))
-    cann = SimpleNamespace(mixed_quant_sparse_flash_mla_metadata=meta, mixed_quant_sparse_flash_mla=main)
+    writer = SimpleNamespace(kv_compress_epilog_v2=packet("_C_ascend::kv_compress_epilog_v2"))
+    cann = SimpleNamespace(sparse_flash_mla_metadata=meta, mixed_quant_sparse_flash_mla=main)
     monkeypatch.setattr(torch.ops, "cann_ops_transformer", cann)
     monkeypatch.setattr(torch.ops, "_C_ascend", writer)
 
@@ -46,7 +46,7 @@ def test_a5_selects_registered_mixed_ops_without_generic_custom_op_capability(mo
         assert native.supports_mixed_mla(q, 64)
         assert native._operators(q.device) == (meta.default, main.default, compact_kv.store_mixed_kv)
         assert calls == ["extension", "cann_ops_transformer"]
-        del writer.kv_compress_epilog
+        del writer.kv_compress_epilog_v2
         native._operators.cache_clear()
         assert not native.supports_mixed_mla(q, 64)
         monkeypatch.setattr(device_config, "get_device_config", lambda: device_config.DeviceConfig(AscendDeviceType.A3))
@@ -74,10 +74,12 @@ class ScratchReference:
 
     def metadata(self, **kw):
         self.calls.append(kw)
-        assert kw["layout_q"] == "TND" and kw["layout_kv"] == "PA_BBND" and kw["quant_mode"] == 2
+        assert kw["layout_q"] == "TND" and kw["layout_kv"] == "PA_BBND"
+        assert "quant_mode" not in kw and "rope_head_dim" not in kw
         return torch.tensor([kw["batch_size"]], dtype=torch.int32)
 
     def attention(self, q, **kw):
+        assert kw["quant_mode"] == 2 and kw["rope_head_dim"] == 64
         assert len(q) == kw["metadata"].item()
         raw = self.pages.pop(id(kw["ori_kv"]))
         cmp = self.pages.pop(id(kw["cmp_kv"])) if "cmp_kv" in kw else None
