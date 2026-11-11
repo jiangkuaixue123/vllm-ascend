@@ -45,6 +45,7 @@ constexpr uint64_t M_L1_MAX_SIZE = 256;
 constexpr uint64_t K_MULIT_CORE_SPLIT_BASE_SIZE = 256;
 constexpr uint64_t A_L1_SIZE = 128 * 256;
 constexpr uint64_t K_L1_MAX_SIZE = 1024;
+constexpr uint64_t COEFFICIENT_M_TILE = 64;
 }
 
 class HcPreTilingRegbase {
@@ -66,6 +67,7 @@ public:
 private:
     gert::TilingContext *context_ = nullptr;
     uint64_t tilingKey_ = 0;
+    bool returnPre_ = false;
     HcPreTilingData tilingData_;
     uint64_t aivCoreNum_ = 0;
     uint64_t aicCoreNum_ = 0;
@@ -157,8 +159,8 @@ ge::graphStatus HcPreTilingRegbase::GetShapeAttrsInfoInner()
     OPS_LOG_E_IF_NULL(context_, firstShape, return ge::GRAPH_FAILED);
     OPS_LOG_E_IF_NULL(context_, firstDesc, return ge::GRAPH_FAILED);
     const auto &out = firstShape->GetStorageShape();
-    const bool returnPre = firstDesc->GetDataType() == ge::DT_FLOAT;
-    OPS_ERR_IF(out.GetDimNum() + 1 != xDimNum || out.GetDim(xDimNum - 2) != (returnPre ? hcMult_ : d_),
+    returnPre_ = firstDesc->GetDataType() == ge::DT_FLOAT;
+    OPS_ERR_IF(out.GetDimNum() + 1 != xDimNum || out.GetDim(xDimNum - 2) != (returnPre_ ? hcMult_ : d_),
                OPS_LOG_E(context_->GetNodeName(), "Unexpected HcPre first output shape."), return ge::GRAPH_FAILED);
     for (size_t i = 0; i + 2 < xDimNum; ++i) {
         OPS_ERR_IF(out.GetDim(i) != xShape->GetStorageShape().GetDim(i),
@@ -418,6 +420,21 @@ ge::graphStatus HcPreTilingRegbase::CalcMKSplitCorePart2Tiling()
 ge::graphStatus HcPreTilingRegbase::CalcOpTiling() {
     uint64_t kSize = hcMult_ * d_;
     tilingData_.set_k(kSize);
+    if (returnPre_) {
+        // The FP32 coefficients carry into the next sublayer. Keep each token's
+        // reduction order invariant when other requests enter or leave its batch.
+        const uint64_t splitK = RoundUp(CeilDiv(kSize, aicCoreNum_), K_MULIT_CORE_SPLIT_BASE_SIZE);
+        tilingData_.set_cubeCoreNum(aicCoreNum_);
+        tilingData_.set_cubeBlockDimM(CeilDiv(bs_, COEFFICIENT_M_TILE));
+        tilingData_.set_cubeBlockDimK(CeilDiv(kSize, splitK));
+        tilingData_.set_multCoreSplitMSize(COEFFICIENT_M_TILE);
+        tilingData_.set_mL1Size(COEFFICIENT_M_TILE);
+        tilingData_.set_multCoreSplitKSize(splitK);
+        tilingData_.set_kL1Size(A_L1_SIZE / COEFFICIENT_M_TILE);
+        tilingData_.set_cvLoopKSize(1024);
+        tilingKey_ = 1000;
+        return CalcMKSplitCorePart2Tiling();
+    }
     // 计算bs_轴切核
     uint64_t mDimNum = std::min(aicCoreNum_, static_cast<uint64_t>(CeilDiv(bs_, M_L1_MAX_SIZE)));
     uint64_t singleCoreM = RoundUp(CeilDiv(bs_, mDimNum), AscendC::BLOCK_CUBE);

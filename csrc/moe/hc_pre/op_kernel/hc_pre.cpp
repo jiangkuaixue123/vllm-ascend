@@ -50,7 +50,7 @@ extern "C" __global__ __aicore__ void hc_pre(GM_ADDR x, GM_ADDR hc_fn, GM_ADDR h
         if (TILING_KEY_IS(1000)) {
             GET_TILING_DATA_WITH_STRUCT(HcPreTilingData, tiling_data_in, tiling);
             const HcPreTilingData *__restrict tilingData = &tiling_data_in;
-            HcPreNs::HcPreMKSplitCorePart1<DTYPE_X> op;
+            HcPreNs::HcPreMKSplitCorePart1<DTYPE_X, IsSameType<DTYPE_Y, float>::value> op;
             op.Init(x, hc_fn, userWs, tilingData, &pipe);
             op.Process();
             pipe.Destroy();

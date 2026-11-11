@@ -10,6 +10,39 @@ from vllm_ascend.models.deepseek_v41.backend import Block
 from vllm_ascend.models.deepseek_v41.native_ops import native_hc_ops
 
 
+@torch.inference_mode()
+def test_hc_fp32_coefficients_are_invariant_to_other_rows_and_m_tile_tails():
+    if not get_device_config().supports_hc_pre_coefficients:
+        pytest.skip("Requires the A5 FP32 coefficient kernel.")
+    gen = torch.Generator().manual_seed(92362)
+    # Include the 268-vs-536 cold-prefill geometry and a partial M tile
+    # after multiple rounds of work on each AIC/AIV pair.
+    x = torch.randn((821, 4, 5120), generator=gen).bfloat16().npu()
+    weights = (torch.randn((24, 20480), generator=gen) / 128).npu()
+    scale = torch.tensor([0.73, 0.51, 0.81], device=x.device)
+    bias = torch.randn(24, generator=gen).npu()
+    op = native_hc_ops(x).npu_hc_pre_v2
+
+    def run(t):
+        return op(t.contiguous(), weights, scale, bias, 4, 20, 1e-20, 1e-6, return_pre=True)
+
+    target = x[:268]
+    reference = run(target)
+    empty = target[:0]
+    peer = x[268:536]
+    for before, after, count in (
+        (empty, peer, 268),
+        (peer, empty, 268),
+        (x[268:], empty, 268),
+        (empty, empty, 1),
+        (x[268:333], peer, 6),
+    ):
+        begin = len(before)
+        actual = run(torch.cat((before, target[:count], after)))
+        for expected, got in zip(reference, actual):
+            torch.testing.assert_close(got[begin : begin + count], expected[:count], atol=0, rtol=0)
+
+
 @pytest.mark.parametrize(("batch", "seq", "expanded"), [(1, 6, True), (2, 7, False), (1, 97, False)])
 @torch.inference_mode()
 def test_hc_carried_coefficients_and_full_residual_on_a5(batch, seq, expanded):

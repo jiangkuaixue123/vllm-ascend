@@ -23,7 +23,7 @@
 namespace HcPreNs {
 using namespace AscendC;
 
-template <typename T>
+template <typename T, bool StableCoefficients = false>
 class HcPreMKSplitCorePart1 {
 public:
     __aicore__ inline HcPreMKSplitCorePart1()
@@ -67,56 +67,47 @@ public:
 
     __aicore__ inline void Process()
     {
-        int64_t curBlockIdx = GetBlockIdx();
-        int64_t totalBlockNum = GetBlockNum();
-
-        uint64_t mBlkDimIdx = curBlockIdx / tilingData->cubeBlockDimK;
-        uint64_t kBlkDimIdx = curBlockIdx % tilingData->cubeBlockDimK;
-
-        // todo 移到tiling计算
-        uint64_t mCnt = CeilDiv(tilingData->bs, tilingData->mL1Size);
-        uint64_t singleCoreMaxRound = CeilDiv(mCnt, tilingData->cubeBlockDimM);
-        uint64_t mainCoreCount = mCnt % tilingData->cubeBlockDimM;
-        uint64_t singleCoreRound = (mainCoreCount == 0 || curBlockIdx < mainCoreCount) ? singleCoreMaxRound : singleCoreMaxRound - 1;
-        uint64_t mGmOffset = 0;
-        uint64_t nd2NzBufSize = CeilAlign(tilingData->mUbSize, C0_SIZE) * RoundUp<float>(tilingData->kUbSize);
-        if ASCEND_IS_AIC {
-            mGmOffset = (curBlockIdx / tilingData->cubeBlockDimK) * singleCoreMaxRound * tilingData->mL1Size;
-        } else {
-            mGmOffset = ((curBlockIdx / 2) / tilingData->cubeBlockDimK) * singleCoreMaxRound * tilingData->mL1Size;
-        }
-        int64_t xGmBaseOffset = 0;
-        int64_t rmsGmBaseOffset = 0;
+        const uint64_t curBlockIdx = GetBlockIdx();
+        uint64_t cube = curBlockIdx;
         if ASCEND_IS_AIV {
-            int64_t aivCurBlockIdx = GetBlockIdx();
-            xGmBaseOffset = ((aivCurBlockIdx / 2) / tilingData->cubeBlockDimK) * singleCoreMaxRound * tilingData->mL1Size * tilingData->hcMult * tilingData->d +
-                ((aivCurBlockIdx / 2) % tilingData->cubeBlockDimK) * tilingData->multCoreSplitKSize;
-            rmsGmBaseOffset = ((aivCurBlockIdx / 2) / tilingData->cubeBlockDimK) * singleCoreMaxRound * tilingData->mL1Size;
+            cube = curBlockIdx / 2;
         }
-
-        // todo 移到tiling计算
+        const uint64_t kParts = tilingData->cubeBlockDimK;
+        const uint64_t mTiles = CeilDiv(tilingData->bs, tilingData->mL1Size);
+        uint64_t first = 0;
+        uint64_t step = 1;
+        uint64_t end = 0;
+        uint64_t legacyFirstRow = 0;
+        if constexpr (StableCoefficients) {
+            // A cube and its two vector cores execute the same (M tile, K partition).
+            // Every workspace tile has one writer even when jobs outnumber the cores.
+            first = cube;
+            step = tilingData->cubeCoreNum;
+            end = mTiles * kParts;
+        } else if (cube < kParts * tilingData->cubeBlockDimM) {
+            const uint64_t rounds = CeilDiv(mTiles, tilingData->cubeBlockDimM);
+            const uint64_t remainder = mTiles % tilingData->cubeBlockDimM;
+            end = (remainder == 0 || curBlockIdx < remainder) ? rounds : rounds - 1;
+            legacyFirstRow = (cube / kParts) * rounds * tilingData->mL1Size;
+        }
+        const uint64_t nd2NzBufSize = CeilAlign(tilingData->mUbSize, C0_SIZE) * RoundUp<float>(tilingData->kUbSize);
         int64_t xSplitOffset = 0;
         int64_t rmsSplitOffset = 0;
-        // m轴切分 按照0 0 1 1..分核
         int64_t bufferIdx = 0;
-        int64_t curAicBlockIdx = 0;
-        if ASCEND_IS_AIC {
-            curAicBlockIdx = curBlockIdx;
-        } else {
-            curAicBlockIdx = curBlockIdx / 2;
-        }
-
-        if (curAicBlockIdx < tilingData->cubeBlockDimK * tilingData->cubeBlockDimM) {
+        if (first < end) {
             if ASCEND_IS_AIV {
                 SetFlag<HardEvent::MTE3_V>(static_cast<event_t>(0));
                 SetFlag<HardEvent::MTE3_V>(static_cast<event_t>(1));
             }
-            for (uint64_t roundIdx = 0; roundIdx < singleCoreRound; mGmOffset += tilingData->mL1Size, ++roundIdx)
-            {
+            for (uint64_t job = first; job < end; job += step) {
+                const uint64_t kPart = StableCoefficients ? job % kParts : cube % kParts;
+                const uint64_t mGmOffset = StableCoefficients ? (job / kParts) * tilingData->mL1Size :
+                                                                 legacyFirstRow + job * tilingData->mL1Size;
+                const uint64_t xGmBaseOffset = mGmOffset * tilingData->k + kPart * tilingData->multCoreSplitKSize;
                 uint64_t mL1RealSize = AscendC::Std::min(tilingData->bs - mGmOffset, (uint64_t)tilingData->mL1Size);
                 uint64_t kGmStartOffset = 0;
                 uint64_t kGmEndOffset = AscendC::Std::min(tilingData->multCoreSplitKSize,
-                    tilingData->k -  (curAicBlockIdx % tilingData->cubeBlockDimK) * tilingData->multCoreSplitKSize);
+                    tilingData->k -  kPart * tilingData->multCoreSplitKSize);
                 if ASCEND_IS_AIV {
                     if (GetBlockIdx() % 2 != 0) {
                         xSplitOffset = (mL1RealSize / 2) * tilingData->hcMult * tilingData->d;
@@ -132,17 +123,21 @@ public:
                         bool isFirstKL1 = kGmOffset == kGmStartOffset;
                         bool isLastKL1 = (kGmOffset + tilingData->kL1Size) >= kGmEndOffset;
                         mmService_.CopyInB1Nd2Nz(tilingData->hcMult * tilingData->d, kL1RealSize,
-                                                tilingData->hcMix, hcFnGm[kGmOffset + kBlkDimIdx * tilingData->multCoreSplitKSize],
+                                                tilingData->hcMix, hcFnGm[kGmOffset + kPart * tilingData->multCoreSplitKSize],
                                                 wL1_[mmService_.GetBL1BufferId() * L1_BUF_OFFSET]);
                         CrossCoreWaitFlag<SYNC_MODE4, PIPE_MTE1>(SYNC_AIV_AIC_FLAG + FLAG_ID_MAX);
                         CrossCoreWaitFlag<SYNC_MODE4, PIPE_MTE1>(SYNC_AIV_AIC_FLAG);
                         uint64_t mL1AlignSize = Align(mL1RealSize, AscendC::BLOCK_CUBE);
                         uint64_t nL1AlignSize = Align((uint64_t)tilingData->hcMix, AscendC::BLOCK_CUBE);
 
-                        mmService_.Process(tilingData->bs, tilingData->hcMix, mL1RealSize, (256 / AscendC::Std::max(mL1AlignSize, nL1AlignSize)) * 32,
+                        const uint64_t cubeM = StableCoefficients ? static_cast<uint64_t>(tilingData->mL1Size) : mL1AlignSize;
+                        const uint64_t baseK = (256 / AscendC::Std::max(cubeM, nL1AlignSize)) * 32;
+                        mmService_.Process(tilingData->bs, tilingData->hcMix, mL1RealSize, baseK,
                                         isFirstKL1, isLastKL1, xL1_[aL1BufferID_ * L1_BUF_OFFSET], wL1_[mmService_.GetBL1BufferId() * L1_BUF_OFFSET]);
                         if (isLastKL1) {
-                            mmService_.CopyOut(mmGm[mBlkDimIdx * tilingData->mL1Size * singleCoreMaxRound * tilingData->hcMix + kBlkDimIdx * tilingData->bs * tilingData->hcMix + roundIdx * tilingData->mL1Size]);
+                            const uint64_t tileOffset = StableCoefficients ? mGmOffset * tilingData->hcMix :
+                                legacyFirstRow * tilingData->hcMix + job * tilingData->mL1Size;
+                            mmService_.CopyOut(mmGm[kPart * tilingData->bs * tilingData->hcMix + tileOffset]);
                         }
                         CrossCoreSetFlag<SYNC_MODE4, PIPE_MTE1>(SYNC_AIC_AIV_FLAG); // 写出ub搬出，cv流水同步比较复杂，暂不讨论
                         CrossCoreSetFlag<SYNC_MODE4, PIPE_MTE1>(SYNC_AIC_AIV_FLAG + FLAG_ID_MAX);
@@ -161,7 +156,7 @@ public:
                         for (int64_t cvLoopIdx = 0; cvLoopIdx < cvLoopKSize; cvLoopIdx++) {
                             uint64_t kRealSize = (cvLoopIdx == cvLoopKSize - 1) ? kReminderSize : tilingData->kUbSize;
                             xLocal = xQue.template AllocTensor<T>();
-                            CopyIn(xGm[xGmBaseOffset + xSplitOffset + roundIdx * tilingData->mL1Size * tilingData->hcMult * tilingData->d + kGmOffset + cvLoopIdx * tilingData->kUbSize],
+                            CopyIn(xGm[xGmBaseOffset + xSplitOffset + kGmOffset + cvLoopIdx * tilingData->kUbSize],
                                 xLocal, curRowFactor, kRealSize, tilingData->hcMult * tilingData->d - kRealSize);
                             xQue.template EnQue(xLocal);
                             xLocal = xQue.template DeQue<T>();
@@ -200,10 +195,10 @@ public:
                     aL1BufferID_ ^= 1;
                 }
                 if ASCEND_IS_AIV {
-                    int64_t kBaseOffset = (GetBlockIdx() / 2) % tilingData->kBlockFactor * tilingData->bs;
+                    int64_t kBaseOffset = kPart * tilingData->bs;
                     rmsQue.template EnQue(rmsNormLocal);
                     rmsNormLocal = rmsQue.template DeQue<float>();
-                    CopyOut(rmsNormLocal, rmsGm[kBaseOffset + rmsGmBaseOffset + rmsSplitOffset + roundIdx * tilingData->mL1Size], 1, curRowFactor);
+                    CopyOut(rmsNormLocal, rmsGm[kBaseOffset + mGmOffset + rmsSplitOffset], 1, curRowFactor);
                     rmsQue.template FreeTensor(rmsNormLocal);
                 }
             }
