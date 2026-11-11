@@ -101,3 +101,9 @@ GPQA 两侧启动后先逐题调用服务的 `/tokenize`，核对全部输入 ID
 候选优先使用作者模型卡的 Instruct 条件复测 GPQA-Diamond 全部 198 题。开启思考，推理力度 100，temperature 1.0，top_p 0.95，每题独立采样一次。输出预算采用作者通用建议的 262,144 token。归档实际 HTTP 参数、逐题完整输入 ID、输出长度、结束原因和官方评分。修复滑窗寻址后，先用独立短提示检查调度页表与真实读取，再在关闭诊断的服务运行评测。[固定版本模型卡](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/314113f8a7dadb388215396ba5fbee2c610a04d6/README.md)
 
 作者条件的 GPQA 完成、归档后，在同一仓内 wheel 上按冻结的常规聊天模板启动独立服务。依次运行 262,128 和 1,048,560 个输入 token，各预留 16 个输出 token。每档包含冷请求、热前缀重放和自然停词检索，记录实际用量、返回的三个标记及八卡资源采样。
+
+### A5 融合算子接入
+
+在独立分支接入 HcPre、HcPost、MixedQuantSparseFlashMla、KvCompressEpilogV2、InplacePartialRotaryMul 和 TransposeQuantBatchMatMul。逐项核对目标和草稿网络的调用位置、分组量化与分页布局、实际设备执行和数值对照。涉及 ABI 扩展时保留 DSV4 现有调用。
+
+在指定的同一 0.27 A5 镜像，用普通服务入口、原始 checkpoint 和相同八卡并行配置分别启动基线和候选。沿用阶段二的 AISBench 四样例推理模板、官方测试集前 300 题、显示顺序、解码参数和评分器。记录正确数与逐题变化，候选通过现有门槛且正确数不低于本轮基线，再合回开发分支。
