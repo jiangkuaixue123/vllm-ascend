@@ -15,6 +15,7 @@ from vllm_ascend.models.deepseek_v41.compact_kv import (
 )
 from vllm_ascend.models.deepseek_v41.decode_state import PagedHistory
 from vllm_ascend.models.deepseek_v41.eager_kernels import _fp4_level, act_quant, power_of_two_scale
+from vllm_ascend.models.deepseek_v41.mixed_mla import mixed_mla, supports_mixed_mla
 from vllm_ascend.models.deepseek_v41.native_ops import grouped_output_projection
 from vllm_ascend.models.deepseek_v41.rotary import rotate_rows as _rotate
 
@@ -221,11 +222,19 @@ def _raw_window(state, count, context, window_size):
 
 
 def _sparse(q, window, compressed, win_ids, comp_ids, attn, raw_spans, cache_lut=None):
-    """HF 64-key online softmax, including the BF16 exponent rounding and sink logit."""
-    count, heads, dim = q.shape
-    result = torch.empty_like(q)
+    """Use CANN on compatible target inputs, with HF's 64-key online softmax as the reference."""
     observer = getattr(attn, "_window_observer", None)
     compressed_trace = getattr(attn, "_compressed_observer", None)
+    if (
+        q.device.type == "npu"
+        and observer is None
+        and compressed_trace is None
+        and cache_lut is not None
+        and supports_mixed_mla(q, attn.rope_head_dim)
+    ):
+        return mixed_mla(q, window, win_ids, compressed, comp_ids, attn.attn_sink, attn.softmax_scale, cache_lut)
+    count, heads, dim = q.shape
+    result = torch.empty_like(q)
     for start in range(0, count, 32):
         rows = slice(start, min(start + 32, count))
         w = win_ids[rows]

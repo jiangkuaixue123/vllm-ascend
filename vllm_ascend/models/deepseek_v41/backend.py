@@ -39,6 +39,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from .config import text_model_args
+from .mixed_mla import mixed_mla_from_bf16, supports_mixed_mla
 from .ngram import EngramLayout, NgramHashState
 from .native_ops import NativeGroupedOutputProjection, grouped_output_projection, native_hc_ops, use_grouped_mx_projection
 from .rotary import rotate_rows
@@ -536,12 +537,16 @@ class Attention(nn.Module):
         apply_rotary_emb(q, freqs_cis)
 
         kv, topk_idxs = self._window_kv(x, freqs_cis, start_pos)
+        window_columns = topk_idxs.size(-1)
         if self.compress_ratio:
             compress_kv, compress_idxs = self._compress_kv(x, qr, start_pos, kv.size(1))
             kv = torch.cat([kv, compress_kv], dim=1)
             topk_idxs = torch.cat([topk_idxs, compress_idxs], dim=-1)
 
-        o = sparse_attn(q, kv, self.attn_sink, topk_idxs, self.softmax_scale)
+        if supports_mixed_mla(q, self.rope_head_dim):
+            o = mixed_mla_from_bf16(q, kv, topk_idxs, window_columns, self.attn_sink, self.softmax_scale)
+        else:
+            o = sparse_attn(q, kv, self.attn_sink, topk_idxs, self.softmax_scale)
         apply_rotary_emb(o, freqs_cis, True)
 
         o = o.view(bsz, seqlen, self.n_local_groups, -1)
