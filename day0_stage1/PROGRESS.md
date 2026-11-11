@@ -2,7 +2,7 @@
 
 仓内发行包的阶段一八卡复验已完成。阶段二、三沿用本包和普通服务入口。[执行顺序](PLAN.md) · [标准入口与重放命令](patch/REPLAY.md)
 
-阶段三的 GPQA、64K 单请求检索、超限检查和同一 DP rank 的前缀并发验收均已完成。指定镜像的普通八卡服务在关闭和开启缓存时分别通过四组串行对照。两组并发各在 rank 0 的六个实际调度步中重叠，生成 token 与串行一致。另用四种长度的独立冷输入核对了单、双请求的完整输出。下一项是 256K 和 1M 的单请求冷、热及自然停词检索。[阶段三计划](PLAN.md#阶段三的服务与验收) · [并发对照](../day0_stage3/validator/prefix_overlap.py)
+阶段三的 GPQA、64K 单请求检索、超限检查和同一 DP rank 的前缀并发验收均已完成。指定镜像的普通八卡服务在关闭和开启缓存时分别通过四组串行对照。两组并发各在 rank 0 的六个实际调度步中重叠，生成 token 与串行一致。另用四种长度的独立冷输入核对了单、双请求的完整输出。256K 的冷定长与自然停词检索正确，热定长重复首个数字，仍需修复并复验。1M 单请求已开始冷预填充。[阶段三计划](PLAN.md#阶段三的服务与验收) · [并发对照](../day0_stage3/validator/prefix_overlap.py)
 
 | 日期 | 进展 | 对应材料 |
 | --- | --- | --- |
@@ -145,3 +145,4 @@
 | 2026-11-12 | 包含专家工作区修复的最终候选再次通过八卡缓存开、关及两组同 rank 并发对照。29 项模型回归和 9 项设备测试均通过。已用该 wheel 在同一普通服务向 rank 0 发出 262,128 个输入 token 的冷请求，预留 16 个输出 token。worker 已开始预填充，八卡 KV 及 HBM 同步采样中。 | [并发验收](../day0_stage3/validator/prefix_overlap.py) · [长请求验收](../day0_stage3/validator/context_probe.py) |
 | 2026-11-12 | 256K 冷请求的 rank 0 预填充已达到 132,048 / 262,128 个实际输入位置，累计采得 445 组完整八卡观测。服务继续处理同一请求。 | [长请求检查](../day0_stage3/validator/context_probe.py) · [资源采样](../day0_stage3/validator/sample_memory.py) |
 | 2026-11-12 | 首次完整 256K 三次服务实测均返回 HTTP 200。冷定长生成 16 个 token 并正确检索，热定长命中 262,016 个 token，生成的 16 个 token 为三个正确数字后又重复 73，未通过原检索判据。自然停词命中相同前缀，8 个 token 按序答出 73、41、86。三次分别保留 1,051、6、5 组完整八卡采样。同一候选的 4K 冷热固定输出全部相同，16K 在第 9 个 token 也能复现分歧，正在用于逐层定位。 | [长请求核对](../day0_stage3/validator/compare_context.py) · [原始判据](../day0_stage3/validator/context_probe.py) |
+| 2026-11-12 | 专家激活编码的显存修复已合入开发分支。对 16K 输入做两组独立的冷、热定长重放，两组第 9 步的输入及五个草稿相同。第一组输出 token 相同而目标 logits 不同，第二组冷、热各自的首选非 EOS token 也不同。1M 已用相同 wheel 与配置重新启动普通八卡服务，向 rank 0 发送 1,048,560 个输入 token 的单请求，观察到实际预填充与八卡采样。 | [专家激活](../vllm_ascend/models/deepseek_v41/weighted_experts.py) · [目标 logits](../vllm_ascend/models/deepseek_v41/overlap_logits.py) · [长请求检查](../day0_stage3/validator/context_probe.py) |
