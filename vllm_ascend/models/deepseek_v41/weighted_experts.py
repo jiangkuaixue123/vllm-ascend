@@ -131,7 +131,7 @@ class V41SharedActivation(nn.Module):
         return _quantize(self(gate_up))
 
 
-def _project(activation, scales, weight, weight_scales, group_list, group_list_type):
+def _grouped_matmul(activation, scales, weight, weight_scales, group_list, group_list_type):
     return torch_npu.npu_grouped_matmul(
         x=[activation],
         weight=[weight],
@@ -146,6 +146,10 @@ def _project(activation, scales, weight, weight_scales, group_list, group_list_t
         split_item=2,
         output_dtype=torch.bfloat16,
     )[0]
+
+
+def _project(activation, scales, weight, weight_scales, dispatch):
+    return _grouped_matmul(activation, scales, weight, weight_scales, dispatch.group_list, dispatch.group_list_type)
 
 
 class V41FP4Experts(AscendW4A8MXFPDSDynamicFusedMoEMethod):
@@ -180,20 +184,21 @@ class V41FP4Experts(AscendW4A8MXFPDSDynamicFusedMoEMethod):
         weights, combine = _route_weights(dispatch, comm.token_dispatcher)
         group_list, group_list_type = dispatch.group_list, dispatch.group_list_type
         activation, scales = dispatch.hidden_states, dispatch.dynamic_scale
-        del dispatch
         if scales is None:
             activation, scales = _quantize(activation)
         scales = scales.reshape(activation.shape[0], activation.shape[1] // 64, 2)
         # Each tensor here has a row for every expert assignment received by
         # this rank. The reverse all-to-all needs another full BF16 matrix.
-        gate_up = _project(activation, scales, layer.w13_weight, layer.w13_weight_scale, group_list, group_list_type)
-        del activation, scales
+        gate_up = _project(activation, scales, layer.w13_weight, layer.w13_weight_scale, dispatch)
+        del dispatch, activation, scales
         origin = _swiglu_origin(gate_up, weights, comm.moe_config.swiglu_limit)
         del gate_up, weights
         activation, scales = _quantize(origin)
         del origin
         before_gmm2 = stream.record_event()
-        output = _project(activation, scales, layer.w2_weight, layer.w2_weight_scale, group_list, group_list_type)
+        output = _grouped_matmul(
+            activation, scales, layer.w2_weight, layer.w2_weight_scale, group_list, group_list_type
+        )
         del activation, scales
         before_combine = stream.record_event()
         routed_out = comm.token_dispatcher.token_combine(hidden_states=output, combine_metadata=combine)
