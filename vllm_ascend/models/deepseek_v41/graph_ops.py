@@ -5,15 +5,19 @@ from importlib.util import find_spec
 
 import torch
 
-from vllm_ascend.models.deepseek_v41.backend import apply_rotary_emb
-from vllm_ascend.models.deepseek_v41.compact_kv import cache_row_bytes, pack_fp4, pack_window, unpack_fp4, unpack_window
+from vllm_ascend.models.deepseek_v41.compact_kv import (
+    CacheEncoding,
+    cache_row_bytes,
+    pack_window,
+    store_compact_kv,
+    unpack_fp4,
+    unpack_window,
+)
 from vllm_ascend.models.deepseek_v41.decode_state import PagedHistory
 from vllm_ascend.models.deepseek_v41.eager_kernels import _fp4_level, act_quant, power_of_two_scale
-
-
-def _rotate(x, freq, dim, inverse=False):
-    apply_rotary_emb(x[..., -dim:].unsqueeze(0), freq, inverse)
-    return x
+from vllm_ascend.models.deepseek_v41.mixed_mla import mixed_mla, supports_mixed_mla
+from vllm_ascend.models.deepseek_v41.native_ops import grouped_output_projection
+from vllm_ascend.models.deepseek_v41.rotary import rotate_rows as _rotate
 
 
 def _fp4(x, lut, width=32, e4scale=False):
@@ -94,19 +98,16 @@ def _store_source(attn, x, state, pages):
     trace_write = observer is not None and observer.captures(count)
     if trace_write:
         observer.tap("index_write_input", key)
-    index_data = pack_fp4(key, 32, False)
-    pages.index.index_copy_(0, dest, index_data)
+    store_compact_kv(pages.index, key, dest, CacheEncoding.INDEX_MXFP4)
     if trace_write:
-        observer.tap("index_write_data", index_data)
+        observer.tap("index_write_data", pages.index.index_select(0, dest))
         observer.tap("compressed_write_slots", dest)
-    del index_data
     _rotate(latent, freq, attn.rope_head_dim)
     if trace_write:
         observer.tap("compressed_write_input", latent)
-    compressed_data = pack_fp4(latent, 16, True)
-    pages.compressed.index_copy_(0, dest, compressed_data)
+    store_compact_kv(pages.compressed, latent, dest, CacheEncoding.COMPRESSED_E4_FP4)
     if trace_write:
-        observer.tap("compressed_write_data", compressed_data)
+        observer.tap("compressed_write_data", pages.compressed.index_select(0, dest))
 
 
 def _candidate_blocks(score, lengths, limit, block_size):
@@ -221,11 +222,19 @@ def _raw_window(state, count, context, window_size):
 
 
 def _sparse(q, window, compressed, win_ids, comp_ids, attn, raw_spans, cache_lut=None):
-    """HF 64-key online softmax, including the BF16 exponent rounding and sink logit."""
-    count, heads, dim = q.shape
-    result = torch.empty_like(q)
+    """Use CANN on compatible target inputs, with HF's 64-key online softmax as the reference."""
     observer = getattr(attn, "_window_observer", None)
     compressed_trace = getattr(attn, "_compressed_observer", None)
+    if (
+        q.device.type == "npu"
+        and observer is None
+        and compressed_trace is None
+        and cache_lut is not None
+        and supports_mixed_mla(q, attn.rope_head_dim)
+    ):
+        return mixed_mla(q, window, win_ids, compressed, comp_ids, attn.attn_sink, attn.softmax_scale, cache_lut)
+    count, heads, dim = q.shape
+    result = torch.empty_like(q)
     for start in range(0, count, 32):
         rows = slice(start, min(start + 32, count))
         w = win_ids[rows]
@@ -290,12 +299,11 @@ def paged_attention(attn, x, state, pages, shared, context):
     q = attn.wq_b(qr).unflatten(-1, (attn.n_local_heads, attn.head_dim))
     _rotate(q, freq, attn.rope_head_dim)
     kv = _rotate(attn.kv_norm(attn.wkv(x)), freq, attn.rope_head_dim)
-    packed = pack_window(kv)
-    pages.window.index_copy_(0, state.slots[:count], packed)
+    slots = state.slots[:count]
+    store_compact_kv(pages.window, kv, slots, CacheEncoding.WINDOW_MXFP8)
     observer = getattr(attn, "_window_observer", None)
     if observer is not None:
-        observer.projections(attn.layer_id, q, kv, packed, state.slots[:count], pages.window)
-    del packed
+        observer.projections(attn.layer_id, q, kv, pack_window(kv), slots, pages.window)
     win_ids, raw_spans = _raw_window(state, count, context, attn.window_size)
     compressed_trace = getattr(attn, "_compressed_observer", None)
     if compressed_trace is not None and compressed_trace.captures(count):
@@ -327,13 +335,14 @@ def paged_attention(attn, x, state, pages, shared, context):
         observer.tap(attn.layer_id, "sparse_output", out)
     _rotate(out, freq, attn.rope_head_dim, True)
     out = out.reshape(count, attn.n_local_groups, -1)
-    act_quant(out, 32, inplace=True)
-    if compressed_trace is not None and compressed_trace.captures(count):
-        compressed_trace.tap("wo_a_input", out)
-    if observer is not None:
-        observer.tap(attn.layer_id, "wo_a_input", out)
-    wo_a = attn.wo_a.weight.view(attn.n_local_groups, attn.o_lora_rank, -1)
-    out = torch.einsum("tgd,grd->tgr", out, wo_a)
+    trace_input = compressed_trace is not None and compressed_trace.captures(count)
+    if trace_input or observer is not None:
+        traced = act_quant(out.clone(), 32, inplace=True)
+        if trace_input:
+            compressed_trace.tap("wo_a_input", traced)
+        if observer is not None:
+            observer.tap(attn.layer_id, "wo_a_input", traced)
+    out = grouped_output_projection(out, attn.wo_a)
     if compressed_trace is not None and compressed_trace.captures(count):
         compressed_trace.tap("wo_a_output", out)
     if observer is not None:

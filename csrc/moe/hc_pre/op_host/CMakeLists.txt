@@ -8,6 +8,8 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # ----------------------------------------------------------------------------
 
+set(hc_pre_track_kernel_inputs TRUE CACHE INTERNAL "Rebuild binary variants when staged source changes")
+
 # add_ops_compile_options(
 #         OP_NAME HcPre
 #         OPTIONS --cce-auto-sync=off

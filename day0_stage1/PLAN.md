@@ -101,3 +101,14 @@ GPQA 两侧启动后先逐题调用服务的 `/tokenize`，核对全部输入 ID
 候选优先使用作者模型卡的 Instruct 条件复测 GPQA-Diamond 全部 198 题。开启思考，推理力度 100，temperature 1.0，top_p 0.95，每题独立采样一次。输出预算采用作者通用建议的 262,144 token。归档实际 HTTP 参数、逐题完整输入 ID、输出长度、结束原因和官方评分。修复滑窗寻址后，先用独立短提示检查调度页表与真实读取，再在关闭诊断的服务运行评测。[固定版本模型卡](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/314113f8a7dadb388215396ba5fbee2c610a04d6/README.md)
 
 作者条件的 GPQA 完成、归档后，在同一仓内 wheel 上按冻结的常规聊天模板启动独立服务。依次运行 262,128 和 1,048,560 个输入 token，各预留 16 个输出 token。每档包含冷请求、热前缀重放和自然停词检索，记录实际用量、返回的三个标记及八卡资源采样。
+
+### A5 融合算子接入
+
+在独立分支接入 HcPre、HcPost、MixedQuantSparseFlashMla、KvCompressEpilogV2、InplacePartialRotaryMul 和 TransposeQuantBatchMatMul。逐项核对目标和草稿网络的调用位置、分组量化与分页布局、实际设备执行和数值对照。涉及 ABI 扩展时保留 DSV4 现有调用。
+
+在指定的同一 0.27 A5 镜像，用普通服务入口、原始 checkpoint 和相同八卡并行配置分别启动基线和候选。沿用阶段二的 AISBench 四样例推理模板、官方测试集前 300 题、显示顺序、解码参数和评分器。记录正确数与逐题变化，候选通过现有门槛且正确数不低于本轮基线，再合回开发分支。
+
+取得两轮 AISBench 原始目录后，用同一组 gates、输入清单和 AISBench 源码复核两轮官方评分，并按实际请求哈希配对。输出包含两轮正确数与准确率、逐题正确性发生变化的索引，以及是否达到本轮合并条件。[逐题对照工具](../day0_stage2/validator/compare_gsm8k.py)
+
+- HcPre 返回 V4.1 下一子层使用的 FP32 pre 门值，HcPost 对当前子层输出做残差混合。旧 HcPre 调用沿用原输出。目标和草稿的 RoPE 仅旋转 head 末尾 64 维，分组输出投影直接使用 checkpoint 的 E4M3 权重与每 32 元素的 E8M0 尺度。[模型接线](../vllm_ascend/models/deepseek_v41/backend.py) · [分组投影](../vllm_ascend/models/deepseek_v41/native_ops.py)
+- KvCompressEpilogV2 按物理槽写入原始窗口、压缩 KV 和索引缓存，也可写入 Mixed reader 所需的 584 字节分面页。A5 镜像里的 SparseFlashMlaMetadata 提供兼容的调度数据，注意力由 MixedQuantSparseFlashMla 主算子计算。稀疏键的页面转换包含一次额外的 FP8 量化，数值对照覆盖该舍入。[缓存接口](../vllm_ascend/models/deepseek_v41/compact_kv.py) · [稀疏注意力](../vllm_ascend/models/deepseek_v41/mixed_mla.py)

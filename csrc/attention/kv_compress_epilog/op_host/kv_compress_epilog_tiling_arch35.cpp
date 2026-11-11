@@ -15,6 +15,7 @@
 
 #include <sstream>
 #include "kv_compress_epilog_tiling_arch35.h"
+#include "kv_compress_row_partition.h"
 
 using namespace ge;
 
@@ -191,9 +192,10 @@ ge::graphStatus KvCompressEpilogTiling::ValidateDtypes()
 
 ge::graphStatus KvCompressEpilogTiling::DoOpTiling()
 {
-    rowOfFormerBlock_ = CeilDiv(bs_, static_cast<int64_t>(coreNum_));
-    usedCoreNums_ = std::min(CeilDiv(bs_, rowOfFormerBlock_), static_cast<int64_t>(coreNum_));
-    rowOfTailBlock_ = bs_ - (usedCoreNums_ - 1) * rowOfFormerBlock_;
+    const auto partition = PartitionKvCompressRows(bs_, static_cast<int64_t>(coreNum_));
+    rowOfFormerBlock_ = partition.perCore;
+    usedCoreNums_ = partition.usedCores;
+    rowOfTailBlock_ = partition.lastCore;
 
     if (quantMode_ == QUANT_MDOE_GROUP_MXFP8) {
         OPS_ERR_IF(quantGroupSize_ != 64 && quantGroupSize_ != 128,

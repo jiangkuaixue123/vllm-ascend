@@ -7,7 +7,7 @@ from importlib import import_module
 import torch
 from torch import nn
 
-from vllm_ascend.models.deepseek_v41.eager_kernels import quantize_fp8_blocks
+from vllm_ascend.models.deepseek_v41.eager_kernels import act_quant, quantize_fp8_blocks
 
 
 @cache
@@ -17,6 +17,18 @@ def initialize_native_ops():
 
     bootstrap_custom_op_env()
     import_module("vllm_ascend.vllm_ascend_C")
+
+
+def native_hc_ops(residual):
+    if residual.device.type != "npu" or residual.dtype != torch.bfloat16 or residual.shape[-2:] != (4, 5120):
+        return None
+    # The standalone CPU oracle does not initialize the installed device package.
+    from vllm_ascend.device.device_config import get_device_config
+
+    if not get_device_config().supports_hc_pre_coefficients:
+        return None
+    initialize_native_ops()
+    return torch.ops._C_ascend
 
 
 def hash_route(logits, bias, *, top_k, temperature=1.0, route_scale=1.5):
@@ -51,6 +63,67 @@ class NativeRMSNorm(nn.Module):
 
     def forward(self, x):
         return rms_norm(x, self.weight, self.eps)
+
+
+class NativeGroupedOutputProjection(nn.Module):
+    """Block-diagonal wo_a with the checkpoint's E4M3 weights and per-32 UE8M0 scales."""
+
+    def __init__(self, groups, rank, width):
+        super().__init__()
+        self.groups, self.rank, self.width = groups, rank, width
+        self.weight = nn.Parameter(torch.empty(groups * rank, width, dtype=torch.float8_e4m3fn), requires_grad=False)
+        self.scale = nn.Parameter(torch.empty(groups * rank // 32, width // 32, dtype=torch.uint8), requires_grad=False)
+        self.register_buffer("paired_weight_scale", None, persistent=False)
+
+    @torch.no_grad()
+    def pack_after_loading(self):
+        # The strict loader writes canonical [group * rank, K] rows each time.
+        # Reuse that parameter's storage for the kernel's contiguous [group, K, rank].
+        weight = self.weight.view(self.groups, self.rank, self.width).transpose(1, 2).contiguous()
+        self.weight.copy_(weight.reshape_as(self.weight))
+        scale = self.scale.repeat_interleave(32, dim=0).view(self.groups, self.rank, self.width // 64, 2)
+        self.paired_weight_scale = scale.transpose(1, 2).contiguous().view(torch.float8_e8m0fnu)
+
+    def forward(self, x):
+        import torch_npu
+
+        flat = x.reshape(-1, self.groups, self.width)
+        quant, _, raw = quantize_fp8_blocks(flat)
+        activation_scale = raw.reshape(flat.size(0), self.groups, self.width // 64, 2)
+        out = torch_npu.npu_transpose_quant_batchmatmul(
+            quant,
+            self.weight.view(self.groups, self.width, self.rank),
+            dtype=torch.bfloat16,
+            x1_scale=activation_scale.view(torch.float8_e8m0fnu),
+            x2_scale=self.paired_weight_scale,
+            group_sizes=(0, 0, 32),
+            perm_x1=(1, 0, 2),
+            perm_x2=(0, 1, 2),
+            perm_y=(1, 0, 2),
+        )
+        return out.reshape(*x.shape[:-1], self.rank)
+
+
+def use_grouped_mx_projection(device, width, rank):
+    if device.type != "npu" or width % 64 or rank % 32:
+        return False
+    from vllm_ascend.device.device_config import get_device_config
+
+    return get_device_config().supports_grouped_mx_output_projection
+
+
+def pack_grouped_output_weights(model):
+    for layer in model.modules():
+        if isinstance(layer, NativeGroupedOutputProjection):
+            layer.pack_after_loading()
+
+
+def grouped_output_projection(x, projection):
+    if isinstance(projection, NativeGroupedOutputProjection):
+        return projection(x)
+    act_quant(x, inplace=True)
+    weight = projection.weight.view(x.size(-2), -1, x.size(-1))
+    return torch.einsum("...gk,grk->...gr", x, weight)
 
 
 def quantize_activation(x):
@@ -100,9 +173,11 @@ def replace_native_leaves(module, *, prefix="", sites=None):
         sites = {}
     for name, child in list(module.named_children()):
         path = f"{prefix}.{name}" if prefix else name
-        if isinstance(child, (NativeMXLinear, NativeRMSNorm)):
+        if isinstance(child, NativeGroupedOutputProjection):
+            sites[path] = "npu::npu_transpose_quant_batchmatmul"
+        elif isinstance(child, (NativeMXLinear, NativeRMSNorm)):
             continue
-        if isinstance(child, RMSNorm):
+        elif isinstance(child, RMSNorm):
             setattr(module, name, NativeRMSNorm(child))
             sites[path] = "npu::npu_rms_norm"
         elif isinstance(child, Linear) and child.scale is not None:

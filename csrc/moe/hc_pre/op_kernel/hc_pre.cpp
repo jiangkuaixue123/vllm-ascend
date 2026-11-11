@@ -56,14 +56,14 @@ extern "C" __global__ __aicore__ void hc_pre(GM_ADDR x, GM_ADDR hc_fn, GM_ADDR h
             pipe.Destroy();
 
             TPipe pipeStage2;
-            HcPreNs::HcPreMKSplitCorePart2<DTYPE_X> op2;
+            HcPreNs::HcPreMKSplitCorePart2<DTYPE_X, DTYPE_Y> op2;
             op2.Init(x, hc_scale, hc_base, y, post, comb_frag, userWs, tilingData, &pipeStage2);
             op2.Process();
             pipeStage2.Destroy();
         } else if (TILING_KEY_IS(1001)) {
             GET_TILING_DATA_WITH_STRUCT(HcPreTilingData, tiling_data_in, tiling);
             const HcPreTilingData *__restrict tilingData = &tiling_data_in;
-            HcPreNs::HcPreMSplitCorePart1<DTYPE_X> op;
+            HcPreNs::HcPreMSplitCorePart1<DTYPE_X, DTYPE_Y> op;
             op.Init(x, hc_fn, hc_scale, hc_base, y, post, comb_frag, tilingData, &pipe);
             op.Process();
         }

@@ -4,7 +4,15 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vllm_ascend.models.deepseek_v41.compact_kv import pack_fp4, pack_window, unpack_fp4, unpack_window
+from vllm_ascend.models.deepseek_v41.compact_kv import (
+    CacheEncoding,
+    pack_fp4,
+    pack_window,
+    store_compact_kv,
+    store_mixed_kv,
+    unpack_fp4,
+    unpack_window,
+)
 from vllm_ascend.models.deepseek_v41.eager_kernels import act_quant
 from vllm_ascend.models.deepseek_v41.graph_ops import LayerPages, _fp4
 
@@ -41,3 +49,44 @@ def test_raw_page_and_planner_match_physical_storage():
     assert sum(buf.numel() * buf.element_size() for buf in vars(pages).values()) == LayerPages.bytes_per_block(
         config, 128
     )
+
+
+@pytest.mark.parametrize(
+    "encoding,dim",
+    [(CacheEncoding.WINDOW_MXFP8, 512), (CacheEncoding.COMPRESSED_E4_FP4, 512), (CacheEncoding.INDEX_MXFP4, 128)],
+)
+def test_compact_store_uses_row_slots_and_preserves_guards(encoding, dim):
+    x = torch.randn((6, dim), generator=torch.Generator().manual_seed(79)).bfloat16()
+    if encoding == CacheEncoding.WINDOW_MXFP8:
+        packed = pack_window(x)
+    else:
+        e4 = encoding == CacheEncoding.COMPRESSED_E4_FP4
+        packed = pack_fp4(x, 16 if e4 else 32, e4)
+    slots = torch.tensor([9, 3, -1, 7, 14, 1])
+    cache = torch.full((12, packed.size(1)), 0xA5, dtype=torch.uint8)
+    expected = cache.clone()
+    expected[slots[[0, 1, 3, 5]]] = packed[[0, 1, 3, 5]]
+    store_compact_kv(cache, x, slots, encoding)
+    assert torch.equal(cache, expected)
+
+
+@pytest.mark.parametrize("dtype", [torch.uint8, torch.float8_e4m3fn])
+def test_mixed_store_uses_versioned_writer_and_original_storage(monkeypatch, dtype):
+    cache = torch.empty((2, 128, 1, 584), dtype=dtype)
+    x = torch.arange(512 * 3).to(torch.bfloat16).view(512, 3).T
+    slots = torch.tensor([0, 19, 127, 17, 128, 37])[::2]
+    calls = []
+
+    def writer(bank, values, indices, mode):
+        assert bank.shape == (256, 584) and bank.dtype == torch.uint8
+        assert bank.data_ptr() == cache.data_ptr() and bank.is_contiguous()
+        assert values.is_contiguous() and indices.is_contiguous()
+        assert torch.equal(values.view(torch.int16), x.contiguous().view(torch.int16))
+        assert torch.equal(indices, slots)
+        calls.append(mode)
+
+    monkeypatch.setattr(torch.ops._C_ascend, "kv_compress_epilog_v2", writer, raising=False)
+    store_mixed_kv(cache, x, slots)
+    assert calls == [3]
+    with pytest.raises(ValueError, match="128"):
+        store_mixed_kv(cache[:, :64].contiguous(), x, slots)

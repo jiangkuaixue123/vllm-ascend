@@ -152,6 +152,20 @@ ge::graphStatus HcPreTilingRegbase::GetShapeAttrsInfoInner()
         d_ = xShape->GetStorageShape().GetDim(3);
     }
 
+    auto firstShape = context_->GetOutputShape(0);
+    auto firstDesc = context_->GetOutputDesc(0);
+    OPS_LOG_E_IF_NULL(context_, firstShape, return ge::GRAPH_FAILED);
+    OPS_LOG_E_IF_NULL(context_, firstDesc, return ge::GRAPH_FAILED);
+    const auto &out = firstShape->GetStorageShape();
+    const bool returnPre = firstDesc->GetDataType() == ge::DT_FLOAT;
+    OPS_ERR_IF(out.GetDimNum() + 1 != xDimNum || out.GetDim(xDimNum - 2) != (returnPre ? hcMult_ : d_),
+               OPS_LOG_E(context_->GetNodeName(), "Unexpected HcPre first output shape."), return ge::GRAPH_FAILED);
+    for (size_t i = 0; i + 2 < xDimNum; ++i) {
+        OPS_ERR_IF(out.GetDim(i) != xShape->GetStorageShape().GetDim(i),
+                   OPS_LOG_E(context_->GetNodeName(), "HcPre output and input leading dimensions differ."),
+                   return ge::GRAPH_FAILED);
+    }
+
     auto shapeHcFn = context_->GetInputShape(1);
     hcMix_ = shapeHcFn->GetStorageShape().GetDim(0);
     OPS_ERR_IF(shapeHcFn->GetStorageShape().GetDim(1) != d_ * hcMult_,

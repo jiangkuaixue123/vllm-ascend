@@ -25,6 +25,24 @@ class DeviceConfig:
 
     _device_type: AscendDeviceType
 
+    @property
+    def supports_hc_pre_coefficients(self) -> bool:
+        """The A5 HcPre kernel can return the FP32 gate for the next sublayer."""
+        return self._device_type == AscendDeviceType.A5
+
+    @property
+    def supports_compact_kv_epilog(self) -> bool:
+        """Native writer for full post-RoPE MXFP8 and E2M1 cache rows."""
+        return self._device_type == AscendDeviceType.A5
+
+    @property
+    def supports_grouped_mx_output_projection(self) -> bool:
+        return self._device_type == AscendDeviceType.A5
+
+    @property
+    def supports_mixed_quant_sparse_mla(self) -> bool:
+        return self._device_type == AscendDeviceType.A5
+
 
 def _device_type_from_build_info() -> AscendDeviceType:
     from vllm_ascend import _build_info  # type: ignore

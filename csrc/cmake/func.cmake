@@ -418,18 +418,27 @@ function(add_ops_src_copy)
 
     if (NOT TARGET ${DOING_TARGET_NAME})
         set(_BUILD_FLAG ${SRC_COPY_DST}/${DOING_TARGET_NAME}.done)
+        set(_kernel_inputs)
+        if (${CUR_NAME}_track_kernel_inputs)
+            file(GLOB_RECURSE _kernel_inputs CONFIGURE_DEPENDS LIST_DIRECTORIES FALSE "${SRC_COPY_SRC}/op_kernel/*")
+            # A new stamp also invalidates trees copied before source tracking was enabled.
+            set(_BUILD_FLAG ${SRC_COPY_DST}/${DOING_TARGET_NAME}_tracked.done)
+            set_property(GLOBAL PROPERTY ${DOING_TARGET_NAME}_tracked_stamp "${_BUILD_FLAG}")
+        endif()
         if (NOT BUILD_OPS_RTY_KERNEL AND BELONG_MC2_OPS)
             add_custom_command(OUTPUT ${_BUILD_FLAG}
                     COMMAND mkdir -p ${SRC_COPY_DST}
                     COMMAND cp -rf ${SRC_FILES} ${SRC_COPY_DST}
                     COMMAND rm -rf ${SRC_COPY_DST}/op_kernel/
                     COMMAND touch ${_BUILD_FLAG}
+                    DEPENDS ${_kernel_inputs}
             )
         else()
             add_custom_command(OUTPUT ${_BUILD_FLAG}
                     COMMAND mkdir -p ${SRC_COPY_DST}
                     COMMAND cp -rf ${SRC_FILES} ${SRC_COPY_DST}
                     COMMAND touch ${_BUILD_FLAG}
+                    DEPENDS ${_kernel_inputs}
             )
         endif()
 
@@ -619,9 +628,20 @@ function(add_bin_compile_target)
                 list(APPEND _BUILD_COMMAND && echo $(MAKE))
             endif()
 
+            # Target-order dependencies below make staging run first. Link
+            # the stamp as a file as well so an already compiled ELF is rebuilt.
+            get_property(_source_stamps GLOBAL PROPERTY ${OP_TARGET_NAME}_src_copy_tracked_stamp)
+            foreach(_dep IN LISTS ${op_file}_depends)
+                get_filename_component(_dep_name "${_dep}" NAME)
+                get_property(_dep_stamp GLOBAL PROPERTY ${_dep_name}_${BINARY_COMPUTE_UNIT}_src_copy_tracked_stamp)
+                if (_dep_stamp)
+                    list(APPEND _source_stamps "${_dep_stamp}")
+                endif()
+            endforeach()
             add_custom_command(OUTPUT ${_BUILD_FLAG}
                     COMMAND ${_BUILD_COMMAND}
                     COMMAND touch ${_BUILD_FLAG}
+                    DEPENDS ${_source_stamps}
                     WORKING_DIRECTORY ${GEN_OUT_DIR}
             )
 

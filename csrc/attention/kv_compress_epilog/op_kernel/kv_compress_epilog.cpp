@@ -46,7 +46,8 @@ extern "C" __global__ __aicore__ void kv_compress_epilog(
 
     // Dispatch based on tiling key
     if (TILING_KEY_IS(0)) {
-        KvCompressEpilogOps::KvCompressEpilogRegBase<DTYPE_X, DTYPE_SLOT_MAPPING, DTYPE_KV_COMPRESS_CACHE> op(&pipe);
+        KvCompressEpilogOps::KvCompressEpilogRegBase<DTYPE_X, DTYPE_SLOT_MAPPING, DTYPE_KV_COMPRESS_CACHE,
+                                                KvCompressEpilogTilingData, void> op(&pipe);
         op.Init(x, slot_mapping, kv_compress_cache, tilingData);
         op.Process();
     }
