@@ -1,12 +1,61 @@
 # SPDX-License-Identifier: Apache-2.0
 """CPU address/selection oracle for the CANN V4.1 adapter; native numerics use the A5 validator."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
 from vllm_ascend.models.deepseek_v41 import mixed_mla as native
 from vllm_ascend.models.deepseek_v41.compact_kv import pack_fp4, pack_window, unpack_fp4, unpack_window
 from vllm_ascend.models.deepseek_v41.decode_state import DecodeInputs, PagedHistory
+
+
+def test_a5_selects_registered_mixed_ops_without_generic_custom_op_capability(monkeypatch):
+    from vllm_ascend.device import device_config
+    from vllm_ascend.device.hardware import AscendDeviceType, device_type_from_runtime_soc, device_type_from_soc_version
+    from vllm_ascend.device.hardware_profile import HardwareCapability, get_hardware_profile
+    from vllm_ascend.models.deepseek_v41 import compact_kv, native_ops
+
+    a5 = AscendDeviceType.A5
+    assert device_type_from_runtime_soc(260) == a5
+    for name in ("Ascend950DT_9574", "ascend950dt_9582", "Ascend950"):
+        assert device_type_from_soc_version(name) == a5
+    assert not get_hardware_profile(a5).supports(HardwareCapability.RUNTIME_CUSTOM_OPS)
+    monkeypatch.setattr(device_config, "get_device_config", lambda: device_config.DeviceConfig(a5))
+    calls = []
+    monkeypatch.setattr(native_ops, "initialize_native_ops", lambda: calls.append("extension"))
+    monkeypatch.setattr(native, "import_module", calls.append)
+
+    def packet(name):
+        return SimpleNamespace(default=SimpleNamespace(_schema=torch._C.parse_schema(f"{name}(Tensor x) -> Tensor")))
+
+    meta = packet("cann_ops_transformer::mixed_quant_sparse_flash_mla_metadata")
+    main = packet("cann_ops_transformer::mixed_quant_sparse_flash_mla")
+    writer = SimpleNamespace(kv_compress_epilog=packet("_C_ascend::kv_compress_epilog"))
+    cann = SimpleNamespace(mixed_quant_sparse_flash_mla_metadata=meta, mixed_quant_sparse_flash_mla=main)
+    monkeypatch.setattr(torch.ops, "cann_ops_transformer", cann)
+    monkeypatch.setattr(torch.ops, "_C_ascend", writer)
+
+    class Device:
+        type = "npu"
+
+    q = SimpleNamespace(device=Device(), dtype=torch.bfloat16, shape=(6, 64, 512))
+    native._operators.cache_clear()
+    try:
+        assert native.supports_mixed_mla(q, 64)
+        assert native._operators(q.device) == (meta.default, main.default, compact_kv.store_mixed_kv)
+        assert calls == ["extension", "cann_ops_transformer"]
+        del writer.kv_compress_epilog
+        native._operators.cache_clear()
+        assert not native.supports_mixed_mla(q, 64)
+        monkeypatch.setattr(device_config, "get_device_config", lambda: device_config.DeviceConfig(AscendDeviceType.A3))
+        native._operators.cache_clear()
+        calls.clear()
+        assert not native.supports_mixed_mla(q, 64)
+        assert not calls
+    finally:
+        native._operators.cache_clear()
 
 
 class ScratchReference:

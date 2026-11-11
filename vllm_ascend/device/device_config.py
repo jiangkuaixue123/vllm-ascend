@@ -39,6 +39,10 @@ class DeviceConfig:
     def supports_grouped_mx_output_projection(self) -> bool:
         return self._device_type == AscendDeviceType.A5
 
+    @property
+    def supports_mixed_quant_sparse_mla(self) -> bool:
+        return self._device_type == AscendDeviceType.A5
+
 
 def _device_type_from_build_info() -> AscendDeviceType:
     from vllm_ascend import _build_info  # type: ignore

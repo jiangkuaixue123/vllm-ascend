@@ -17,17 +17,26 @@ QUERY_TILE = 16
 
 @cache
 def _operators(device):
-    if not torch.npu.get_device_name(device).startswith("Ascend950DT"):
+    from vllm_ascend.device.device_config import get_device_config
+
+    from .native_ops import initialize_native_ops
+
+    if not get_device_config().supports_mixed_quant_sparse_mla:
         return None
     try:
+        initialize_native_ops()
         import_module("cann_ops_transformer")
         namespace = torch.ops.cann_ops_transformer
-        metadata, attention = namespace.mixed_quant_sparse_flash_mla_metadata, namespace.mixed_quant_sparse_flash_mla
+        metadata = namespace.mixed_quant_sparse_flash_mla_metadata.default
+        attention = namespace.mixed_quant_sparse_flash_mla.default
+        writer = torch.ops._C_ascend.kv_compress_epilog.default
     except (ImportError, AttributeError):
         return None
-    from vllm_ascend.utils import enable_custom_op
-
-    if not enable_custom_op() or not hasattr(torch.ops._C_ascend, "kv_compress_epilog"):
+    if (metadata._schema.name, attention._schema.name, writer._schema.name) != (
+        "cann_ops_transformer::mixed_quant_sparse_flash_mla_metadata",
+        "cann_ops_transformer::mixed_quant_sparse_flash_mla",
+        "_C_ascend::kv_compress_epilog",
+    ):
         return None
     from .compact_kv import store_mixed_kv
 
