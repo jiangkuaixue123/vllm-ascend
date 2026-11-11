@@ -104,7 +104,7 @@ GPQA 两侧启动后先逐题调用服务的 `/tokenize`，核对全部输入 ID
 
 前缀缓存的八卡验收已完成。四组串行输入在缓存开关两侧均符合命中和输出预期。混合命中与未命中、两条均命中的并发输入均取得真实同一步调度记录并与串行输出逐 token 相同。四种冷提示长度的单、双请求也已逐题配对，并复验了页复用、Engram 历史以及 DSpark 的接受和回退。[并发对照](../day0_stage3/validator/prefix_overlap.py)
 
-收尾验证从已合入六项 A5 算子的版本开始。同一候选先用关闭前缀缓存的全新服务建立逐题对照，再开启缓存，在 rank 0 对比串行、并发与页复用；由 worker 的实际调度记录确认两个请求同一步执行。长请求使用同一候选与冻结的输入，每档以新 `cache_salt` 做冷测，同档两次热测沿用该 salt。逐次核对输入、实际输出数、命中数、三个检索标记以及八卡 KV/HBM 采样。[缓存探针](../day0_stage3/validator/prefix_probe.py) · [长请求结果核对](../day0_stage3/validator/compare_context.py)
+收尾验证从已合入六项 A5 算子的版本开始。同一候选先用关闭前缀缓存的全新服务建立逐题对照，再开启缓存，在 rank 0 对比串行、并发与页复用。由 worker 的实际调度记录确认两个请求同一步执行。长请求使用同一候选与冻结的输入，每档以新 `cache_salt` 做冷测，同档两次热测沿用该 salt。逐次核对输入、实际输出数、命中数、三个检索标记以及八卡 KV/HBM 采样。[缓存探针](../day0_stage3/validator/prefix_probe.py) · [长请求结果核对](../day0_stage3/validator/compare_context.py)
 
 ### A5 融合算子接入
 
