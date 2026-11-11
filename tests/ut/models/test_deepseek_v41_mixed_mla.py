@@ -25,7 +25,14 @@ def test_a5_selects_registered_mixed_ops_without_generic_custom_op_capability(mo
     monkeypatch.setattr(device_config, "get_device_config", lambda: device_config.DeviceConfig(a5))
     calls = []
     monkeypatch.setattr(native_ops, "initialize_native_ops", lambda: calls.append("extension"))
-    monkeypatch.setattr(native, "import_module", calls.append)
+    sparse_info = SimpleNamespace(SMLA_METADATA_SIZE=1024)
+    mixed_info = SimpleNamespace(MQSMLA_METADATA_SIZE=1024)
+
+    def load_contract(name):
+        calls.append(name)
+        return mixed_info if name.endswith(".mixed_quant_sparse_flash_mla") else sparse_info
+
+    monkeypatch.setattr(native, "import_module", load_contract)
 
     def packet(name):
         return SimpleNamespace(default=SimpleNamespace(_schema=torch._C.parse_schema(f"{name}(Tensor x) -> Tensor")))
@@ -45,7 +52,15 @@ def test_a5_selects_registered_mixed_ops_without_generic_custom_op_capability(mo
     try:
         assert native.supports_mixed_mla(q, 64)
         assert native._operators(q.device) == (meta.default, main.default, compact_kv.store_mixed_kv)
-        assert calls == ["extension", "cann_ops_transformer"]
+        assert calls == [
+            "extension",
+            "cann_ops_transformer.ops.attention.sparse_flash_mla.sparse_flash_mla",
+            "cann_ops_transformer.ops.attention.mixed_quant_sparse_flash_mla.mixed_quant_sparse_flash_mla",
+        ]
+        sparse_info.SMLA_METADATA_SIZE = 2048
+        native._operators.cache_clear()
+        assert not native.supports_mixed_mla(q, 64)
+        sparse_info.SMLA_METADATA_SIZE = 1024
         del writer.kv_compress_epilog_v2
         native._operators.cache_clear()
         assert not native.supports_mixed_mla(q, 64)
@@ -76,11 +91,11 @@ class ScratchReference:
         self.calls.append(kw)
         assert kw["layout_q"] == "TND" and kw["layout_kv"] == "PA_BBND"
         assert "quant_mode" not in kw and "rope_head_dim" not in kw
-        return torch.tensor([kw["batch_size"]], dtype=torch.int32)
+        return torch.full((1024,), kw["batch_size"], dtype=torch.int32)
 
     def attention(self, q, **kw):
         assert kw["quant_mode"] == 2 and kw["rope_head_dim"] == 64
-        assert len(q) == kw["metadata"].item()
+        assert len(q) == kw["metadata"][0].item()
         raw = self.pages.pop(id(kw["ori_kv"]))
         cmp = self.pages.pop(id(kw["cmp_kv"])) if "cmp_kv" in kw else None
         out = []

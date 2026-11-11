@@ -13,6 +13,7 @@ ROPE_DIM = 64
 NATIVE_PAGE_SIZE = 128
 NATIVE_ROW_BYTES = 584
 QUERY_TILE = 16
+METADATA_WORDS = 1024
 
 
 @cache
@@ -25,7 +26,11 @@ def _operators(device):
         return None
     try:
         initialize_native_ops()
-        import_module("cann_ops_transformer")
+        attention_package = "cann_ops_transformer.ops.attention"
+        sparse = import_module(f"{attention_package}.sparse_flash_mla.sparse_flash_mla")
+        mixed = import_module(f"{attention_package}.mixed_quant_sparse_flash_mla.mixed_quant_sparse_flash_mla")
+        if (sparse.SMLA_METADATA_SIZE, mixed.MQSMLA_METADATA_SIZE) != (METADATA_WORDS, METADATA_WORDS):
+            return None
         namespace = torch.ops.cann_ops_transformer
         # The two 950 MLA kernels use the same 1,024-word FA/FD workload ABI.
         # The 0.27 image ships the SparseFlashMla AICPU metadata provider.
@@ -125,6 +130,8 @@ def _attend_tile(q, window_bank, window_ids, compressed_bank, compressed_ids, si
         **extra_meta,
         **config,
     )
+    if plan.shape != (METADATA_WORDS,) or plan.dtype != torch.int32:
+        raise RuntimeError("Unexpected A5 SparseFlashMla scheduler output for Mixed MLA")
     output, _ = attention(
         q.contiguous(),
         quant_mode=2,
