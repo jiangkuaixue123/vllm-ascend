@@ -38,6 +38,7 @@
 
 
 add_op_to_compiled_list()
+set(kv_compress_epilog_track_kernel_inputs TRUE CACHE INTERNAL "Rebuild binary variants when staged source changes")
 
 if (BUILD_OPEN_PROJECT)
     target_sources(op_host_aclnn PRIVATE
