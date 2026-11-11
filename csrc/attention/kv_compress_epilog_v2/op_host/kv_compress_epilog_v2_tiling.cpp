@@ -10,6 +10,11 @@
 namespace optiling {
 struct KvCompressEpilogV2CompileInfo {};
 
+// The A5 SIMT row codec accesses the DMA queues through shared UB. Reserve
+// one supported DCache slice, as in the arch35 SIMT histogram/scatter tiler.
+constexpr uint64_t kSimtDcacheBytes = 32 * 1024;
+constexpr uint64_t kQueueAlignmentReserve = 1024;
+
 static ge::graphStatus TileKvCompressEpilogV2(gert::TilingContext *ctx)
 {
     auto *cache = ctx->GetInputShape(0);
@@ -38,12 +43,17 @@ static ge::graphStatus TileKvCompressEpilogV2(gert::TilingContext *ctx)
     uint64_t ub = 0;
     platform.GetCoreMemSize(platform_ascendc::CoreMemType::UB, ub);
     const int64_t cores = platform.GetCoreNumAiv();
-    if (cores <= 0 || ub <= 1024) {
+    if (cores <= 0 || ub <= kSimtDcacheBytes + kQueueAlignmentReserve ||
+        ub - kSimtDcacheBytes > std::numeric_limits<uint32_t>::max()) {
+        return ge::GRAPH_FAILED;
+    }
+    const uint32_t localBytes = static_cast<uint32_t>(ub - kSimtDcacheBytes);
+    if (ctx->SetDynUBufSize(localBytes) != ge::GRAPH_SUCCESS) {
         return ge::GRAPH_FAILED;
     }
     const auto partition = PartitionKvCompressRows(rows, cores);
     const int64_t rowBytes = 2 * (2 * width + ((stride + 31) / 32) * 32) + sizeof(int64_t);
-    const int64_t blockRows = std::min<int64_t>(partition.perCore, (ub - 1024) / rowBytes);
+    const int64_t blockRows = std::min<int64_t>(partition.perCore, (localBytes - kQueueAlignmentReserve) / rowBytes);
     if (blockRows == 0) {
         return ge::GRAPH_FAILED;
     }
