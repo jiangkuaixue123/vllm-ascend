@@ -9,6 +9,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from compare_gsm8k import compare
 from summarize_gsm8k import audit
 
 
@@ -315,6 +316,23 @@ class TestSummarizeGsm8k(unittest.TestCase):
         write_lines(self.run / "http.jsonl", self.events[:2])
         self.inconclusive("did not finish")
         self.assertEqual(self.report()["http"]["observed_peak"], 2)
+
+    def test_pair_reports_opposite_changes_at_equal_accuracy(self):
+        before = self.report()
+        self.result["details"]["0"]["correct"] = [False]
+        self.result["details"]["1"]["correct"] = [True]
+        write(self.official, self.result)
+        result = compare(before, self.report())
+        self.assertEqual(result["verdict"], "PASS")
+        self.assertEqual((result["baseline_only"], result["candidate_only"], result["delta_correct"]), (1, 1, 0))
+        self.assertEqual([row["index"] for row in result["changed"]], [0, 1])
+
+    def test_pair_does_not_score_a_mismatched_request(self):
+        before, after = self.report(), self.report()
+        after["rows"][1]["request_sha256"] = "0" * 64
+        result = compare(before, after)
+        self.assertEqual(result["verdict"], "INCONCLUSIVE")
+        self.assertNotIn("candidate_correct", result)
 
 
 if __name__ == "__main__":

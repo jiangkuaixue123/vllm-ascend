@@ -107,3 +107,5 @@ GPQA 两侧启动后先逐题调用服务的 `/tokenize`，核对全部输入 ID
 在独立分支接入 HcPre、HcPost、MixedQuantSparseFlashMla、KvCompressEpilogV2、InplacePartialRotaryMul 和 TransposeQuantBatchMatMul。逐项核对目标和草稿网络的调用位置、分组量化与分页布局、实际设备执行和数值对照。涉及 ABI 扩展时保留 DSV4 现有调用。
 
 在指定的同一 0.27 A5 镜像，用普通服务入口、原始 checkpoint 和相同八卡并行配置分别启动基线和候选。沿用阶段二的 AISBench 四样例推理模板、官方测试集前 300 题、显示顺序、解码参数和评分器。记录正确数与逐题变化，候选通过现有门槛且正确数不低于本轮基线，再合回开发分支。
+
+取得两轮 AISBench 原始目录后，用同一组 gates、输入清单和 AISBench 源码复核两轮官方评分，并按实际请求哈希配对。输出包含两轮正确数与准确率、逐题正确性发生变化的索引，以及是否达到本轮合并条件。[逐题对照工具](../day0_stage2/validator/compare_gsm8k.py)
