@@ -132,3 +132,4 @@
 | 2026-11-11 | 阶段目录已增加前后两轮的 GSM8K 对照工具。两轮复用同一官方评分核验，再逐题匹配索引、问题、实发请求及标准答案。已在本轮真实基线自配和 14 项 CPU 用例中检查同分错题互换、错请求和不完整运行。 | [配对工具](../day0_stage2/validator/compare_gsm8k.py) · [测试](../day0_stage2/validator/test_summarize_gsm8k.py) |
 | 2026-11-11 | 两轮官方 GSM8K 前 300 题已完成，逐题核对实际请求、官方参考与评分后，确认基线中答对的题在候选中全部答对。已对同一候选另启服务采集短请求的设备事件。 | [重新评分与配对](../day0_stage2/validator/compare_gsm8k.py) |
 | 2026-11-11 | 同一候选 wheel 启动的八卡服务完成独立短请求采集。八张卡各自的设备任务表均记录了 HcPre、HcPost、KvCompressEpilogV2、MixedQuantSparseFlashMla、InplacePartialRotaryMul 和 TransposeQuantBatchMatMul；采集结束后再次核对了全部设备表哈希。 | [融合接线与验收](PLAN.md#a5-融合算子接入) · [分页回归](../tests/e2e/nightly/single_node/ops/singlecard_ops/test_deepseek_v41_sparse_cache.py) |
+| 2026-11-11 | 六项融合已合回开发分支。已核对合并后的模型、权重加载器、设备扩展、打包代码及设备回归测试与实际接受八卡验证的版本一致。评分与设备追踪服务均已退出。 | [实现和验收条件](PLAN.md#a5-融合算子接入) · [复算两轮成绩](../day0_stage2/validator/compare_gsm8k.py) |
