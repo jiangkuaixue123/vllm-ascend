@@ -57,9 +57,9 @@ class CacheEncoding(IntEnum):
 def store_compact_kv(cache, x, slots, encoding):
     """Write a complete post-RoPE BF16 row at a scheduler-owned or scratch slot."""
     if x.device.type == "npu":
-        from vllm_ascend.device.device_config import AscendDeviceType, get_ascend_device_type
+        from vllm_ascend.device.device_config import get_device_config
 
-        if get_ascend_device_type() == AscendDeviceType.A5:
+        if get_device_config().supports_compact_kv_epilog:
             torch.ops._C_ascend.kv_compress_epilog_v2(cache, x.contiguous(), slots.contiguous(), int(encoding))
             return
     if encoding == CacheEncoding.WINDOW_MXFP8:

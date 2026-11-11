@@ -31,6 +31,11 @@ class DeviceConfig:
         return self._device_type == AscendDeviceType.A5
 
     @property
+    def supports_compact_kv_epilog(self) -> bool:
+        """Native writer for full post-RoPE MXFP8 and E2M1 cache rows."""
+        return self._device_type == AscendDeviceType.A5
+
+    @property
     def supports_grouped_mx_output_projection(self) -> bool:
         return self._device_type == AscendDeviceType.A5
 

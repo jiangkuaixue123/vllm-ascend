@@ -69,7 +69,12 @@ KV_CODEC_INLINE uint8_t PayloadFP8(uint16_t word, uint8_t scale)
     const uint32_t sign = (word >> 8) & 128U;
     const uint16_t magnitude = word & 0x7fffU;
     if (scale == 255) {
-        return static_cast<uint8_t>(sign | (magnitude >= 0x7f80U ? 127U : 0U));
+        // The reference decodes this sentinel as +Inf. Inf/Inf yields
+        // canonical positive NaN; an input NaN retains its sign.
+        if (magnitude == 0x7f80U) {
+            return 127;
+        }
+        return static_cast<uint8_t>(sign | (magnitude > 0x7f80U ? 127U : 0U));
     }
     const float x = AsFloat(static_cast<uint32_t>(magnitude) << 16);
     const float normalized = x * AsFloat(static_cast<uint32_t>(254 - scale) << 23);
@@ -78,6 +83,13 @@ KV_CODEC_INLINE uint8_t PayloadFP8(uint16_t word, uint8_t scale)
 
 KV_CODEC_INLINE uint8_t PayloadFP4(uint16_t word, float scale)
 {
+    FloatBits scaleBits;
+    scaleBits.value = scale;
+    if ((scaleBits.word & 0x7fffffffU) > 0x7f800000U) {
+        // All comparisons against the E4M3 NaN scale fail. The dividend's
+        // sign survives division only when the dividend itself is a NaN.
+        return (word & 0x7fffU) > 0x7f80U ? static_cast<uint8_t>((word >> 12) & 8U) : 0;
+    }
     const float x = AsFloat(static_cast<uint32_t>(word & 0x7fffU) << 16);
     const uint32_t code = (x > scale * 0.25f) + (x >= scale * 0.75f) + (x > scale * 1.25f) +
         (x >= scale * 1.75f) + (x > scale * 2.5f) + (x >= scale * 3.5f) + (x > scale * 5.0f);
@@ -99,6 +111,9 @@ KV_CODEC_INLINE uint8_t PayloadMXFP4(uint16_t word, uint8_t scale)
     // Every midpoint is exactly representable as a BF16 magnitude at the
     // UE8M0 floor, including subnormals. Avoid vector-core float FTZ here.
     const uint16_t x = word & 0x7fffU;
+    if (scale == 255) {
+        return x == 0x7f80U ? 0 : static_cast<uint8_t>((word >> 12) & 8U);
+    }
     const uint32_t code = (x > PowerScaledBoundary(0x3e80U, scale)) +
         (x >= PowerScaledBoundary(0x3f40U, scale)) + (x > PowerScaledBoundary(0x3fa0U, scale)) +
         (x >= PowerScaledBoundary(0x3fe0U, scale)) + (x > PowerScaledBoundary(0x4020U, scale)) +
