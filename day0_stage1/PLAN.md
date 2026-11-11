@@ -104,6 +104,8 @@ GPQA 两侧启动后先逐题调用服务的 `/tokenize`，核对全部输入 ID
 
 前缀缓存的四个串行探针已验证命中数及开关缓存时的生成 token。滑窗物理读槽修正后，同一 DP rank 上的单请求与双请求在冷预填充时仍出现首选 token 差异，并发输出一致性待验收。[并发对照](../day0_stage3/validator/prefix_overlap.py)
 
+收尾验证从已合入六项 A5 算子的版本开始。同一候选先用关闭前缀缓存的全新服务建立逐题对照，再开启缓存，在 rank 0 对比串行、并发与页复用；由 worker 的实际调度记录确认两个请求同一步执行。长请求使用同一候选与冻结的输入，每档以新 `cache_salt` 做冷测，同档两次热测沿用该 salt。逐次核对输入、实际输出数、命中数、三个检索标记以及八卡 KV/HBM 采样。[缓存探针](../day0_stage3/validator/prefix_probe.py) · [长请求结果核对](../day0_stage3/validator/compare_context.py)
+
 ### A5 融合算子接入
 
 在独立分支接入 HcPre、HcPost、MixedQuantSparseFlashMla、KvCompressEpilogV2、InplacePartialRotaryMul 和 TransposeQuantBatchMatMul。逐项核对目标和草稿网络的调用位置、分组量化与分页布局、实际设备执行和数值对照。涉及 ABI 扩展时保留 DSV4 现有调用。

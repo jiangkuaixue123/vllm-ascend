@@ -134,3 +134,4 @@
 | 2026-11-11 | 同一候选 wheel 启动的八卡服务完成独立短请求采集。八张卡各自的设备任务表均记录了 HcPre、HcPost、KvCompressEpilogV2、MixedQuantSparseFlashMla、InplacePartialRotaryMul 和 TransposeQuantBatchMatMul；采集结束后再次核对了全部设备表哈希。 | [融合接线与验收](PLAN.md#a5-融合算子接入) · [分页回归](../tests/e2e/nightly/single_node/ops/singlecard_ops/test_deepseek_v41_sparse_cache.py) |
 | 2026-11-11 | 六项融合已合回开发分支。已核对合并后的模型、权重加载器、设备扩展、打包代码及设备回归测试与实际接受八卡验证的版本一致。评分与设备追踪服务均已退出。 | [实现和验收条件](PLAN.md#a5-融合算子接入) · [复算两轮成绩](../day0_stage2/validator/compare_gsm8k.py) |
 | 2026-11-11 | 任务方确认阶段三 GPQA 测试已完成。CPU 绑核开关和串行前缀缓存已实测。剩余两项是同一 DP rank 的并发输出一致性，以及 256K、1M 单请求长上下文验收。256K 在预填充时按要求停止，1M 请求尚未启动。 | [阶段三计划](PLAN.md#阶段三的服务与验收) · [并发对照](../day0_stage3/validator/prefix_overlap.py) · [长请求检查](../day0_stage3/validator/context_probe.py) |
+| 2026-11-11 | 已按任务方要求重启上述两项验收。六算子版本与本轮起点的运行时代码相同，指定镜像已启动独立的八卡 cache-off 服务，用原串行输入与同 rank 双请求复查分歧。 | [收尾方案](PLAN.md#阶段三的服务与验收) · [并发输入](../day0_stage3/validator/prefix_overlap.py) |
