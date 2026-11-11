@@ -40,6 +40,7 @@ from torch.nn import functional as F
 
 from .config import text_model_args
 from .ngram import EngramLayout, NgramHashState
+from .rotary import rotate_rows
 from .eager_kernels import act_quant, compact_linear, fp4_act_quant, hc_split_sinkhorn, sparse_attn
 from .ep import ExpertPlacement
 
@@ -163,24 +164,9 @@ def precompute_freqs_cis(dim, seqlen, original_seq_len, base, factor, beta_fast,
     return torch.view_as_real(phases).to(device)
 
 def apply_rotary_emb(x, freqs_cis, inverse=False):
-    pairs = x.float().unflatten(-1, (-1, 2))
-    if x.ndim == 4:
-        freqs_cis = freqs_cis.unsqueeze(1)
-    if x.device.type == "cpu":
-        phase = torch.view_as_complex(freqs_cis)
-        rotated = torch.view_as_real(torch.view_as_complex(pairs) * (phase.conj() if inverse else phase))
-    else:
-        # Keep the table and the multiply on device, using real FP32 operations
-        # for the complex rotation. Match the fused product before BF16 rounding.
-        cos, sin = freqs_cis.unbind(-1)
-        if inverse:
-            sin = -sin
-        real, imag = pairs.unbind(-1)
-        rot_r = torch.addcmul(-(imag * sin), real, cos)
-        rot_i = torch.addcmul(imag * cos, real, sin)
-        rotated = torch.stack((rot_r, rot_i), dim=-1)
-    x.copy_(rotated.flatten(-2))
-    return x
+    if x.ndim > 2:
+        freqs_cis = freqs_cis.unsqueeze(0).expand(x.shape[0], -1, -1, -1)
+    return rotate_rows(x, freqs_cis, 2 * freqs_cis.size(-2), inverse)
 
 
 @lru_cache(16)
@@ -309,7 +295,7 @@ class Indexer(torch.nn.Module):
         the RoPE'd, quantized values."""
         assert self.freqs_cis is not None
         bsz, seqlen, _ = x.size()
-        ratio, rd, end_pos = self.compress_ratio, self.rope_head_dim, start_pos + seqlen
+        ratio, end_pos = self.compress_ratio, start_pos + seqlen
 
         # Append index keys when a compression group completes.
         if self.owns_k and latent is not None:
@@ -320,14 +306,14 @@ class Indexer(torch.nn.Module):
                 else self.freqs_cis[start_pos + 1 - ratio].unsqueeze(0)
             )
             k = self.k_norm(self.wk(latent))
-            apply_rotary_emb(k[..., -rd:], freqs)
+            apply_rotary_emb(k, freqs)
             fp4_act_quant(k, fp4_block_size, True)
             self.k_cache[:bsz, start_pos // ratio : start_pos // ratio + k.size(1)] = k
         if self.owns_k:
             self.shared.index_k = self.k_cache
 
         q = self.wq_b(qr).unflatten(-1, (self.n_local_heads, self.index_head_dim))
-        apply_rotary_emb(q[..., -rd:], self.freqs_cis[start_pos:end_pos])
+        apply_rotary_emb(q, self.freqs_cis[start_pos:end_pos])
         fp4_act_quant(q, fp4_block_size, True)
 
         index_k = self.shared.index_k[:bsz, : end_pos // ratio]
@@ -482,7 +468,7 @@ class Attention(nn.Module):
         bsz, seqlen, _ = x.size()
         win = self.window_size
         kv = self.kv_norm(self.wkv(x))
-        apply_rotary_emb(kv[..., -self.rope_head_dim :], freqs_cis)
+        apply_rotary_emb(kv, freqs_cis)
         act_quant(kv, fp8_block_size, scale_fmt, scale_dtype, True)
         if start_pos == 0:  # prefill: attend over this chunk, seeding the ring buffer for decode
             if seqlen <= win:
@@ -534,7 +520,7 @@ class Attention(nn.Module):
                 if start_pos == 0
                 else self.freqs_cis[start_pos + 1 - ratio].unsqueeze(0)
             )
-            apply_rotary_emb(latent[..., -self.rope_head_dim :], freqs)
+            apply_rotary_emb(latent, freqs)
             # Compressed KV uses groups of 16 with E4M3 scales; the indexer uses 32 with E8M0.
             fp4_act_quant(latent, 16, True, scale_dtype=torch.float8_e4m3fn)
             self.compress_kv_cache[:bsz, start_pos // ratio : start_pos // ratio + latent.size(1)] = latent
@@ -544,11 +530,9 @@ class Attention(nn.Module):
     def forward(self, x: torch.Tensor, start_pos: int):
         bsz, seqlen, _ = x.size()
         freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
-        rd = self.rope_head_dim
-
         qr = self.q_norm(self.wq_a(x))
         q = self.wq_b(qr).unflatten(-1, (self.n_local_heads, self.head_dim))
-        apply_rotary_emb(q[..., -rd:], freqs_cis)
+        apply_rotary_emb(q, freqs_cis)
 
         kv, topk_idxs = self._window_kv(x, freqs_cis, start_pos)
         if self.compress_ratio:
@@ -557,7 +541,7 @@ class Attention(nn.Module):
             topk_idxs = torch.cat([topk_idxs, compress_idxs], dim=-1)
 
         o = sparse_attn(q, kv, self.attn_sink, topk_idxs, self.softmax_scale)
-        apply_rotary_emb(o[..., -rd:], freqs_cis, True)
+        apply_rotary_emb(o, freqs_cis, True)
 
         # wo_a is block-diagonal over groups (each projects only its own heads), hence einsum not
         # Linear. convert.py dequantizes it to bf16; quantize/dequantize o before einsum.

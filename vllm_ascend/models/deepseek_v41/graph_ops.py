@@ -5,15 +5,10 @@ from importlib.util import find_spec
 
 import torch
 
-from vllm_ascend.models.deepseek_v41.backend import apply_rotary_emb
 from vllm_ascend.models.deepseek_v41.compact_kv import cache_row_bytes, pack_fp4, pack_window, unpack_fp4, unpack_window
 from vllm_ascend.models.deepseek_v41.decode_state import PagedHistory
 from vllm_ascend.models.deepseek_v41.eager_kernels import _fp4_level, act_quant, power_of_two_scale
-
-
-def _rotate(x, freq, dim, inverse=False):
-    apply_rotary_emb(x[..., -dim:].unsqueeze(0), freq, inverse)
-    return x
+from vllm_ascend.models.deepseek_v41.rotary import rotate_rows as _rotate
 
 
 def _fp4(x, lut, width=32, e4scale=False):

@@ -21,6 +21,7 @@ from vllm_ascend.models.deepseek_v41 import backend as base
 from vllm_ascend.models.deepseek_v41 import weights as checkpoint
 from vllm_ascend.models.deepseek_v41.config import text_model_args
 from vllm_ascend.models.deepseek_v41.eager_kernels import act_quant, sparse_attn
+from vllm_ascend.models.deepseek_v41.rotary import rotate_rows
 
 
 class DraftOutput(NamedTuple):
@@ -30,21 +31,7 @@ class DraftOutput(NamedTuple):
 
 
 def _rotate(x, phases, inverse=False):
-    """Rotate a flat token batch whose rows can have different absolute positions."""
-    pairs = x.float().unflatten(-1, (-1, 2))
-    # A head axis exists for Q/O, but not the shared latent KV.
-    if phases.ndim == pairs.ndim - 1:
-        phases = phases.unsqueeze(-3)
-    if x.device.type == "cpu":
-        z = torch.view_as_complex(phases)
-        rotated = torch.view_as_real(torch.view_as_complex(pairs) * (z.conj() if inverse else z))
-    else:
-        c, s = phases.unbind(-1)
-        if inverse:
-            s = -s
-        re, im = pairs.unbind(-1)
-        rotated = torch.stack((torch.addcmul(-(im * s), re, c), torch.addcmul(im * c, re, s)), -1)
-    x.copy_(rotated.flatten(-2))
+    rotate_rows(x, phases, 2 * phases.size(-2), inverse)
 
 
 class DSparkAttention(base.Attention):
@@ -63,7 +50,7 @@ class DSparkAttention(base.Attention):
 
     def commit(self, main, slots, positions):
         kv = self.kv_norm(self.wkv(main))
-        _rotate(kv[..., -self.rope_head_dim :], self.freqs_cis[positions])
+        _rotate(kv, self.freqs_cis[positions])
         if self.pages is not None:
             self.pages.write(self.page_layer, slots, kv)
         else:
@@ -77,9 +64,9 @@ class DSparkAttention(base.Attention):
         offsets = torch.arange(k, device=x.device)
         phases = self.freqs_cis[positions[:, None] + 1 + offsets]
         q = self.wq_b(self.q_norm(self.wq_a(x))).unflatten(-1, (self.n_local_heads, self.head_dim))
-        _rotate(q[..., -self.rope_head_dim :], phases)
+        _rotate(q, phases)
         kv = self.kv_norm(self.wkv(x))
-        _rotate(kv[..., -self.rope_head_dim :], phases)
+        _rotate(kv, phases)
         act_quant(kv, inplace=True)
 
         # Arrange main KVs in the same physical-ring order as HF, then append draft
@@ -97,7 +84,7 @@ class DSparkAttention(base.Attention):
         indices = torch.arange(win + k, device=x.device).expand(b, -1)
         indices = torch.where(indices < length, indices, torch.where(indices < length + k, win + indices - length, -1))
         o = sparse_attn(q, all_kv, self.attn_sink, indices[:, None].expand(-1, k, -1), self.softmax_scale)
-        _rotate(o[..., -self.rope_head_dim :], phases, inverse=True)
+        _rotate(o, phases, inverse=True)
         o = o.reshape(b, k, self.n_local_groups, -1)
         act_quant(o, inplace=True)
         grouped = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
