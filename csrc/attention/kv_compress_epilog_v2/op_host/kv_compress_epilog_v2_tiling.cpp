@@ -29,14 +29,15 @@ static ge::graphStatus TileKvCompressEpilogV2(gert::TilingContext *ctx)
     const auto &c = cache->GetStorageShape();
     const auto &s = slots->GetStorageShape();
     const int64_t mode = *attrs->GetInt(0);
-    if (mode < 0 || mode > 2 || x.GetDimNum() != 2 || c.GetDimNum() != 2 || s.GetDimNum() != 1) {
+    if (mode < 0 || mode > 3 || x.GetDimNum() != 2 || c.GetDimNum() != 2 || s.GetDimNum() != 1) {
         return ge::GRAPH_FAILED;
     }
     const int64_t width = x.GetDim(1), rows = x.GetDim(0), stride = c.GetDim(1);
     const int64_t group = mode == 1 ? 16 : 32;
+    const bool validLayout = mode == 3 ? width == 512 && stride == 584 && c.GetDim(0) % 128 == 0 :
+        stride == (mode == 0 ? width : width / 2) + width / group;
     if (rows <= 0 || rows != s.GetDim(0) || rows > std::numeric_limits<int32_t>::max() ||
-        width <= 0 || width > 65536 || width % group != 0 || c.GetDim(0) <= 0 ||
-        stride != (mode == 0 ? width : width / 2) + width / group) {
+        width <= 0 || width > 65536 || width % group != 0 || c.GetDim(0) <= 0 || !validLayout) {
         return ge::GRAPH_FAILED;
     }
     auto platform = platform_ascendc::PlatformAscendC(ctx->GetPlatformInfo());

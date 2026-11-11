@@ -11,6 +11,11 @@
 
 namespace {
 constexpr uint32_t kThreads = 128;
+constexpr uint32_t kMixedMode = 3;
+constexpr uint32_t kMixedPage = 128;
+constexpr uint32_t kNope = 448;
+constexpr uint32_t kMixedValues = kNope + 64 * sizeof(uint16_t);
+constexpr uint32_t kMixedScales = 8;
 using namespace AscendC;
 using namespace KvCompactCodec;
 
@@ -18,17 +23,28 @@ __simt_vf__ __aicore__ LAUNCH_BOUND(kThreads) inline void EncodeRows(
     __ubuf__ uint8_t *output, __ubuf__ uint16_t *input, uint32_t rows, uint32_t dim,
     uint32_t rowBytes, uint32_t mode)
 {
-    const bool fp8 = mode == 0;
+    const bool mixed = mode == kMixedMode;
+    const bool fp8 = mode == 0 || mixed;
     const bool e4Scale = mode == 1;
-    const uint32_t block = e4Scale ? 16U : 32U;
+    const uint32_t block = mixed ? 64U : e4Scale ? 16U : 32U;
     const uint32_t groups = dim / block;
     const uint32_t stride = (rowBytes + 31U) / 32U * 32U;
-    const uint32_t payload = fp8 ? dim : dim / 2;
+    const uint32_t payload = mixed ? kMixedValues : fp8 ? dim : dim / 2;
     for (uint32_t work = Simt::GetThreadIdx(); work < rows * groups; work += kThreads) {
         const uint32_t row = work / groups;
         const uint32_t group = work % groups;
         __ubuf__ uint16_t *src = input + row * dim + group * block;
         __ubuf__ uint8_t *dst = output + row * stride;
+        if (mixed && group == groups - 1) {
+            // Mixed MLA consumes the last 64 RoPE components as original BF16
+            // and ignores the eighth scale byte. Initialize every stored byte.
+            __ubuf__ uint16_t *rope = (__ubuf__ uint16_t *)(dst + kNope);
+            for (uint32_t i = 0; i < block; ++i) {
+                rope[i] = src[i];
+            }
+            dst[payload + group] = 0;
+            continue;
+        }
         uint16_t maximum = 0;
         for (uint32_t i = 0; i < block; ++i) {
             const uint16_t v = src[i] & 0x7fffU;
@@ -52,6 +68,19 @@ __simt_vf__ __aicore__ LAUNCH_BOUND(kThreads) inline void EncodeRows(
 }
 
 struct CompactRowWriter {
+    static __aicore__ inline void Store(LocalTensor<uint8_t>& local, GlobalTensor<uint8_t>& cache,
+        int64_t row, int64_t slot, const KvCompressEpilogV2TilingData *tiling)
+    {
+        using namespace KvCompressEpilogOps;
+        const int64_t offset = row * RoundUp<uint8_t>(tiling->kvCacheCol);
+        if (tiling->quantMode == kMixedMode) {
+            CopyBlockSplitKv(local[offset], local[offset + kMixedValues], cache, slot, kMixedPage,
+                             kMixedValues, kMixedScales, kMixedPage * (kMixedValues + kMixedScales));
+        } else {
+            CopyOut(local[offset], cache[slot * tiling->kvCacheCol], 1, tiling->kvCacheCol);
+        }
+    }
+
     static __aicore__ inline void Run(LocalTensor<uint8_t> &out, LocalTensor<bfloat16_t> &in,
                                       int64_t rows, const KvCompressEpilogV2TilingData *tiling)
     {

@@ -81,11 +81,11 @@ def store_compact_kv(cache, x, slots, encoding):
 
 def store_mixed_kv(cache, x, slots):
     """Store BF16 rows in the existing Mixed MLA block-split MXFP8 cache."""
-    if cache.ndim != 4 or cache.shape[2:] != (1, 584) or not cache.is_contiguous():
-        raise ValueError("Mixed MLA cache must be contiguous [pages, page_size, 1, 584]")
+    if cache.ndim != 4 or cache.shape[1:] != (128, 1, 584) or not cache.is_contiguous():
+        raise ValueError("Mixed MLA cache must be contiguous [pages, 128, 1, 584]")
     if (cache.dtype not in (torch.uint8, torch.float8_e4m3fn) or x.ndim != 2 or x.size(1) != 512
             or x.dtype != torch.bfloat16):
         raise ValueError("Expected a byte-addressable E4M3 cache and 512-channel BF16 rows")
-    torch.ops._C_ascend.kv_compress_epilog(
-        cache.view(torch.float8_e4m3fn), x.contiguous(), slots.contiguous(), 64, 2, True, 2
+    torch.ops._C_ascend.kv_compress_epilog_v2(
+        cache.view(torch.uint8).view(-1, 584), x.contiguous(), slots.contiguous(), 3
     )

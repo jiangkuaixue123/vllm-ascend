@@ -1448,7 +1448,7 @@ std::tuple<at::Tensor, at::Tensor> npu_rms_norm_dynamic_quant_npu(
 // V2 stores the complete post-RoPE row in the checkpoint's compact format.
 void kv_compress_epilog_v2(at::Tensor& cache, const at::Tensor& x, const at::Tensor& slots, int64_t mode)
 {
-    TORCH_CHECK(mode >= 0 && mode <= 2, "Expected raw MXFP8, E4-scaled FP4 or MXFP4");
+    TORCH_CHECK(mode >= 0 && mode <= 3, "Expected raw MXFP8, E4-scaled FP4, MXFP4 or block-split MXFP8");
     TORCH_CHECK(x.dim() == 2 && cache.dim() == 2 && slots.dim() == 1 && slots.size(0) == x.size(0),
                 "Expected cache[slots,bytes], x[tokens,dim] and slot_mapping[tokens]");
     TORCH_CHECK(x.scalar_type() == at::kBFloat16 && cache.scalar_type() == at::kByte &&
@@ -1459,8 +1459,9 @@ void kv_compress_epilog_v2(at::Tensor& cache, const at::Tensor& x, const at::Ten
                 "Compact KV epilog requires contiguous tensors on the same device");
     const int64_t group = mode == 1 ? 16 : 32;
     const int64_t dim = x.size(1);
-    TORCH_CHECK(dim > 0 && dim <= 65536 && dim % group == 0 && cache.size(0) > 0 &&
-                    cache.size(1) == (mode == 0 ? dim : dim / 2) + dim / group,
+    const bool validLayout = mode == 3 ? dim == 512 && cache.size(1) == 584 && cache.size(0) % 128 == 0 :
+        cache.size(1) == (mode == 0 ? dim : dim / 2) + dim / group;
+    TORCH_CHECK(dim > 0 && dim <= 65536 && dim % group == 0 && cache.size(0) > 0 && validLayout,
                 "The cache row width does not match the requested quantization");
     if (x.size(0)) {
         EXEC_NPU_CMD(aclnnKvCompressEpilogV2, cache, x, slots, mode);
