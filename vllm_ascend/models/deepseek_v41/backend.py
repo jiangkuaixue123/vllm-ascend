@@ -41,7 +41,13 @@ from torch.nn import functional as F
 from .config import text_model_args
 from .mixed_mla import mixed_mla_from_bf16, supports_mixed_mla
 from .ngram import EngramLayout, NgramHashState
-from .native_ops import NativeGroupedOutputProjection, grouped_output_projection, native_hc_ops, use_grouped_mx_projection
+from .native_ops import (
+    NativeGroupedOutputProjection,
+    grouped_output_projection,
+    native_engram_statistics,
+    native_hc_ops,
+    use_grouped_mx_projection,
+)
 from .rotary import rotate_rows
 from .eager_kernels import act_quant, compact_linear, fp4_act_quant, hc_split_sinkhorn, sparse_attn
 from .ep import ExpertPlacement
@@ -126,12 +132,17 @@ class Engram(nn.Module):
         the gate so those positions pass through untouched."""
         kv = self.wkv(self.embed(hash_ids).flatten(-2))
         key, value = kv.split([self.hc_mult * self.dim, self.dim], dim=-1)
-        key = key.float().unflatten(-1, (self.hc_mult, self.dim))
+        key = key.unflatten(-1, (self.hc_mult, self.dim))
         weight = self.q_weight.float() * self.k_weight.float()  # only ever used as a product
         h, eps = x.float(), self.eps
         # normalized per (token, hc copy) over `dim`, NOT jointly over the copies
-        rstd = torch.rsqrt(h.square().mean(-1) + eps) * torch.rsqrt(key.square().mean(-1) + eps)
-        dot = (h * weight * key).sum(-1) * rstd * self.dim**-0.5
+        stats = native_engram_statistics(x, key, weight)
+        if stats is None:
+            k = key.float()
+            stats = h.square().mean(-1), k.square().mean(-1), (h * weight * k).sum(-1)
+        h2, k2, dot = stats
+        rstd = torch.rsqrt(h2 + eps) * torch.rsqrt(k2 + eps)
+        dot = dot * rstd * self.dim**-0.5
         # signed sqrt before the sigmoid, matching the training kernel
         magnitude = dot.abs().clamp_min(self.clamp_value).sqrt()
         gate = torch.sigmoid(torch.where(torch.signbit(dot), -magnitude, magnitude))

@@ -31,6 +31,55 @@ def native_hc_ops(residual):
     return torch.ops._C_ascend
 
 
+def _sum_engram_channels(values):
+    # Keep an unpaired tail until its neighbor is available at the next level.
+    while values.size(-1) > 1:
+        even = values.size(-1) - values.size(-1) % 2
+        reduced = values[..., :even:2] + values[..., 1:even:2]
+        values = torch.cat((reduced, values[..., -1:]), -1) if even < values.size(-1) else reduced
+    return values.squeeze(-1)
+
+
+def _tensor_engram_statistics(hidden, key, weight):
+    h, k = hidden.float(), key.float()
+    dim = hidden.size(-1)
+    return (
+        _sum_engram_channels(h.square()) / dim,
+        _sum_engram_channels(k.square()) / dim,
+        _sum_engram_channels((h * weight) * k),
+    )
+
+
+@cache
+def _engram_statistics_op():
+    from vllm_ascend.device.device_config import get_device_config
+
+    if not get_device_config().supports_fixed_engram_reductions:
+        return None
+    try:
+        from .engram_reduce import gate_statistics
+    except ModuleNotFoundError as error:
+        if error.name not in ("triton", "triton.language"):
+            raise
+        return _tensor_engram_statistics
+    return gate_statistics
+
+
+def native_engram_statistics(hidden, key, weight):
+    if (
+        hidden.device.type != "npu"
+        or hidden.shape[-2:] != (4, 5120)
+        or hidden.dtype != torch.bfloat16
+        or key.dtype != torch.bfloat16
+        or hidden.stride(-1) != 1
+        or key.stride(-1) != 1
+        or weight.stride(-1) != 1
+    ):
+        return None
+    op = _engram_statistics_op()
+    return None if op is None else op(hidden, key, weight)
+
+
 def hash_route(logits, bias, *, top_k, temperature=1.0, route_scale=1.5):
     """Text-only selection: sqrt(softplus(logit/T)) + bias, then unbiased renorm."""
     # The image's norm_type=2 is sqrt-softplus with unbiased top-k renormalization.
