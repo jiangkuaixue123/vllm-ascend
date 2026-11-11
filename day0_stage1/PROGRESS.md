@@ -123,3 +123,4 @@
 | 2026-11-11 | 作者条件全 198 道唯一题均已实际发出，每题一次。逐题核对实发 HTTP 正文及规范化 JSON 的 SHA-256，198/198 均和预先冻结的官方客户端请求一致。 | [客户端与评分核对](../day0_stage3/validator/gpqa.md) |
 | 2026-11-11 | 已按任务方确认排好 GPQA 与长上下文的执行顺序。全量评分归档后，同一候选依次执行 256K 与 1M 单请求的冷、热和自然停词验证。 | [阶段三验收顺序](PLAN.md#阶段三的服务与验收) |
 | 2026-11-11 | 已冻结六项算子融合的基线、模型和评测协议。接入前的独立八卡服务已完成加载和图预热，正在用官方 GSM8K 前 300 题建立同条件对照。 | [融合计划](PLAN.md#a5-融合算子接入) · [评分与输入校验](../day0_stage2/validator/summarize_gsm8k.py) |
+| 2026-11-11 | 候选已接入六项算子。HcPre 将本层 FP32 门值传给下一子层，分组输出投影直接加载 checkpoint 的 FP8 权重，正、逆 RoPE 在完整的 head 上更新最后 64 维。三种压缩 KV 格式沿用原始字节布局，目标稀疏注意力按各请求的实际页表准备 CANN 输入。指定镜像开始构建完整 wheel，逐项设备数值与 GSM8K 对照待完成。 | [模型调用](../vllm_ascend/models/deepseek_v41/graph_ops.py) · [缓存写入](../vllm_ascend/models/deepseek_v41/compact_kv.py) · [稀疏注意力](../vllm_ascend/models/deepseek_v41/mixed_mla.py) |
