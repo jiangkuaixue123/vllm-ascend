@@ -40,7 +40,7 @@ from torch.nn import functional as F
 
 from .config import text_model_args
 from .ngram import EngramLayout, NgramHashState
-from .native_ops import native_hc_ops
+from .native_ops import NativeGroupedOutputProjection, grouped_output_projection, native_hc_ops, use_grouped_mx_projection
 from .rotary import rotate_rows
 from .eager_kernels import act_quant, compact_linear, fp4_act_quant, hc_split_sinkhorn, sparse_attn
 from .ep import ExpertPlacement
@@ -407,11 +407,11 @@ class Attention(nn.Module):
         self.wq_b = Linear(self.q_lora_rank, self.n_heads * self.head_dim)
         self.wkv = Linear(self.dim, self.head_dim)
         self.kv_norm = RMSNorm(self.head_dim, self.eps)
-        self.wo_a = Linear(
-            self.n_heads * self.head_dim // self.n_groups,
-            self.n_groups * args.o_lora_rank,
-            dtype=torch.bfloat16,
-        )
+        group_width = self.n_heads * self.head_dim // self.n_groups
+        if use_grouped_mx_projection(self.wq_a.weight.device, group_width, self.o_lora_rank):
+            self.wo_a = NativeGroupedOutputProjection(self.n_groups, self.o_lora_rank, group_width)
+        else:
+            self.wo_a = Linear(group_width, self.n_groups * self.o_lora_rank, dtype=torch.bfloat16)
         self.wo_b = Linear(self.n_groups * args.o_lora_rank, self.dim)
         self.softmax_scale = self.head_dim**-0.5
 
@@ -544,12 +544,8 @@ class Attention(nn.Module):
         o = sparse_attn(q, kv, self.attn_sink, topk_idxs, self.softmax_scale)
         apply_rotary_emb(o, freqs_cis, True)
 
-        # wo_a is block-diagonal over groups (each projects only its own heads), hence einsum not
-        # Linear. convert.py dequantizes it to bf16; quantize/dequantize o before einsum.
         o = o.view(bsz, seqlen, self.n_local_groups, -1)
-        act_quant(o, fp8_block_size, scale_fmt, scale_dtype, True)
-        wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
-        o = torch.einsum("bsgd,grd->bsgr", o, wo_a)
+        o = grouped_output_projection(o, self.wo_a)
         x = self.wo_b(o.flatten(2))
         return x
 

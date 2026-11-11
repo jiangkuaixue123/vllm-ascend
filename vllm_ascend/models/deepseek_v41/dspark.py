@@ -21,6 +21,7 @@ from vllm_ascend.models.deepseek_v41 import backend as base
 from vllm_ascend.models.deepseek_v41 import weights as checkpoint
 from vllm_ascend.models.deepseek_v41.config import text_model_args
 from vllm_ascend.models.deepseek_v41.eager_kernels import act_quant, sparse_attn
+from vllm_ascend.models.deepseek_v41.native_ops import grouped_output_projection, pack_grouped_output_weights
 from vllm_ascend.models.deepseek_v41.rotary import rotate_rows
 
 
@@ -86,9 +87,7 @@ class DSparkAttention(base.Attention):
         o = sparse_attn(q, all_kv, self.attn_sink, indices[:, None].expand(-1, k, -1), self.softmax_scale)
         _rotate(o, phases, inverse=True)
         o = o.reshape(b, k, self.n_local_groups, -1)
-        act_quant(o, inplace=True)
-        grouped = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
-        return self.wo_b(torch.einsum("bsgd,grd->bsgr", o, grouped).flatten(2))
+        return self.wo_b(grouped_output_projection(o, self.wo_a).flatten(2))
 
 
 class MarkovHead(nn.Module):
@@ -241,7 +240,7 @@ class DSparkDraft(nn.Module):
                 and checkpoint.expert_owner(name, self.expert_count, self.placement.size) != self.placement.rank
             ):
                 actions["other_ep_rank"] += 1
-            elif name.endswith(".attn.wo_a.scale"):
+            elif name.endswith(".attn.wo_a.scale") and params[name.removesuffix(".scale") + ".weight"].dtype == torch.bfloat16:
                 conversions[name.removesuffix(".scale") + ".weight"] = ref
                 actions["wo_a_scale"] += 1
             else:
@@ -273,6 +272,7 @@ class DSparkDraft(nn.Module):
             }
             for name, ref in local.items():
                 checkpoint._copy_tensor(ref, params[name], files, conversions.get(name))
+        pack_grouped_output_weights(self)
         index = Path(directory) / checkpoint.INDEX_NAME
         summary = dict(
             index_sha256=hashlib.sha256(index.read_bytes()).hexdigest() if index.is_file() else None,

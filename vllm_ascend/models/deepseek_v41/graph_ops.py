@@ -8,6 +8,7 @@ import torch
 from vllm_ascend.models.deepseek_v41.compact_kv import cache_row_bytes, pack_fp4, pack_window, unpack_fp4, unpack_window
 from vllm_ascend.models.deepseek_v41.decode_state import PagedHistory
 from vllm_ascend.models.deepseek_v41.eager_kernels import _fp4_level, act_quant, power_of_two_scale
+from vllm_ascend.models.deepseek_v41.native_ops import grouped_output_projection
 from vllm_ascend.models.deepseek_v41.rotary import rotate_rows as _rotate
 
 
@@ -322,13 +323,14 @@ def paged_attention(attn, x, state, pages, shared, context):
         observer.tap(attn.layer_id, "sparse_output", out)
     _rotate(out, freq, attn.rope_head_dim, True)
     out = out.reshape(count, attn.n_local_groups, -1)
-    act_quant(out, 32, inplace=True)
-    if compressed_trace is not None and compressed_trace.captures(count):
-        compressed_trace.tap("wo_a_input", out)
-    if observer is not None:
-        observer.tap(attn.layer_id, "wo_a_input", out)
-    wo_a = attn.wo_a.weight.view(attn.n_local_groups, attn.o_lora_rank, -1)
-    out = torch.einsum("tgd,grd->tgr", out, wo_a)
+    trace_input = compressed_trace is not None and compressed_trace.captures(count)
+    if trace_input or observer is not None:
+        traced = act_quant(out.clone(), 32, inplace=True)
+        if trace_input:
+            compressed_trace.tap("wo_a_input", traced)
+        if observer is not None:
+            observer.tap(attn.layer_id, "wo_a_input", traced)
+    out = grouped_output_projection(out, attn.wo_a)
     if compressed_trace is not None and compressed_trace.captures(count):
         compressed_trace.tap("wo_a_output", out)
     if observer is not None:

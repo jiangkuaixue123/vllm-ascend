@@ -279,6 +279,7 @@ def load_checkpoint(model, checkpoint_dir, *, ep_rank, device, ep_size=8, manife
     """Populate one rank's text backbone. Returns its loaded named-parameter set."""
     import torch
     from .engram import HostEngramEmbedding
+    from .native_ops import pack_grouped_output_weights
 
     if not 0 <= ep_rank < ep_size:
         raise ValueError(f"Invalid EP rank {ep_rank} of {ep_size}")
@@ -345,6 +346,7 @@ def load_checkpoint(model, checkpoint_dir, *, ep_rank, device, ep_size=8, manife
             _copy_tensor(ref, params[name], files, converted.get(name.removesuffix(".weight")))
         for name, pair in host.items():
             embeddings[name].bind(pair["weight"], pair["scale"], device)
+    pack_grouped_output_weights(model)
     if manifest is not None:
         path = Path(manifest)
         key_path = path.with_name(path.name + ".keys.jsonl.gz")
