@@ -69,5 +69,11 @@ def test_mixed_mla_reads_compact_rows_through_paged_target():
         raw_values = compact_kv.unpack_window(raw[raw_ids[i, raw_ids[i] >= 0]], width)
         cmp_values = compact_kv.unpack_fp4(compressed[cmp_ids[i, cmp_ids[i] >= 0]], width, 16, True, lut)
         keys = torch.cat((raw_values, cmp_values)).float()
+        # The Mixed reader uses one E8M0 scale per 64 non-RoPE channels.
+        # Reconstruct its keys independently, including the second rounding of FP4 values.
+        groups = keys[:, :448].unflatten(-1, (7, 64))
+        scales = (groups.abs().amax(dim=-1, keepdim=True).clamp_min(1e-4) / 448).log2().ceil().exp2()
+        decoded = (groups / scales).clamp(-448, 448).to(torch.float8_e4m3fn).float() * scales
+        keys[:, :448] = decoded.flatten(-2)
         expected = (keys.sum(0) / (keys.size(0) + 1)).bfloat16().expand(q.size(1), -1)
         torch.testing.assert_close(output[i].cpu(), expected, rtol=0.008, atol=0.004)
