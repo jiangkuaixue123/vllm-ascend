@@ -3514,6 +3514,11 @@ class NPUModelRunner(GPUModelRunner):
                 assert isinstance(attn_metadata, list)
                 attn_metadata_dict = attn_metadata[ubid]
 
+            if getattr(self.model_config.hf_text_config, "model_type", None) == "deepseek_v41_text":
+                # A short prompt extension and a decode step can have the same
+                # query width. Preserve the actual prompt boundary in row order.
+                attn_metadata_i.v41_prompt_lengths = self.input_batch.num_prompt_tokens[:num_reqs].copy()
+
             for layer_name in attn_group.layer_names:
                 attn_metadata_dict[layer_name] = attn_metadata_i
 
@@ -4134,7 +4139,8 @@ class NPUModelRunner(GPUModelRunner):
                         enable_enpu=self.enable_enpu,
                     )
             elif cudagraph_mode.has_full_cudagraphs():
-                self.model = ACLGraphWrapper(
+                wrapper_cls = getattr(self.model, "ascend_full_graph_wrapper_cls", ACLGraphWrapper)
+                self.model = wrapper_cls(
                     self.model,
                     self.vllm_config,
                     runtime_mode=CUDAGraphMode.FULL,
@@ -4252,6 +4258,16 @@ class NPUModelRunner(GPUModelRunner):
             Dict[str, torch.Tensor]: A map between layer names to their
             corresponding memory buffer for KV cache.
         """
+        # A V4.1 automatic pool includes the target's window, compressor and
+        # indexer in its scheduler page. Only its metadata marker goes through
+        # the generic K/V tensor allocation below.
+        if (
+            self.cache_config.num_gpu_blocks_override is None
+            and getattr(self.model_config.hf_text_config, "model_type", None) == "deepseek_v41_text"
+        ):
+            prepare = getattr(self.get_model(), "prepare_device_kv_cache", None)
+            if prepare is not None:
+                kv_cache_config = prepare(kv_cache_config, self.max_model_len)
         # Initialize the memory buffer for KV cache
         kv_cache_raw_tensors = self._allocate_kv_cache_tensors(kv_cache_config)
         # Change the memory buffer to the desired shape
@@ -5443,6 +5459,13 @@ class NPUModelRunner(GPUModelRunner):
             set_graph_params(capture_sizes)
             if self.speculative_config:
                 set_draft_graph_params(capture_sizes)
+
+    def _warmup_and_capture(self, desc: BatchDescriptor, cudagraph_runtime_mode: CUDAGraphMode, *args, **kwargs):
+        warmup = nullcontext
+        if desc.uniform and cudagraph_runtime_mode == CUDAGraphMode.FULL:
+            warmup = getattr(self.get_model(), "full_decode_graph_warmup", nullcontext)
+        with warmup():
+            return super()._warmup_and_capture(desc, cudagraph_runtime_mode, *args, **kwargs)
 
     def capture_model(self) -> int:
         """Capture NPU graphs and return actual graph pool memory bytes consumed."""

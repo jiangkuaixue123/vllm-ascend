@@ -49,7 +49,7 @@ def get_dynamic_mx_quant_scale_alg(vllm_config=None) -> int:
     ``scale_alg=0`` derives a shared exponent directly from the block's
     maximum absolute value. ``scale_alg=1`` first maps that maximum to the
     destination FP8 range, then rounds the E8M0 scale exponent up to avoid
-    quantization overflow. MiniMax M3 checkpoints require the latter.
+    quantization overflow. MiniMax M3 and DeepSeek V4.1 checkpoints require the latter.
     """
     if not get_current_hardware_profile().supports(HardwareCapability.DYNAMIC_MX_QUANT_SCALE_ALG_ONE):
         return 0
@@ -74,7 +74,7 @@ def get_dynamic_mx_quant_scale_alg(vllm_config=None) -> int:
     model_type = getattr(hf_text_config, "model_type", None)
     if (
         any(isinstance(architecture, str) and architecture.startswith("MiniMaxM3") for architecture in architectures)
-        or model_type == "minimax_m3"
+        or model_type in ("minimax_m3", "deepseek_v41_text")
     ):
         return 1
     return 0

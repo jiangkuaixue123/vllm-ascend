@@ -32,6 +32,14 @@ class TestDynamicMxQuantScaleAlg(TestBase):
         )
 
     @patch("vllm_ascend.quantization.utils.get_current_hardware_profile")
+    def test_v41_uses_checkpoint_scale_rounding_on_supported_hardware(self, mock_profile):
+        config = self._config("DeepseekV41ForCausalLM", model_type="deepseek_v41_text")
+        mock_profile.return_value.supports.return_value = True
+        self.assertEqual(get_dynamic_mx_quant_scale_alg(config), 1)
+        mock_profile.return_value.supports.return_value = False
+        self.assertEqual(get_dynamic_mx_quant_scale_alg(config), 0)
+
+    @patch("vllm_ascend.quantization.utils.get_current_hardware_profile")
     def test_uses_one_only_for_minimax_m3_on_a5(self, mock_profile):
         minimax_config = self._config("MiniMaxM3SparseForCausalLM")
         other_config = self._config("DeepseekV3ForCausalLM")

@@ -458,6 +458,14 @@ class NPUPlatform(Platform):
             logger.warning("Model config is missing. Skipping Ascend-specific config updates.")
             return
 
+        # The host-mapped Engram tables and EP-local experts require placement
+        # before generic safetensors iteration materializes any full tensor.
+        if (
+            getattr(getattr(vllm_config.model_config, "hf_config", None), "model_type", None) == "deepseek_v41"
+            and vllm_config.load_config.load_format in ("auto", "hf", "safetensors")
+        ):
+            vllm_config.load_config.load_format = "deepseek_v41"
+
         cls._validate_indexer_pp_config(vllm_config)
 
         _validate_draft_decode_context_parallel_config(vllm_config)
@@ -1299,6 +1307,14 @@ def _setup_worker_and_scheduler(
             vllm_config.scheduler_config.scheduler_cls = (
                 "vllm_ascend.core.batch_job_aware_scheduler.BatchJobAwareScheduler"
             )
+
+    if (
+        getattr(getattr(vllm_config.model_config, "hf_config", None), "model_type", None) == "deepseek_v41"
+        and vllm_config.cache_config.enable_prefix_caching
+        and vllm_config.scheduler_config.scheduler_cls is None
+    ):
+        name = "V41AsyncPrefixScheduler" if vllm_config.scheduler_config.async_scheduling else "V41PrefixScheduler"
+        vllm_config.scheduler_config.scheduler_cls = f"vllm_ascend.models.deepseek_v41.prefix_scheduler.{name}"
 
 
 def _validate_sfa_dcp_kv_sp(vllm_config: VllmConfig) -> None:

@@ -494,6 +494,13 @@ class NPUWorker(WorkerBase):
 
             self.model_runner = NPUModelRunnerV2(self.vllm_config, self.device)
         else:
+            if self.vllm_config.speculative_config is not None:
+                from vllm_ascend.models.deepseek_v41.spec_config import is_v41_spec
+
+                if is_v41_spec(self.vllm_config.speculative_config):
+                    from vllm_ascend.models.deepseek_v41.spec_runner import install_spec_runner
+
+                    install_spec_runner()
             self.model_runner = NPUModelRunner(self.vllm_config, self.device)
 
         if self.rank == 0:
@@ -536,6 +543,18 @@ class NPUWorker(WorkerBase):
         )
         return int(budget.final_planner_bytes)
 
+    def _apply_kv_cache_memory_constraints(self, budget: int) -> int:
+        budget = self._apply_kv_offload_decode_memory_constraints(budget)
+        if (
+            self.cache_config.num_gpu_blocks_override is None
+            and getattr(self.model_config.hf_text_config, "model_type", None) == "deepseek_v41_text"
+        ):
+            marker = getattr(self.get_model(), "metadata_layer", None)
+            limit = getattr(marker, "workload_budget", None)
+            if limit is not None:
+                budget = limit(budget, self.vllm_config)
+        return budget
+
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
         """Profiles the peak memory usage of the model to determine how much
@@ -565,7 +584,7 @@ class NPUWorker(WorkerBase):
                 GiB(self.init_snapshot.free_memory),
                 GiB(kv_cache_memory_bytes),
             )
-            return self._apply_kv_offload_decode_memory_constraints(kv_cache_memory_bytes)
+            return self._apply_kv_cache_memory_constraints(kv_cache_memory_bytes)
 
         # Execute a forward pass with dummy inputs to profile the memory usage
         # of the model.
@@ -628,7 +647,7 @@ class NPUWorker(WorkerBase):
         logger.info_once(
             "Available KV cache memory: %.2f GiB", GiB(self.available_kv_cache_memory_bytes), scope="local"
         )
-        self.available_kv_cache_memory_bytes = self._apply_kv_offload_decode_memory_constraints(
+        self.available_kv_cache_memory_bytes = self._apply_kv_cache_memory_constraints(
             self.available_kv_cache_memory_bytes
         )
 

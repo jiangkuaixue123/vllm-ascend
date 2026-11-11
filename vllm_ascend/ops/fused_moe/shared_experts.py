@@ -366,9 +366,8 @@ class AscendSharedExperts:
                 original_dtype = hidden_states.dtype
                 # Execute dynamic quant concurrently with MoE gate.
                 torch.npu.current_stream().wait_event(fused_moe_evts.before_routed_experts)
-                quantized_x, pertoken_scale = torch_npu.npu_dynamic_mx_quant(
-                    hidden_states, dst_type=torch.float8_e4m3fn
-                )
+                quantize_input = getattr(self.layer.act_fn, "quantize_mx_input", torch_npu.npu_dynamic_mx_quant)
+                quantized_x, pertoken_scale = quantize_input(hidden_states, dst_type=torch.float8_e4m3fn)
                 # Execute the gate projection and activation concurrently with the
                 # dispatch communication.
                 maybe_wait_event(fused_moe_evts.before_dispatch)
@@ -383,6 +382,8 @@ class AscendSharedExperts:
                         activate_left=True,
                         dst_type=SITU_MX_DST_TYPE_E4M3FN,
                     )
+                elif hasattr(self.layer.act_fn, "quantize_mx"):
+                    quantized_x, swiglu_out_scale = self.layer.act_fn.quantize_mx(hidden_states)
                 else:
                     quantized_x, swiglu_out_scale, _ = torch.ops._C_ascend.npu_swiglu_group_quant(
                         hidden_states,
