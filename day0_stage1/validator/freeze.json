@@ -1,0 +1,22 @@
+{
+  "scope": "Phase 1 text-only eager. Independent CPU reference. The complete campaign also needs a real A5 service.",
+  "frozen_utc": "2026-11-10T08:03:42.928273+00:00",
+  "request_gate": "Alias advertised, prompt IDs match, original smoke requires 4/4 exact trimmed contents, status 200, finish_reason=stop, returned alias and nonempty request IDs",
+  "input_and_sampling": "prompts.json",
+  "trace_policy": "Identical prompt IDs and greedy tokens until EOS or step budget, complete prefill and at least two decode steps for the successive-decode probe. Record full logits, top16 and every backbone layer. On divergence retain step, token position, layer, rank and both tensor files.",
+  "numerics": "No cross-backend floating tolerance supplied. Report exact first differences and per-tensor deltas. Approximate matches alone cannot yield a numeric PASS.",
+  "cpu_operator": "Read actual FP8 table plus scales of both layers, compare incremental versus whole prompt hashes, reconstruct independent q/k gate and preserve real-weight output under the specified diagnostic residual.",
+  "model_integrity": "Original shard/index identities are published in hf-source.json. Record what was actually verified in each run. A size/index match alone is not a full-content SHA256 check.",
+  "files": {
+    "check_service.py": "b008806846ddf03473e556af76bb7808bc45218c6bd86bb34f6f1b5bbf0acb88",
+    "compare_traces.py": "e76de2453aa6ce9865dbb57314a25070cca891d9722e384f4689365cfaa1ac28",
+    "cpu_math.py": "a3d8d736a17e92f59a74169a8b60dd2b6c460d49abff2f818b6a7df1f919e722",
+    "freeze_prompts.py": "f4262fe5cfe69c56bc8443209b22246944225dcf701185543e69f1bbc134a4a2",
+    "hf-source.json": "51871acfce6e85bf3e827c9798ccd9c3c2bab84e151e1cb889a038161d260e3a",
+    "hf_cpu_reference.py": "35aa9d7ab0e92fcbf9b1a713205dc4691ebb2523a197d3ace6a2536fae42139c",
+    "hf_engram_cpu.py": "4bc8144ccc55324598a8a2a8a4c4fe943e90e4d7f15444382b6a50395a064678",
+    "prompts.json": "d3b1d15694f0c28b627ce7f56b766318577fd8a67bc5458f4c17025d6d939830",
+    "smoke_chat.py": "867175bfe482912117f90946c979f3bcddff02a8fa6e7289715f8f785c9ad47b",
+    "stage1_trace.py": "9c63f0247f1291a3678150cce99130a0080e01a024a78982eec0c023bef5778f"
+  }
+}

@@ -1,0 +1,170 @@
+{
+  "revision": "314113f8a7dadb388215396ba5fbee2c610a04d6",
+  "template_kwargs": {
+    "thinking_mode": "chat",
+    "reasoning_effort": "high"
+  },
+  "generation": {
+    "temperature": 0,
+    "smoke_max_tokens": 32,
+    "oracle_max_tokens": 8,
+    "stop_token_id": 1,
+    "add_generation_prompt": true
+  },
+  "served_model": "dsv41-stage1",
+  "max_model_len": 256,
+  "smoke_concurrency": 1,
+  "smoke_timeout_s": 600,
+  "request_retries": 0,
+  "packages": {
+    "transformers": "5.14.1",
+    "tokenizers": "0.22.2",
+    "jinja2": "3.1.6"
+  },
+  "cases": [
+    {
+      "id": "smoke-1",
+      "messages": [
+        {
+          "role": "user",
+          "content": "只回复两个小写字母 ok。"
+        }
+      ],
+      "rendered": "<｜begin▁of▁sentence｜><｜User｜>只回复两个小写字母 ok。<｜Assistant｜></think>",
+      "prompt_ids": [
+        0,
+        128803,
+        1299,
+        20143,
+        3878,
+        844,
+        2935,
+        29156,
+        9109,
+        320,
+        128804,
+        128822
+      ],
+      "expected": "ok"
+    },
+    {
+      "id": "smoke-2",
+      "messages": [
+        {
+          "role": "user",
+          "content": "2 加 2 等于几？只回复阿拉伯数字。"
+        }
+      ],
+      "rendered": "<｜begin▁of▁sentence｜><｜User｜>2 加 2 等于几？只回复阿拉伯数字。<｜Assistant｜></think>",
+      "prompt_ids": [
+        0,
+        128803,
+        20,
+        223,
+        1107,
+        223,
+        20,
+        223,
+        15120,
+        2040,
+        1148,
+        1299,
+        20143,
+        50170,
+        8283,
+        320,
+        128804,
+        128822
+      ],
+      "expected": "4"
+    },
+    {
+      "id": "smoke-3",
+      "messages": [
+        {
+          "role": "user",
+          "content": "10 减 3 等于几？只回复阿拉伯数字。"
+        }
+      ],
+      "rendered": "<｜begin▁of▁sentence｜><｜User｜>10 减 3 等于几？只回复阿拉伯数字。<｜Assistant｜></think>",
+      "prompt_ids": [
+        0,
+        128803,
+        553,
+        223,
+        3775,
+        223,
+        21,
+        223,
+        15120,
+        2040,
+        1148,
+        1299,
+        20143,
+        50170,
+        8283,
+        320,
+        128804,
+        128822
+      ],
+      "expected": "7"
+    },
+    {
+      "id": "smoke-4",
+      "messages": [
+        {
+          "role": "user",
+          "content": "只回复两个小写字母 ok。"
+        }
+      ],
+      "rendered": "<｜begin▁of▁sentence｜><｜User｜>只回复两个小写字母 ok。<｜Assistant｜></think>",
+      "prompt_ids": [
+        0,
+        128803,
+        1299,
+        20143,
+        3878,
+        844,
+        2935,
+        29156,
+        9109,
+        320,
+        128804,
+        128822
+      ],
+      "expected": "ok"
+    },
+    {
+      "id": "numerical",
+      "messages": [
+        {
+          "role": "user",
+          "content": "请按顺序列出从二十到三十的整数，用逗号分隔。"
+        }
+      ],
+      "rendered": "<｜begin▁of▁sentence｜><｜User｜>请按顺序列出从二十到三十的整数，用逗号分隔。<｜Assistant｜></think>",
+      "prompt_ids": [
+        0,
+        128803,
+        2788,
+        2635,
+        18143,
+        52271,
+        1255,
+        7962,
+        621,
+        13468,
+        301,
+        27342,
+        303,
+        642,
+        33347,
+        2449,
+        74534,
+        320,
+        128804,
+        128822
+      ]
+    }
+  ]
+}
