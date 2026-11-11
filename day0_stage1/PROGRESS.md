@@ -150,3 +150,4 @@
 | 2026-11-12 | 1M 冷请求在 3,543 秒时已预填充 263,088 / 1,048,560 个输入 token，累计取得 1,037 组完整八卡采样。 | [长请求验收](../day0_stage3/validator/context_probe.py) · [逐 rank 资源采样](../day0_stage3/validator/sample_memory.py) |
 | 2026-11-12 | 1M 冷请求在 6,176 秒时已预填充 394,128 / 1,048,560 个输入 token，累计取得 1,805 组完整八卡采样。 | [长请求验收](../day0_stage3/validator/context_probe.py) · [逐 rank 资源采样](../day0_stage3/validator/sample_memory.py) |
 | 2026-11-12 | 1M 冷请求在 9,398 秒时已预填充 525,168 / 1,048,560 个输入 token，累计取得 2,747 组完整八卡采样。 | [长请求验收](../day0_stage3/validator/context_probe.py) · [逐 rank 资源采样](../day0_stage3/validator/sample_memory.py) |
+| 2026-11-12 | 1M 冷请求在 13,210 秒时已预填充 656,208 / 1,048,560 个输入 token，累计取得 3,863 组完整八卡采样。 | [长请求验收](../day0_stage3/validator/context_probe.py) · [逐 rank 资源采样](../day0_stage3/validator/sample_memory.py) |
