@@ -16,19 +16,28 @@ from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
 from vllm_ascend.utils import AscendDeviceType, enable_custom_op, get_ascend_device_type
 
 if HAS_TRITON:
-    from vllm_ascend.ops.triton.deepseek_v41_paged_index_score import paged_index_scores, supports_paged_index_scores
+    from vllm_ascend.ops.triton.deepseek_v41_paged_index_score import (
+        paged_index_scores,
+        supports_grouped_index_scores,
+        supports_paged_index_scores,
+    )
 
 
 @pytest.mark.skipif(not HAS_TRITON, reason="Requires Ascend Triton")
-@pytest.mark.parametrize("rows,ratio", [(6, 2), (12, 1)])
+@pytest.mark.parametrize(
+    "rows,ratio,group_start",
+    [(6, 2, None), (12, 1, None)]
+    + [(rows, ratio, start) for rows, start in ((3, 0), (3, 3), (6, 0), (12, 0)) for ratio in (1, 2)],
+)
 @torch.inference_mode()
-def test_paged_index_score_dynamic_replay(rows, ratio):
+def test_paged_index_score_dynamic_replay(rows, ratio, group_start):
     if get_ascend_device_type() != AscendDeviceType.A3:
         pytest.skip("A3 only")
     init_device_properties_triton()
     assert enable_custom_op()
     gen = torch.Generator().manual_seed(83)
-    block, limit, dim, heads = 128, 16384, 128, 32
+    limit = 153600 if group_start is not None and (rows, ratio) in ((3, 2), (12, 1)) else 16384
+    block, dim, heads = 128, 128, 32
     capacity = limit // ratio
     field = torch.empty(limit * 2, 1024, dtype=torch.bfloat16, device="npu")[:, 512:640]
     latent = fp4_quant_dequant(torch.randn(len(field), dim, generator=gen).bfloat16().npu(), 32)
@@ -44,6 +53,11 @@ def test_paged_index_score_dynamic_replay(rows, ratio):
         max_model_len=limit,
     )
     dst = SimpleNamespace(active=src.active.clone(), seq_lens=src.seq_lens.clone(), max_model_len=limit)
+    if group_start is not None:
+        src.query_width = dst.query_width = 6
+        src.grouped_row_start = dst.grouped_row_start = group_start
+        dst.seq_lens, dst.active = src.seq_lens, src.active
+    assert supports_grouped_index_scores(q, src, dst) == (group_start is not None)
     assert supports_paged_index_scores(q, field, weights, src, dst, ratio, block)
     cache = SimpleNamespace(block_size=block, field=lambda *args: field)
     cols = torch.arange(capacity, device="npu")[None, :]
@@ -74,6 +88,9 @@ def test_paged_index_score_dynamic_replay(rows, ratio):
         out = fused()
     for step, length in enumerate((0, 127, 129, 1029, 2050, limit, 513, 0)):
         tpl = torch.randperm(limit * 2 // block, generator=gen)[: limit // block].expand(rows, -1).clone().int()
+        if group_start is not None:
+            for begin in range(6, rows, 6):
+                tpl[begin : begin + 6] = torch.randperm(limit * 2 // block, generator=gen)[: limit // block].int()
         tpl[:, 0] = 0
         if step == 4:
             tpl[:, 1] = -1
@@ -81,7 +98,7 @@ def test_paged_index_score_dynamic_replay(rows, ratio):
         table.copy_(tpl)
         lengths = (torch.arange(rows) % 6 + length - 5).clamp_min(0)
         dst.seq_lens.copy_(lengths)
-        src.seq_lens.copy_((lengths - 7).clamp_min(0))
+        src.seq_lens.copy_(lengths if group_start is not None else (lengths - 7).clamp_min(0))
         dst.active.copy_(lengths > 0)
         src.active.copy_(lengths > 0)
         src.active[1] = False
@@ -90,13 +107,47 @@ def test_paged_index_score_dynamic_replay(rows, ratio):
         ref = selected(original())
         graph.replay()
         torch.npu.synchronize()
-        for x, y, z in zip(out, eager, ref):
-            assert torch.equal(x, y) and torch.equal(x, z)
+        for part, (x, y, z) in enumerate(zip(out, eager, ref)):
+            torch.testing.assert_close(
+                x,
+                y,
+                rtol=0,
+                atol=0,
+                msg=lambda message, step=step, part=part: f"step={step}, part={part}, graph/eager\n{message}",
+            )
+            torch.testing.assert_close(
+                x,
+                z,
+                rtol=0,
+                atol=0,
+                msg=lambda message, step=step, part=part: f"step={step}, part={part}, graph/reference\n{message}",
+            )
+
+
+@pytest.mark.skipif(not HAS_TRITON, reason="Requires Ascend Triton")
+@pytest.mark.parametrize("changed", ["query_width", "grouped_row_start", "seq_lens", "active", "dtype"])
+def test_grouped_index_requires_matching_source_inputs(changed):
+    q = torch.zeros(3, 32, 128)
+    md = dict(
+        query_width=6,
+        grouped_row_start=3,
+        seq_lens=torch.ones(3, dtype=torch.int64),
+        active=torch.ones(3, dtype=torch.bool),
+    )
+    src, dst = SimpleNamespace(**md), SimpleNamespace(**md)
+    assert supports_grouped_index_scores(q, src, dst)
+    if changed == "dtype":
+        src.seq_lens = src.seq_lens.view(torch.int32)[:3]
+    else:
+        value = getattr(src, changed)
+        setattr(src, changed, value.clone() if isinstance(value, torch.Tensor) else value + 1)
+    assert not supports_grouped_index_scores(q, src, dst)
 
 
 @pytest.mark.parametrize("tensor_device", ["cpu", "npu"])
+@pytest.mark.parametrize("rows,tp", [(3, 8), (6, 4), (6, 8), (12, 4)])
 @torch.inference_mode()
-def test_paged_decode_dispatch_matches_reference(tensor_device):
+def test_paged_decode_dispatch_matches_reference(tensor_device, rows, tp):
     if tensor_device == "npu" and (
         not torch.npu.is_available()
         or attention.paged_index_scores is None
@@ -105,7 +156,7 @@ def test_paged_decode_dispatch_matches_reference(tensor_device):
         pytest.skip("Requires A3 and Ascend Triton")
     if tensor_device == "npu":
         init_device_properties_triton()
-    rows, heads, dim, block = 6, 32, 128, 128
+    heads, dim, block = 32, 128, 128
     gen = torch.Generator(device="cpu").manual_seed(42)
 
     def values(shape):
@@ -118,10 +169,12 @@ def test_paged_decode_dispatch_matches_reference(tensor_device):
     cache = SimpleNamespace(block_size=block, field=lambda *args: field)
     cache.decode_read = lambda *args: attention.DeepseekV41Cache.decode_read(cache, *args)
     md = SimpleNamespace(
-        active=torch.tensor([True, True, False, True, True, True], device=tensor_device),
-        seq_lens=torch.tensor([1, 27, 0, 128, 133, 255], device=tensor_device),
+        active=torch.tensor([True, True, False, True, True, True] * 2, device=tensor_device)[:rows],
+        seq_lens=torch.tensor([1, 27, 0, 128, 133, 255] * 2, device=tensor_device)[:rows],
         max_model_len=block * 2,
         block_table_tensor=torch.tensor([[1, 0]] * rows, dtype=torch.int32, device=tensor_device),
+        query_width=6,
+        grouped_row_start=3 if rows == 3 else 0,
     )
     runtime = SimpleNamespace(source_cache=cache, source_decode=md)
     cfg = SimpleNamespace(
@@ -137,7 +190,7 @@ def test_paged_decode_dispatch_matches_reference(tensor_device):
         ratio=2,
         layer_id=0,
         dim=512,
-        tp=4,
+        tp=tp,
         dsa_cp=True,
         index_heads=heads,
         config=cfg,
