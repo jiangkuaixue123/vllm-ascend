@@ -181,10 +181,23 @@ template <typename T0, typename U, typename T1, typename Tiling, typename RowCod
             } else if (tilingData->layout == 2 && tilingData->quantMode == QUANT_MDOE_GROUP_MXFP8) {
                 for (int32_t curValidIdx = 0; curValidIdx < validIdx; curValidIdx++) {
                     int32_t slot = indexLocal.GetValue(curValidIdx);
-                    CopyBlockSplitKv(kvCacheLocal[curValidIdx * RoundUp<T1>(tilingData->valuePerToken)],
+                    int64_t blockIdx = static_cast<int64_t>(slot) / tilingData->blockSize;
+                    int64_t slotInBlock = static_cast<int64_t>(slot) % tilingData->blockSize;
+
+                    // CopyOut value (FP8 quant + BF16 rope)
+                    int64_t valueGmOff = blockIdx * tilingData->blockStride
+                                       + slotInBlock * tilingData->valuePerToken;
+                    CopyOut(
+                        kvCacheLocal[curValidIdx * RoundUp<T1>(tilingData->valuePerToken)],
+                        kvCacheGm[valueGmOff], 1, tilingData->valuePerToken);
+
+                    // CopyOut scale (uint8)
+                    int64_t scaleGmOff = blockIdx * tilingData->blockStride
+                                       + tilingData->blockSize * tilingData->valuePerToken
+                                       + slotInBlock * tilingData->scalePerToken;
+                    CopyOut(
                         kvCacheScaleLocal[curValidIdx * RoundUp<T1>(tilingData->scalePerToken)],
-                        kvCacheGm, slot, tilingData->blockSize, tilingData->valuePerToken,
-                        tilingData->scalePerToken, tilingData->blockStride);
+                        kvCacheGm[scaleGmOff], 1, tilingData->scalePerToken);
                 }
             } else {
                 for (int32_t curValidIdx = 0; curValidIdx < validIdx; curValidIdx++) {

@@ -74,8 +74,12 @@ struct CompactRowWriter {
         using namespace KvCompressEpilogOps;
         const int64_t offset = row * RoundUp<uint8_t>(tiling->kvCacheCol);
         if (tiling->quantMode == kMixedMode) {
-            CopyBlockSplitKv(local[offset], local[offset + kMixedValues], cache, slot, kMixedPage,
-                             kMixedValues, kMixedScales, kMixedPage * (kMixedValues + kMixedScales));
+            // Match the V1 layout-2 page formula with fixed 576/8-byte planes.
+            const int64_t base = (slot / kMixedPage) * kMixedPage * (kMixedValues + kMixedScales);
+            const int64_t lane = slot % kMixedPage;
+            CopyOut(local[offset], cache[base + lane * kMixedValues], 1, kMixedValues);
+            CopyOut(local[offset + kMixedValues], cache[base + kMixedPage * kMixedValues + lane * kMixedScales],
+                    1, kMixedScales);
         } else {
             CopyOut(local[offset], cache[slot * tiling->kvCacheCol], 1, tiling->kvCacheCol);
         }

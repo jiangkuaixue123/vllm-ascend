@@ -719,18 +719,6 @@ __aicore__ inline void CopyOut(
     DataCopyPad<T, mode>(outputGm, outputTensor, dataCopyParams);
 }
 
-// PA_BBND stores all value rows of a page before its scale rows.
-template <typename T>
-__aicore__ inline void CopyBlockSplitKv(const LocalTensor<T>& values, const LocalTensor<T>& scales,
-    GlobalTensor<T>& cache, int64_t slot, int64_t blockSize, int64_t valueBytes, int64_t scaleBytes,
-    int64_t blockStride)
-{
-    const int64_t base = (slot / blockSize) * blockStride;
-    const int64_t lane = slot % blockSize;
-    CopyOut(values, cache[base + lane * valueBytes], 1, valueBytes);
-    CopyOut(scales, cache[base + blockSize * valueBytes + lane * scaleBytes], 1, scaleBytes);
-}
-
 } // namespace KvCompressEpilogOps
 
 #endif
