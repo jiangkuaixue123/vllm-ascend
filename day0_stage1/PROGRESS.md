@@ -135,3 +135,4 @@
 | 2026-11-11 | 六项融合已合回开发分支。已核对合并后的模型、权重加载器、设备扩展、打包代码及设备回归测试与实际接受八卡验证的版本一致。评分与设备追踪服务均已退出。 | [实现和验收条件](PLAN.md#a5-融合算子接入) · [复算两轮成绩](../day0_stage2/validator/compare_gsm8k.py) |
 | 2026-11-11 | 任务方确认阶段三 GPQA 测试已完成。CPU 绑核开关和串行前缀缓存已实测。剩余两项是同一 DP rank 的并发输出一致性，以及 256K、1M 单请求长上下文验收。256K 在预填充时按要求停止，1M 请求尚未启动。 | [阶段三计划](PLAN.md#阶段三的服务与验收) · [并发对照](../day0_stage3/validator/prefix_overlap.py) · [长请求检查](../day0_stage3/validator/context_probe.py) |
 | 2026-11-11 | 已按任务方要求重启上述两项验收。六算子版本与本轮起点的运行时代码相同，指定镜像已启动独立的八卡 cache-off 服务，用原串行输入与同 rank 双请求复查分歧。 | [收尾方案](PLAN.md#阶段三的服务与验收) · [并发输入](../day0_stage3/validator/prefix_overlap.py) |
+| 2026-11-11 | 六算子基线的串行 cache-off/on 各四组输入均符合对照。同一 rank 的 worker 实际同时调度一条命中和一条未命中请求，后者第 3 个输出 token 与单独运行不同。两条请求均为冷预填充时也复现了首个 token 分歧。4K 三次均按序找回三个标记，热请求命中 3,968 个 token，冷、热定长在第 9 个 token 分歧。已据此开始逐层比对预填充。 | [并发探针](../day0_stage3/validator/prefix_overlap.py) · [长请求核对](../day0_stage3/validator/compare_context.py) |
