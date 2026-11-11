@@ -588,6 +588,7 @@ __aicore__ inline void VFProcessInvRmsPart3(const LocalTensor<float> &yLocal,
 
 
 // Matmul的结果会直接FixPipe到UB上，不会在搬运时完成Split动作，因此需要在UB内完成Split动作
+template <bool packedOutput = false>
 __aicore__ inline void VFProcessPre(const LocalTensor<float> &preLocal, const LocalTensor<float> &mixLocal,
                                     const LocalTensor<float> &hcBaseLocal,
                                     float scale, float eps, uint16_t curRowNum, uint16_t curColNum, uint16_t hcMix)
@@ -596,8 +597,8 @@ __aicore__ inline void VFProcessPre(const LocalTensor<float> &preLocal, const Lo
     __local_mem__ float *mixLocalAddr = (__local_mem__ float *)mixLocal.GetPhyAddr();
     __local_mem__ float *hcBaseLocalAddr = (__local_mem__ float *)hcBaseLocal.GetPhyAddr();
     uint16_t loopCount = CeilDiv(curColNum, VL_FP32);
-    uint32_t curColNumAlign = RoundUp<float>(curColNum);
     uint32_t hcMixAlign = RoundUp<float>(hcMix);
+    uint32_t outputStride = packedOutput ? RoundUp<float>(curColNum) : hcMixAlign;
     if (loopCount > 1) {
         __VEC_SCOPE__
         {
@@ -616,7 +617,7 @@ __aicore__ inline void VFProcessPre(const LocalTensor<float> &preLocal, const Lo
                     Add(mix, mix, base, pregLoop);
                     VFSigmoid(mix, mix, one, pregLoop);
                     Adds(mix, mix, eps, pregLoop);
-                    StoreOutputData(preLocalAddr, mix, pregLoop, i * VL_FP32 + j * hcMixAlign);
+                    StoreOutputData(preLocalAddr, mix, pregLoop, i * VL_FP32 + j * outputStride);
                 }
             }
         }
@@ -636,7 +637,7 @@ __aicore__ inline void VFProcessPre(const LocalTensor<float> &preLocal, const Lo
                 Add(mix, mix, base, pregLoop);
                 VFSigmoid(mix, mix, one, pregLoop);
                 Adds(mix, mix, eps, pregLoop);
-                StoreOutputData(preLocalAddr, mix, pregLoop, i * hcMixAlign);
+                StoreOutputData(preLocalAddr, mix, pregLoop, i * outputStride);
             }
         }
     }
@@ -1141,6 +1142,20 @@ __aicore__ inline void CopyOut(const LocalTensor<T> &outputTensor, const LocalTe
     DataCopy(outputGm, outputTensor, dataCopyParams);
 }
 
+
+// Write the carried FP32 coefficients through the same double-buffered VECOUT
+// queue as post. DataCopyPad handles four FP32 values per 32-byte-aligned UB row.
+__aicore__ inline void WritePreCoefficients(TQue<QuePosition::VECOUT, 1> &queue,
+    const GlobalTensor<float> &output, const LocalTensor<float> &mixes, const LocalTensor<float> &base,
+    float scale, float eps, uint16_t rows, uint16_t hc, uint16_t mixWidth)
+{
+    auto pre = queue.AllocTensor<float>();
+    VFProcessPre<true>(pre, mixes, base, scale, eps, rows, hc, mixWidth);
+    queue.EnQue(pre);
+    pre = queue.DeQue<float>();
+    CopyOut(pre, output, rows, hc);
+    queue.FreeTensor(pre);
+}
 
 } // namespace HcPreSinkhorn
 

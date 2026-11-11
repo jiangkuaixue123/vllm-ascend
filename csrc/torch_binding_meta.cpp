@@ -1036,7 +1036,7 @@ at::Tensor npu_hc_post_meta(
     return outputs;
 }
 
-std::tuple<at::Tensor, at::Tensor, at::Tensor> construct_hc_pre_output_tensor(const at::Tensor& x, int64_t hc_mult)
+std::tuple<at::Tensor, at::Tensor, at::Tensor> construct_hc_pre_output_tensor(const at::Tensor& x, int64_t hc_mult, bool return_pre)
 {
     auto xDims = x.dim();
     at::SmallVector<c10::SymInt, 8> y_size;
@@ -1057,7 +1057,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> construct_hc_pre_output_tensor(co
         comb_frag_size = {bs, hc_mult, hc_mult};
     }
 
-    at::Tensor y = at::empty_symint(c10::SymIntArrayRef(y_size), x.options().dtype(at::kBFloat16));
+    at::Tensor y = at::empty_symint(c10::SymIntArrayRef(return_pre ? post_size : y_size),
+                                    x.options().dtype(return_pre ? at::kFloat : at::kBFloat16));
     at::Tensor post = at::empty_symint(c10::SymIntArrayRef(post_size), x.options().dtype(at::kFloat));
     at::Tensor comb_frag = at::empty_symint(c10::SymIntArrayRef(comb_frag_size), x.options().dtype(at::kFloat));
 
@@ -1066,9 +1067,9 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> construct_hc_pre_output_tensor(co
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor> npu_hc_pre_meta(
     const at::Tensor& x, const at::Tensor& hc_fn, const at::Tensor& hc_scale, const at::Tensor& hc_base,
-    int64_t hc_mult, int64_t hc_sinkhorn_iters, double norm_eps, double hc_eps)
+    int64_t hc_mult, int64_t hc_sinkhorn_iters, double norm_eps, double hc_eps, bool return_pre)
 {
-    auto output_tensors = construct_hc_pre_output_tensor(x, hc_mult);
+    auto output_tensors = construct_hc_pre_output_tensor(x, hc_mult, return_pre);
     at::Tensor y = std::get<0>(output_tensors);
     at::Tensor post = std::get<1>(output_tensors);
     at::Tensor comb_frag = std::get<2>(output_tensors);

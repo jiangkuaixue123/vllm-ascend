@@ -66,6 +66,20 @@ public:
         this->AICore().AddConfig("ascend910_93");
 
         OpAICoreConfig regbaseCfg;
+        // On A5, an FP32 first output returns the four pre-mix coefficients
+        // for a later sublayer. The BF16 first output is the original reduced y.
+        regbaseCfg.Input("x").ParamType(REQUIRED).DataType({ge::DT_BF16, ge::DT_BF16})
+            .Format({ge::FORMAT_ND, ge::FORMAT_ND}).UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND});
+        for (const char *input : {"hc_fn", "hc_scale", "hc_base"}) {
+            regbaseCfg.Input(input).ParamType(REQUIRED).DataType({ge::DT_FLOAT, ge::DT_FLOAT})
+                .Format({ge::FORMAT_ND, ge::FORMAT_ND}).UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND});
+        }
+        regbaseCfg.Output("y").ParamType(REQUIRED).DataType({ge::DT_BF16, ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND, ge::FORMAT_ND}).UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND});
+        for (const char *output : {"post", "comb_frag"}) {
+            regbaseCfg.Output(output).ParamType(REQUIRED).DataType({ge::DT_FLOAT, ge::DT_FLOAT})
+                .Format({ge::FORMAT_ND, ge::FORMAT_ND}).UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND});
+        }
         regbaseCfg.DynamicCompileStaticFlag(true)
             .DynamicRankSupportFlag(true)
             .DynamicShapeSupportFlag(true)

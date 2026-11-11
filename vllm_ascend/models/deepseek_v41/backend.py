@@ -40,6 +40,7 @@ from torch.nn import functional as F
 
 from .config import text_model_args
 from .ngram import EngramLayout, NgramHashState
+from .native_ops import native_hc_ops
 from .rotary import rotate_rows
 from .eager_kernels import act_quant, compact_linear, fp4_act_quant, hc_split_sinkhorn, sparse_attn
 from .ep import ExpertPlacement
@@ -690,6 +691,14 @@ class Block(nn.Module):
     def hc_mixes(self, x: torch.Tensor, hc_fn: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor):
         """x: [b,s,hc,d], hc_fn: [mix_hc, hc*d], hc_scale: [3], hc_base: [mix_hc]. Returns the
         pre / post / comb coefficients, split out of one projection of the flattened stream."""
+        ops = native_hc_ops(x)
+        if ops is not None:
+            # V4.1 carries this pre gate to the next sublayer. Its current
+            # input is reduced separately with the incoming gate.
+            return ops.npu_hc_pre_v2(
+                x.contiguous(), hc_fn, hc_scale, hc_base, self.hc_mult,
+                self.hc_sinkhorn_iters, self.norm_eps, self.hc_eps, return_pre=True,
+            )
         # normalized over the whole flattened hc*d stream, one statistic per token
         x = x.flatten(2).float()
         rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + self.norm_eps)
@@ -704,6 +713,9 @@ class Block(nn.Module):
     def hc_post(self, x: torch.Tensor, residual: torch.Tensor, post: torch.Tensor, comb: torch.Tensor):
         """Expand the sublayer output back to hc copies and mix the residual in through `comb`.
         x: [b,s,d], residual: [b,s,hc,d], post: [b,s,hc], comb: [b,s,hc,hc] -> [b,s,hc,d]"""
+        ops = native_hc_ops(residual)
+        if ops is not None and x.dtype == residual.dtype:
+            return ops.npu_hc_post(x.contiguous(), residual.contiguous(), post.contiguous(), comb.contiguous())
         y = post.unsqueeze(-1) * x.unsqueeze(-2) + torch.sum(comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=2)
         return y.type_as(x)
 

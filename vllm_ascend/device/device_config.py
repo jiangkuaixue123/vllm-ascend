@@ -25,6 +25,11 @@ class DeviceConfig:
 
     _device_type: AscendDeviceType
 
+    @property
+    def supports_hc_pre_coefficients(self) -> bool:
+        """The A5 HcPre kernel can return the FP32 gate for the next sublayer."""
+        return self._device_type == AscendDeviceType.A5
+
 
 def _device_type_from_build_info() -> AscendDeviceType:
     from vllm_ascend import _build_info  # type: ignore

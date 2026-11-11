@@ -19,6 +19,18 @@ def initialize_native_ops():
     import_module("vllm_ascend.vllm_ascend_C")
 
 
+def native_hc_ops(residual):
+    if residual.device.type != "npu" or residual.dtype != torch.bfloat16 or residual.shape[-2:] != (4, 5120):
+        return None
+    # The standalone CPU oracle does not initialize the installed device package.
+    from vllm_ascend.device.device_config import get_device_config
+
+    if not get_device_config().supports_hc_pre_coefficients:
+        return None
+    initialize_native_ops()
+    return torch.ops._C_ascend
+
+
 def hash_route(logits, bias, *, top_k, temperature=1.0, route_scale=1.5):
     """Text-only selection: sqrt(softplus(logit/T)) + bias, then unbiased renorm."""
     # The image's norm_type=2 is sqrt-softplus with unbiased top-k renormalization.

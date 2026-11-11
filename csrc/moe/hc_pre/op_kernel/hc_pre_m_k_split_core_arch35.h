@@ -249,7 +249,7 @@ private:
 };
 
 
-template <typename T>
+template <typename T, typename Y>
 class HcPreMKSplitCorePart2 {
 public:
     __aicore__ inline HcPreMKSplitCorePart2()
@@ -265,7 +265,7 @@ public:
         xGm.SetGlobalBuffer((__gm__ T*)x);
         hcScaleGm.SetGlobalBuffer((__gm__ float*)hcScale);
         hcBaseGm.SetGlobalBuffer((__gm__ float*)hcBase);
-        yGm.SetGlobalBuffer((__gm__ T*)y);
+        yGm.SetGlobalBuffer((__gm__ Y*)y);
         postGm.SetGlobalBuffer((__gm__ float*)post);
         combFragGm.SetGlobalBuffer((__gm__ float*)combFrag);
         mmGm.SetGlobalBuffer((__gm__ float*)workspace);
@@ -336,27 +336,34 @@ public:
 
                 VFProcessInvRmsPart3WithGroupReduce(mixesLocal, rmsAndmmLocal, rmsAndmmLocal[mmLocalSize], tilingData->normEps, tilingData->kBlockFactor, curRowFactor, tilingData->hcMix);
 
-                VFProcessPre(
-                    mixesLocal, mixesLocal, hcBase0Local, hcScaleGm.GetValue(0), tilingData->hcEps,
-                    curRowFactor, tilingData->hcMult, tilingData->hcMix);
-                for (int64_t dLoopIdx = 0; dLoopIdx < tilingData->dLoop; dLoopIdx++) {
-                    int64_t curDFactor =
-                        (dLoopIdx == tilingData->dLoop - 1) ? tilingData->tailDFactor : tilingData->dFactor;
-                    xLocal = xQue.template AllocTensor<T>();
-                    CopyIn(
-                        xGm[xGmBaseOffset + rowOuterIdx * tilingData->stage2RowFactor * tilingData->hcMult * tilingData->d +
-                            dLoopIdx * tilingData->dFactor],
-                        xLocal, curRowFactor * tilingData->hcMult, curDFactor, tilingData->d - curDFactor);
-                    xQue.template EnQue(xLocal);
-                    xLocal = xQue.template DeQue<T>();
+                if constexpr (IsSameType<Y, float>::value) {
+                    const int64_t preOffset = (curBlockIdx * tilingData->rowOfFormerBlock + rowOuterIdx * tilingData->stage2RowFactor) * tilingData->hcMult;
+                    WritePreCoefficients(postQue, yGm[preOffset], mixesLocal, hcBase0Local,
+                                         hcScaleGm.GetValue(0), tilingData->hcEps, curRowFactor,
+                                         tilingData->hcMult, tilingData->hcMix);
+                } else {
+                    VFProcessPre(
+                        mixesLocal, mixesLocal, hcBase0Local, hcScaleGm.GetValue(0), tilingData->hcEps,
+                        curRowFactor, tilingData->hcMult, tilingData->hcMix);
+                    for (int64_t dLoopIdx = 0; dLoopIdx < tilingData->dLoop; dLoopIdx++) {
+                        int64_t curDFactor =
+                            (dLoopIdx == tilingData->dLoop - 1) ? tilingData->tailDFactor : tilingData->dFactor;
+                        xLocal = xQue.template AllocTensor<T>();
+                        CopyIn(
+                            xGm[xGmBaseOffset + rowOuterIdx * tilingData->stage2RowFactor * tilingData->hcMult * tilingData->d +
+                                dLoopIdx * tilingData->dFactor],
+                            xLocal, curRowFactor * tilingData->hcMult, curDFactor, tilingData->d - curDFactor);
+                        xQue.template EnQue(xLocal);
+                        xLocal = xQue.template DeQue<T>();
 
-                    yLocal = yQue.template AllocTensor<T>();
-                    VFProcessY(yLocal, mixesLocal, xLocal, curRowFactor, tilingData->hcMult, curDFactor, tilingData->hcMix);
-                    xQue.template FreeTensor(xLocal);
-                    yQue.template EnQue(yLocal);
-                    yLocal = yQue.template DeQue<T>();
-                    CopyOut(yLocal, yGm[curBlockIdx * tilingData->rowOfFormerBlock * tilingData->d + rowOuterIdx * tilingData->stage2RowFactor * tilingData->d + dLoopIdx * tilingData->dFactor], curRowFactor, curDFactor, tilingData->d - curDFactor);
-                    yQue.template FreeTensor(yLocal);
+                        yLocal = yQue.template AllocTensor<T>();
+                        VFProcessY(yLocal, mixesLocal, xLocal, curRowFactor, tilingData->hcMult, curDFactor, tilingData->hcMix);
+                        xQue.template FreeTensor(xLocal);
+                        yQue.template EnQue(yLocal);
+                        yLocal = yQue.template DeQue<T>();
+                        CopyOut(yLocal, yGm[curBlockIdx * tilingData->rowOfFormerBlock * tilingData->d + rowOuterIdx * tilingData->stage2RowFactor * tilingData->d + dLoopIdx * tilingData->dFactor], curRowFactor, curDFactor, tilingData->d - curDFactor);
+                        yQue.template FreeTensor(yLocal);
+                    }
                 }
 
                 // post
@@ -394,7 +401,7 @@ private:
     GlobalTensor<float> hcScaleGm;
     GlobalTensor<float> hcBaseGm;
     GlobalTensor<T> xGm;
-    GlobalTensor<T> yGm;
+    GlobalTensor<Y> yGm;
     GlobalTensor<float> postGm;
     GlobalTensor<float> combFragGm;
 
