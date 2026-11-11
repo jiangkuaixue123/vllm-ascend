@@ -8,6 +8,8 @@ import pytest
 import torch
 
 from vllm_ascend.models.deepseek_v41 import weighted_experts as w
+from vllm_ascend.ops.fused_moe.dataclass.moe_quant import MoEMxfpParams, MoEQuantParams
+from vllm_ascend.ops.fused_moe.dataclass.token_dispatcher import MoETokenDispatchInput, MoETokenDispatchOutput
 
 
 @pytest.mark.parametrize("topk", [3, 6])
@@ -82,3 +84,37 @@ def test_mc2_consumes_expanded_scales_once():
     assert torch.equal(combine.expand_scales, torch.ones_like(expanded))
     with pytest.raises(ValueError):
         w._route_weights(SimpleNamespace(combine_metadata=metadata, hidden_states=torch.empty(3, 1)), None)
+
+
+def test_v41_mc2_transports_bf16_and_ignores_unused_scale(monkeypatch):
+    x = torch.randn(4, 128).bfloat16()
+    weights = torch.tensor([[0.345678, 0.654322]]).repeat(4, 1)
+    quant = MoEQuantParams(quant_type=w.QuantType.W4A8MXFP, mxfp=MoEMxfpParams(act_quant_type=torch.float8_e4m3fn))
+    inputs = MoETokenDispatchInput(x, weights, torch.tensor([[1, 2]]).repeat(4, 1), None, quant)
+    counts = torch.tensor([4])
+    metadata = object()
+    expanded = x.flip(0)
+    unused_scale = torch.full((4,), float("nan"))
+    returned = MoETokenDispatchOutput(expanded, counts, 0, metadata, unused_scale)
+    dispatcher = object.__new__(w.TokenDispatcherWithMC2)
+    dispatch = Mock(return_value=returned)
+    monkeypatch.setattr(dispatcher, "token_dispatch", dispatch)
+    codes = torch.empty_like(expanded, dtype=torch.float8_e4m3fn)
+    scales = torch.ones((4, 2, 2), dtype=torch.uint8)
+    encode = Mock(return_value=(codes, scales))
+    monkeypatch.setattr(w, "_quantize", encode)
+    actual = w._dispatch_for_w1(dispatcher, inputs)
+    exchange = dispatch.call_args.args[0]
+    assert exchange.hidden_states is x and exchange.topk_weights is weights and exchange.topk_ids is inputs.topk_ids
+    assert (
+        not exchange.quant.dispatch_with_quant and exchange.quant.comm_quant_mode == 0 and exchange.quant.mxfp is None
+    )
+    assert inputs.quant is quant and quant.dispatch_with_quant
+    encode.assert_called_once_with(expanded)
+    assert actual.hidden_states is codes and actual.dynamic_scale is scales
+    assert actual.combine_metadata is metadata and actual.group_list is counts and actual.group_list_type == 0
+
+    other = SimpleNamespace(token_dispatch=Mock(return_value=returned))
+    assert w._dispatch_for_w1(other, inputs) is returned
+    other.token_dispatch.assert_called_once_with(inputs)
+    encode.assert_called_once()

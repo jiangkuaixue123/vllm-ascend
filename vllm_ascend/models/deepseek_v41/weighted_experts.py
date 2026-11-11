@@ -17,7 +17,9 @@ from vllm_ascend.ops.fused_moe.dataclass.token_dispatcher import (
 )
 from vllm_ascend.ops.fused_moe.moe_comm_method import FusedExpertsResult
 from vllm_ascend.ops.fused_moe.moe_utils import async_all_to_all
+from vllm_ascend.ops.fused_moe.token_dispatcher import TokenDispatcherWithMC2
 from vllm_ascend.quantization.methods import AscendW4A8MXFPDSDynamicFusedMoEMethod
+from vllm_ascend.quantization.quant_type import QuantType
 
 
 def _dispatched(values, reversed_rows):
@@ -84,6 +86,19 @@ def _quantize(x):
     return encoded.reshape_as(q).view(q.dtype), exponent.clamp_min(105).reshape_as(scale).view(scale.dtype)
 
 
+def _dispatch_for_w1(dispatcher, inputs):
+    if not isinstance(dispatcher, TokenDispatcherWithMC2):
+        return dispatcher.token_dispatch(inputs)
+    # A5 MC2's internal MX quantizer uses exponent derivation 0. Send the
+    # original BF16 rows and retain its expert order, FP32 coefficients and
+    # reverse metadata. Encode W1's input with the same rule as the checkpoint.
+    transport = replace(inputs.quant, quant_type=QuantType.NONE, comm_quant_mode=0, mxfp=None)
+    dispatched = dispatcher.token_dispatch(replace(inputs, quant=transport))
+    activation, scale = _quantize(dispatched.hidden_states)
+    # The scale result of an unquantized MC2 dispatch is unspecified.
+    return replace(dispatched, hidden_states=activation, dynamic_scale=scale)
+
+
 class V41SharedActivation(nn.Module):
     """Original FP8 shared expert, including both HF per-32 activation scales."""
 
@@ -147,7 +162,7 @@ class V41FP4Experts(AscendW4A8MXFPDSDynamicFusedMoEMethod):
         )
         stream = torch.npu.current_stream()
         before_dispatch = stream.record_event()
-        dispatch = comm.token_dispatcher.token_dispatch(build_token_dispatch_input(fused_experts_input=packed))
+        dispatch = _dispatch_for_w1(comm.token_dispatcher, build_token_dispatch_input(fused_experts_input=packed))
         weights, combine = _route_weights(dispatch, comm.token_dispatcher)
         activation, scales = dispatch.hidden_states, dispatch.dynamic_scale
         if scales is None:
