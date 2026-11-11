@@ -5,7 +5,14 @@ from importlib.util import find_spec
 
 import torch
 
-from vllm_ascend.models.deepseek_v41.compact_kv import cache_row_bytes, pack_fp4, pack_window, unpack_fp4, unpack_window
+from vllm_ascend.models.deepseek_v41.compact_kv import (
+    CacheEncoding,
+    cache_row_bytes,
+    pack_window,
+    store_compact_kv,
+    unpack_fp4,
+    unpack_window,
+)
 from vllm_ascend.models.deepseek_v41.decode_state import PagedHistory
 from vllm_ascend.models.deepseek_v41.eager_kernels import _fp4_level, act_quant, power_of_two_scale
 from vllm_ascend.models.deepseek_v41.native_ops import grouped_output_projection
@@ -90,19 +97,16 @@ def _store_source(attn, x, state, pages):
     trace_write = observer is not None and observer.captures(count)
     if trace_write:
         observer.tap("index_write_input", key)
-    index_data = pack_fp4(key, 32, False)
-    pages.index.index_copy_(0, dest, index_data)
+    store_compact_kv(pages.index, key, dest, CacheEncoding.INDEX_MXFP4)
     if trace_write:
-        observer.tap("index_write_data", index_data)
+        observer.tap("index_write_data", pages.index.index_select(0, dest))
         observer.tap("compressed_write_slots", dest)
-    del index_data
     _rotate(latent, freq, attn.rope_head_dim)
     if trace_write:
         observer.tap("compressed_write_input", latent)
-    compressed_data = pack_fp4(latent, 16, True)
-    pages.compressed.index_copy_(0, dest, compressed_data)
+    store_compact_kv(pages.compressed, latent, dest, CacheEncoding.COMPRESSED_E4_FP4)
     if trace_write:
-        observer.tap("compressed_write_data", compressed_data)
+        observer.tap("compressed_write_data", pages.compressed.index_select(0, dest))
 
 
 def _candidate_blocks(score, lengths, limit, block_size):
@@ -286,12 +290,11 @@ def paged_attention(attn, x, state, pages, shared, context):
     q = attn.wq_b(qr).unflatten(-1, (attn.n_local_heads, attn.head_dim))
     _rotate(q, freq, attn.rope_head_dim)
     kv = _rotate(attn.kv_norm(attn.wkv(x)), freq, attn.rope_head_dim)
-    packed = pack_window(kv)
-    pages.window.index_copy_(0, state.slots[:count], packed)
+    slots = state.slots[:count]
+    store_compact_kv(pages.window, kv, slots, CacheEncoding.WINDOW_MXFP8)
     observer = getattr(attn, "_window_observer", None)
     if observer is not None:
-        observer.projections(attn.layer_id, q, kv, packed, state.slots[:count], pages.window)
-    del packed
+        observer.projections(attn.layer_id, q, kv, pack_window(kv), slots, pages.window)
     win_ids, raw_spans = _raw_window(state, count, context, attn.window_size)
     compressed_trace = getattr(attn, "_compressed_observer", None)
     if compressed_trace is not None and compressed_trace.captures(count):

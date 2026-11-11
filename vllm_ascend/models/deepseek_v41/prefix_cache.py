@@ -4,7 +4,7 @@
 import numpy as np
 import torch
 
-from vllm_ascend.models.deepseek_v41.compact_kv import cache_row_bytes, pack_window, unpack_window
+from vllm_ascend.models.deepseek_v41.compact_kv import CacheEncoding, cache_row_bytes, store_compact_kv, unpack_window
 
 
 class DraftPages:
@@ -32,7 +32,7 @@ class DraftPages:
             self.num_slots = slots
 
     def write(self, layer, slots, kv):
-        self.values[layer].index_copy_(0, slots, pack_window(kv))
+        store_compact_kv(self.values[layer], kv, slots, CacheEncoding.WINDOW_MXFP8)
 
     def read(self, layer, slots):
         return unpack_window(self.values[layer][slots], self.width)

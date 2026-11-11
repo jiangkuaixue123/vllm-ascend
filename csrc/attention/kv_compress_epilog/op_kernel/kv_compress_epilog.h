@@ -24,7 +24,7 @@ using namespace AscendC;
 
 namespace KvCompressEpilogOps {
 
-template <typename T0, typename U, typename T1>
+template <typename T0, typename U, typename T1, typename Tiling, typename RowCodec>
 class KvCompressEpilogRegBase {
 public:
     __aicore__ inline KvCompressEpilogRegBase(TPipe* pipe) : pipe_(pipe) {}
@@ -33,7 +33,7 @@ public:
         GM_ADDR x,
         GM_ADDR slotMapping,
         GM_ADDR kvCache,
-        const KvCompressEpilogTilingData* tilingData);
+        const Tiling* tilingData);
 
     __aicore__ inline void Process();
 
@@ -61,17 +61,17 @@ private:
     float fp8Max = 0.0f;
 
     // Tiling data
-    const KvCompressEpilogTilingData* tilingData = nullptr;
+    const Tiling* tilingData = nullptr;
 };
 
 // Template implementations
 
-template <typename T0, typename U, typename T1>
-__aicore__ inline void KvCompressEpilogRegBase<T0, U, T1>::Init(
+template <typename T0, typename U, typename T1, typename Tiling, typename RowCodec>
+__aicore__ inline void KvCompressEpilogRegBase<T0, U, T1, Tiling, RowCodec>::Init(
     GM_ADDR x,
     GM_ADDR slotMapping,
     GM_ADDR kvCache,
-    const KvCompressEpilogTilingData* tilingDataPtr)
+    const Tiling* tilingDataPtr)
 {
         tilingData = tilingDataPtr;
 
@@ -82,7 +82,9 @@ __aicore__ inline void KvCompressEpilogRegBase<T0, U, T1>::Init(
         slotMappingGm.SetGlobalBuffer((__gm__ U*)slotMapping);
 
         pipe_->InitBuffer(xQue, 2, tilingData->rowFactor * RoundUp<T0>(tilingData->d) * sizeof(T0));
-        if (tilingData->layout == 2) {
+        if constexpr (!IsSameType<RowCodec, void>::value) {
+            pipe_->InitBuffer(kvCacheQue, 2, tilingData->rowFactor * RoundUp<T1>(tilingData->kvCacheCol));
+        } else if (tilingData->layout == 2) {
             pipe_->InitBuffer(kvCacheQue, 2, tilingData->rowFactor * RoundUp<T1>(tilingData->valuePerToken) * sizeof(T1));
             pipe_->InitBuffer(kvCacheScaleBuf, tilingData->rowFactor * RoundUp<T1>(tilingData->scalePerToken) * sizeof(T1));
         } else {
@@ -93,8 +95,8 @@ __aicore__ inline void KvCompressEpilogRegBase<T0, U, T1>::Init(
         indexLocal = indexBuf.Get<U>();
 }
 
-template <typename T0, typename U, typename T1>
- __aicore__ inline void KvCompressEpilogRegBase<T0, U, T1>::Process()
+template <typename T0, typename U, typename T1, typename Tiling, typename RowCodec>
+ __aicore__ inline void KvCompressEpilogRegBase<T0, U, T1, Tiling, RowCodec>::Process()
     {
         SetMaxValue();
         int64_t rowOuterLoop =
@@ -107,8 +109,12 @@ template <typename T0, typename U, typename T1>
             validIdx = 0;
             for (int64_t rowInnerIdx = 0; rowInnerIdx < curRowFactor; rowInnerIdx++) {
                 int32_t curSlotIdx = GetBlockIdx() * tilingData->rowOfFormerBlock + rowOuterIdx * tilingData->rowFactor + rowInnerIdx;
-                int32_t slot = static_cast<int32_t>(slotMappingGm.GetValue(curSlotIdx));
-                if (slot == -1) {
+                const U slot = slotMappingGm.GetValue(curSlotIdx);
+                if constexpr (!IsSameType<RowCodec, void>::value) {
+                    if (slot < 0 || static_cast<uint64_t>(slot) >= static_cast<uint64_t>(tilingData->cacheRows)) {
+                        continue;
+                    }
+                } else if (slot == -1) {
                     continue;
                 }
                 CopyIn(
@@ -127,7 +133,11 @@ template <typename T0, typename U, typename T1>
 
             kvCacheLocal = kvCacheQue.template AllocTensor<T1>();
 
-            if (tilingData->quantMode == QUANT_MDOE_GROUP_FP8) {
+            if constexpr (!IsSameType<RowCodec, void>::value) {
+                if (validIdx > 0) {
+                    RowCodec::Run(kvCacheLocal, xLocal, validIdx, tilingData);
+                }
+            } else if (tilingData->quantMode == QUANT_MDOE_GROUP_FP8) {
                 VFProcessDynamicBlockQuant(
                     kvCacheLocal, xLocal, maxValue, validIdx, tilingData->d, tilingData->concatCol, tilingData->padCol);
             } else if (tilingData->layout == 2) {
@@ -160,7 +170,13 @@ template <typename T0, typename U, typename T1>
             kvCacheQue.template EnQue(kvCacheLocal);
             kvCacheLocal = kvCacheQue.template DeQue<T1>();
 
-            if (tilingData->layout == 2 && tilingData->quantMode == QUANT_MDOE_GROUP_MXFP8) {
+            if constexpr (!IsSameType<RowCodec, void>::value) {
+                for (int32_t row = 0; row < validIdx; ++row) {
+                    const int64_t slot = indexLocal.GetValue(row);
+                    CopyOut(kvCacheLocal[row * RoundUp<T1>(tilingData->kvCacheCol)],
+                            kvCacheGm[slot * tilingData->kvCacheCol], 1, tilingData->kvCacheCol);
+                }
+            } else if (tilingData->layout == 2 && tilingData->quantMode == QUANT_MDOE_GROUP_MXFP8) {
                 for (int32_t curValidIdx = 0; curValidIdx < validIdx; curValidIdx++) {
                     int32_t slot = indexLocal.GetValue(curValidIdx);
                     int64_t blockIdx = static_cast<int64_t>(slot) / tilingData->blockSize;
@@ -198,8 +214,8 @@ template <typename T0, typename U, typename T1>
         }
     }
 
-    template <typename T0, typename U, typename T1>
-    __aicore__ inline void KvCompressEpilogRegBase<T0, U, T1>::SetMaxValue()
+    template <typename T0, typename U, typename T1, typename Tiling, typename RowCodec>
+    __aicore__ inline void KvCompressEpilogRegBase<T0, U, T1, Tiling, RowCodec>::SetMaxValue()
     {
         if constexpr (IsSameType<T1, fp8_e5m2_t>::value) {
             maxValue = static_cast<float>(1.0) / FP8_E5M2_MAX_VALUE;

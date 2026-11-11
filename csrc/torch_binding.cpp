@@ -1445,6 +1445,28 @@ std::tuple<at::Tensor, at::Tensor> npu_rms_norm_dynamic_quant_npu(
     return std::make_tuple(y_out, scale_out);
 }
 
+// V2 stores the complete post-RoPE row in the checkpoint's compact format.
+void kv_compress_epilog_v2(at::Tensor& cache, const at::Tensor& x, const at::Tensor& slots, int64_t mode)
+{
+    TORCH_CHECK(mode >= 0 && mode <= 2, "Expected raw MXFP8, E4-scaled FP4 or MXFP4");
+    TORCH_CHECK(x.dim() == 2 && cache.dim() == 2 && slots.dim() == 1 && slots.size(0) == x.size(0),
+                "Expected cache[slots,bytes], x[tokens,dim] and slot_mapping[tokens]");
+    TORCH_CHECK(x.scalar_type() == at::kBFloat16 && cache.scalar_type() == at::kByte &&
+                    (slots.scalar_type() == at::kLong || slots.scalar_type() == at::kInt),
+                "Expected BF16 input, byte cache and integral slots");
+    TORCH_CHECK(x.device() == cache.device() && x.device() == slots.device() &&
+                    x.is_contiguous() && slots.is_contiguous() && cache.is_contiguous(),
+                "Compact KV epilog requires contiguous tensors on the same device");
+    const int64_t group = mode == 1 ? 16 : 32;
+    const int64_t dim = x.size(1);
+    TORCH_CHECK(dim > 0 && dim <= 65536 && dim % group == 0 && cache.size(0) > 0 &&
+                    cache.size(1) == (mode == 0 ? dim : dim / 2) + dim / group,
+                "The cache row width does not match the requested quantization");
+    if (x.size(0)) {
+        EXEC_NPU_CMD(aclnnKvCompressEpilogV2, cache, x, slots, mode);
+    }
+}
+
 void validate_kv_compress_epilog_inputs(
     const at::Tensor& x,
     const at::Tensor& slot_mapping,
@@ -2564,6 +2586,8 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         ") -> ()"
     );
     ops.impl("kv_compress_epilog", torch::kPrivateUse1, &vllm_ascend::kv_compress_epilog_npu);
+    ops.def("kv_compress_epilog_v2(Tensor(a!) cache, Tensor x, Tensor slot_mapping, int quant_mode) -> ()");
+    ops.impl("kv_compress_epilog_v2", torch::kPrivateUse1, &vllm_ascend::kv_compress_epilog_v2);
 
     ops.def(
         "npu_kv_quant_sparse_attn_sharedkv("
