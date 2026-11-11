@@ -74,16 +74,30 @@ def _swiglu_origin(gate_up, route_weight, clamp):
     )[2]
 
 
+def _floor_codes(x, q, exponent):
+    regular = q.view(torch.uint8).reshape(*exponent.shape, 32)
+    floor = (x.float() * (2**22)).clamp(-448, 448).to(torch.float8_e4m3fn).view(torch.uint8).reshape_as(regular)
+    return torch.where((exponent < 105).unsqueeze(-1), floor, regular).reshape_as(q)
+
+
 def _quantize(x):
     q, scale = torch_npu.npu_dynamic_mx_quant(x, dst_type=torch.float8_e4m3fn, scale_alg=1)
     # HF floors the block maximum at 1e-4. Its smallest allowed E8M0
     # exponent is ceil(log2(1e-4/448)) = -22, biased byte 105. Re-encode
     # these groups from their BF16 inputs to avoid double-rounding FP8.
     exponent = scale.view(torch.uint8).reshape(*x.shape[:-1], x.shape[-1] // 32)
-    regular = q.view(torch.uint8).reshape(*exponent.shape, 32)
-    floor = (x.float() * (2**22)).clamp(-448, 448).to(torch.float8_e4m3fn).view(torch.uint8).reshape_as(regular)
-    encoded = torch.where((exponent < 105).unsqueeze(-1), floor, regular)
-    return encoded.reshape_as(q).view(q.dtype), exponent.clamp_min(105).reshape_as(scale).view(scale.dtype)
+    tile_elements = 2 * 1024 * 1024
+    if x.ndim == 2 and x.numel() > tile_elements:
+        # Expert matrices can have many expanded rows. Write corrected bytes
+        # back to the fresh native output, with at most 8 MiB per FP32 tile.
+        tile_rows = max(1, tile_elements // x.size(1))
+        raw = q.view(torch.uint8)
+        for start in range(0, x.size(0), tile_rows):
+            rows = slice(start, start + tile_rows)
+            raw[rows].copy_(_floor_codes(x[rows], q[rows], exponent[rows]))
+    else:
+        q = _floor_codes(x, q, exponent).view(q.dtype)
+    return q, exponent.clamp_min(105).reshape_as(scale).view(scale.dtype)
 
 
 def _dispatch_for_w1(dispatcher, inputs):

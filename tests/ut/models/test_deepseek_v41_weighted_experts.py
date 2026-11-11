@@ -118,3 +118,28 @@ def test_v41_mc2_transports_bf16_and_ignores_unused_scale(monkeypatch):
     assert w._dispatch_for_w1(other, inputs) is returned
     other.token_dispatch.assert_called_once_with(inputs)
     encode.assert_called_once()
+
+
+@pytest.mark.parametrize("rows", [6, 910, 911])
+def test_mx_floor_preserves_codes_and_native_geometry(rows, monkeypatch):
+    width = 2304
+    values = torch.tensor([0.0, -0.0, 2**-28, -(2**-28), 2**-22, 2**-12, 1.0, -3.0])
+    x = values.repeat(rows, width // values.numel()).bfloat16()
+    source = x.clone()
+    exponents = torch.tensor([0, 104, 105, 106, 254, 255], dtype=torch.uint8)
+    scale = exponents.repeat(rows, width // 32 // exponents.numel()).reshape(rows, width // 64, 2)
+    codes = torch.arange(256, dtype=torch.uint8).repeat(rows, width // 256)
+    floored = (x.float() * (2**22)).clamp(-448, 448).to(torch.float8_e4m3fn).view(torch.uint8)
+    expected = torch.where(scale.reshape(rows, -1).repeat_interleave(32, dim=-1) < 105, floored, codes)
+    native = Mock(return_value=(codes.clone().view(torch.float8_e4m3fn), scale.view(torch.float8_e8m0fnu)))
+    monkeypatch.setattr(w.torch_npu, "npu_dynamic_mx_quant", native)
+    helper = Mock(wraps=w._floor_codes)
+    monkeypatch.setattr(w, "_floor_codes", helper)
+    q, s = w._quantize(x)
+    native.assert_called_once()
+    assert native.call_args.args[0] is x
+    assert native.call_args.kwargs == {"dst_type": torch.float8_e4m3fn, "scale_alg": 1}
+    assert [item.args[0].shape[0] for item in helper.call_args_list] == ([910, 1] if rows == 911 else [rows])
+    assert torch.equal(q.view(torch.uint8), expected) and torch.equal(s.view(torch.uint8), scale.clamp_min(105))
+    assert q.dtype == torch.float8_e4m3fn and s.shape == scale.shape and s.dtype == torch.float8_e8m0fnu
+    assert torch.equal(x.view(torch.int16), source.view(torch.int16))
