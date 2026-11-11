@@ -143,3 +143,76 @@ def test_mx_floor_preserves_codes_and_native_geometry(rows, monkeypatch):
     assert torch.equal(q.view(torch.uint8), expected) and torch.equal(s.view(torch.uint8), scale.clamp_min(105))
     assert q.dtype == torch.float8_e4m3fn and s.shape == scale.shape and s.dtype == torch.float8_e8m0fnu
     assert torch.equal(x.view(torch.int16), source.view(torch.int16))
+
+
+def test_expanded_buffers_expire_before_reverse_collective(monkeypatch):
+    from torch.multiprocessing.reductions import StorageWeakRef
+
+    buffers = {}
+    events = []
+    counts = torch.tensor([1, 1])
+    expected_metadata = object()
+    layer = SimpleNamespace(
+        w13_weight=object(),
+        w13_weight_scale=None,
+        w2_weight=object(),
+        w2_weight_scale=None,
+        ascend_expert_map=None,
+        global_redundant_expert_num=0,
+        ascend_mc2_mask=None,
+        ascend_pertoken_scale=None,
+        activation="silu",
+    )
+
+    def track(name, tensor):
+        buffers[name] = StorageWeakRef(tensor.untyped_storage())
+        return tensor
+
+    def dispatch(*args):
+        return MoETokenDispatchOutput(
+            track("w1_input", torch.ones(2, 64)), counts, 1, object(), track("w1_scale", torch.ones(2, 1, 2))
+        )
+
+    def grouped_matmul(*, x, weight, group_list, group_list_type, **kwargs):
+        assert group_list is counts and group_list_type == 1
+        if weight[0] is layer.w13_weight:
+            return [track("gate_up", x[0] + 2)]
+        assert weight[0] is layer.w2_weight
+        return [x[0] + 3]
+
+    def activate(gate_up, weights, clamp):
+        assert buffers["w1_input"].expired() and buffers["w1_scale"].expired()
+        return track("origin", gate_up * weights[:, None])
+
+    def quantize(origin):
+        assert buffers["gate_up"].expired() and buffers["weights"].expired()
+        return track("w2_input", origin.clone()), track("w2_scale", torch.ones(2, 1, 2))
+
+    def combine(hidden_states, combine_metadata):
+        assert combine_metadata is expected_metadata
+        assert all(buffer.expired() for buffer in buffers.values())
+        return hidden_states
+
+    def event():
+        marker = object()
+        events.append(marker)
+        return marker
+
+    dispatcher = SimpleNamespace(token_combine=combine)
+    method = SimpleNamespace(token_dispatcher=dispatcher, moe_config=SimpleNamespace(swiglu_limit=8))
+    monkeypatch.setattr(w, "_EXTRA_CTX", SimpleNamespace(moe_comm_method=method))
+    monkeypatch.setattr(w.torch.npu, "current_stream", lambda: SimpleNamespace(record_event=event))
+    monkeypatch.setattr(w, "build_fused_experts_input", lambda **kwargs: None)
+    monkeypatch.setattr(w, "build_token_dispatch_input", lambda **kwargs: None)
+    monkeypatch.setattr(w, "_dispatch_for_w1", dispatch)
+    monkeypatch.setattr(
+        w, "_route_weights", lambda *args: (track("weights", torch.tensor([0.25, 0.5])), expected_metadata)
+    )
+    monkeypatch.setattr(w.torch_npu, "npu_grouped_matmul", grouped_matmul)
+    monkeypatch.setattr(w, "_swiglu_origin", activate)
+    monkeypatch.setattr(w, "_quantize", quantize)
+    scheme = SimpleNamespace(quant_type=w.QuantType.W4A8MXFP, dynamic_eplb=False)
+    result = w.V41FP4Experts.apply(scheme, layer, torch.empty(2, 64), torch.ones(2, 1), torch.zeros(2, 1), None, None)
+    torch.testing.assert_close(result.routed_out, torch.tensor([3.75, 4.5])[:, None].expand(2, 64))
+    assert result.expert_tokens is counts and result.group_list_type == 1
+    assert [result.before_dispatch_evt, result.before_gmm2_evt, result.before_combine_evt] == events
