@@ -17,7 +17,7 @@ from torch import nn
 from vllm.config import CUDAGraphMode
 from vllm.model_executor.layers.linear import ReplicatedLinear
 
-from vllm_ascend.models.deepseek_v41 import attention
+from vllm_ascend.models.deepseek_v41 import attention, attention_ops
 from vllm_ascend.models.deepseek_v41.config import DeepseekV41TextConfig
 from vllm_ascend.utils import enable_custom_op
 
@@ -145,7 +145,7 @@ def exact(actual, expected):
 
 
 @torch.inference_mode()
-def run_case(layers, rows):
+def run_case(layers, rows, *, bind_quantizer=None):
     """Compare graph operands/state first, then time whole native attention chains."""
     torch.manual_seed(827 + dist.get_rank())
     states = torch.randn(rows, native.HIDDEN, device="npu", dtype=torch.bfloat16)
@@ -165,7 +165,9 @@ def run_case(layers, rows):
     def bind(index):
         for layer, cache, method in zip(layers, caches[index], methods):
             layer.cache = cache
-            layer._prepare_overlapped_index = method if index else lambda *args: None
+            layer._prepare_overlapped_index = method if index or bind_quantizer is not None else lambda *args: None
+        if bind_quantizer is not None:
+            bind_quantizer(index)
 
     def complete():
         runtime = SimpleNamespace(decode=md, slot_arena=attention.DecodeSlotArena())
@@ -219,6 +221,8 @@ def run_case(layers, rows):
             torch.testing.assert_close(
                 outputs[1][0].cpu(), outputs[0][0].cpu(), rtol=native.NUMERICAL_RTOL, atol=native.NUMERICAL_ATOL
             )
+            if bind_quantizer is not None:
+                exact(outputs[1][0], outputs[0][0])
             for candidate, parent in zip(outputs[1][1], outputs[0][1]):
                 for actual, expected in zip(candidate, parent):
                     if expected is not None:
@@ -266,6 +270,7 @@ def run_case(layers, rows):
                     "candidate": medians[1],
                     "metrics": ["host_ms", "ready_ms"],
                     "scope": "full native compressed attention, index/candidate chain, cache, FIA and WO",
+                    "optimization": "fp4_decode" if bind_quantizer is not None else "index_overlap",
                     "limitation": "full static 153600 capacity; controlled live history up to384 tokens",
                 }
             ),
@@ -276,6 +281,7 @@ def run_case(layers, rows):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument("--fp4-decode", action="store_true")
     args = parser.parse_args()
     torch.set_num_threads(1)
     torch.npu.set_device(int(os.environ["LOCAL_RANK"]))
@@ -305,8 +311,32 @@ if __name__ == "__main__":
                         model.attention_kernel.pin_decode_plan(
                             model.attn_sink.device, native.HEADS, rows, native.SELECTED_WIDTH
                         )
+            original_quantizer = attention.fp4_quant_dequant
+            used_formats = set()
+
+            def bind_quantizer(index):
+                def quantize(*args, **kwargs):
+                    kwargs["decode_fusion"] = bool(index) and kwargs.get("decode_fusion", False)
+                    return original_quantizer(*args, **kwargs)
+
+                patch.setattr(attention, "fp4_quant_dequant", quantize)
+
+            if args.fp4_decode:
+                for scale, name in (("e8m0", "_try_fp4_e8m0_aiv"), ("e4m3", "_try_fp4_e4m3_aiv")):
+                    original_dispatch = getattr(attention_ops, name)
+
+                    def observed_dispatch(*args, dispatch=original_dispatch, scale=scale, **kwargs):
+                        output = dispatch(*args, **kwargs)
+                        if output is not None:
+                            used_formats.add(scale)
+                        return output
+
+                    patch.setattr(attention_ops, name, observed_dispatch)
             for models in chains:
                 for rows in (6, 12):
-                    run_case(models, rows)
+                    used_formats.clear()
+                    run_case(models, rows, bind_quantizer=bind_quantizer if args.fp4_decode else None)
+                    if args.fp4_decode:
+                        assert used_formats == {"e8m0", "e4m3"}
     finally:
         dist.destroy_process_group()

@@ -82,6 +82,7 @@ _OUTPUT_QDQ_TILE_ROWS = 256
 _DECODE_INDEX_TILE_KEYS = 8192
 _INDEX_OVERLAP_LAYOUT = (32, 128)
 _INDEX_OVERLAP_TP = 4
+_FP4_DECODE_TP = 4
 _INDEX_OVERLAP_ROWS = (6, 12)
 _DECODE_INDEX_SORT_ROWS = (3, 6, 12)
 _DECODE_INDEX_SORT_K = 512
@@ -767,6 +768,13 @@ class DeepseekV41Indexer(nn.Module):
             self.k_norm = DeepseekV41RMSNorm(config.index_head_dim, config.rms_norm_eps)
 
 
+def _target_fp4_decode(tp):
+    if tp != _FP4_DECODE_TP or not is_forward_context_available():
+        return False
+    context = get_forward_context()
+    return context.cudagraph_runtime_mode == CUDAGraphMode.FULL and getattr(context, "is_draft_model", True) is False
+
+
 class DeepseekV41Attention(nn.Module):
     @staticmethod
     def update_graph_params(*args, **kwargs):
@@ -1024,8 +1032,8 @@ class DeepseekV41Attention(nn.Module):
         keys = self.indexer.k_norm(self.indexer.wk(latent))
         self.rotate(keys.unsqueeze(0), group_start)
         self.rotate(latent.unsqueeze(0), group_start)
-        keys = fp4_quant_dequant(keys, 32, scale_format="e8m0")
-        latent = fp4_quant_dequant(latent, 16, scale_format="e4m3")
+        keys = fp4_quant_dequant(keys, 32, scale_format="e8m0", decode_fusion=_target_fp4_decode(self.tp))
+        latent = fp4_quant_dequant(latent, 16, scale_format="e4m3", decode_fusion=_target_fp4_decode(self.tp))
         self.cache.decode_write(md, latent, 0, dim, complete)
         self.cache.decode_write(md, keys, 1, dim, complete)
         runtime.source_cache = self.cache
@@ -1048,7 +1056,7 @@ class DeepseekV41Attention(nn.Module):
             indexer = self.indexer
             q = indexer.wq_b(qr)[0].view(-1, self.index_heads, self.config.index_head_dim)
             self.rotate(q.unsqueeze(0), pos)
-            q = fp4_quant_dequant(q, 32, scale_format="e8m0")
+            q = fp4_quant_dequant(q, 32, scale_format="e8m0", decode_fusion=_target_fp4_decode(self.tp))
             weights = indexer.weights_proj(x)[0] * (self.config.index_head_dim**-0.5 * self.config.index_n_heads**-0.5)
         else:
             q, weights = prepared
@@ -1273,7 +1281,7 @@ class DeepseekV41Attention(nn.Module):
             return None
         q = self.indexer.wq_b(qr)[0].view(-1, self.index_heads, self.config.index_head_dim)
         self.rotate(q.unsqueeze(0), pos)
-        q = fp4_quant_dequant(q, 32, scale_format="e8m0")
+        q = fp4_quant_dequant(q, 32, scale_format="e8m0", decode_fusion=_target_fp4_decode(self.tp))
         weights = self.indexer.weights_proj(states)[0] * (
             self.config.index_head_dim**-0.5 * self.config.index_n_heads**-0.5
         )
