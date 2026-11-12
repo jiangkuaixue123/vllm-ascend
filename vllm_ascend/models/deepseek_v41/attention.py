@@ -559,6 +559,13 @@ def topk_columns(scores, k):
     if k == 0 or k == scores.shape[-1]:
         return columns[:k].long().expand(*scores.shape[:-1], k)
     top = scores.topk(k, dim=-1)
+    if HAS_TRITON and _use_float32_tie_columns(scores, k) and get_ascend_device_type() == AscendDeviceType.A3:
+        from vllm_ascend.ops.triton.deepseek_v41_index_ties import compact_tied_columns
+
+        compacted = compact_tied_columns(scores, top.values, top.indices)
+        if compacted is not None:
+            logger.info_once("INDEX_TIE_COMPACT_RUNTIME pid=%d rows=%d", os.getpid(), scores.shape[0], scope="process")
+            return compacted
     cutoff = top.values[..., -1:]
     if _use_float32_tie_columns(scores, k):
         # Both column IDs and the out-of-range sentinel are exact FP32 integers.
