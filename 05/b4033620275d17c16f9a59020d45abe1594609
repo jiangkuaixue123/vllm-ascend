@@ -1,0 +1,21 @@
+csrc/mc2/dispatch_ffn_combine/op_kernel/dispatch_ffn_combine.h
+  s_6eab87361519a8::t_5535b8fd74ecfe 63-65,176-200,319
+tests/e2e/nightly/single_node/ops/multicard_ops_a3/test_dispatch_ffn_route_before_down.py
+  s_6eab87361519a8::t_0781b97260ce69 34,38-46,48-66,68,71-72,75,79,83,86-89,152-185,199,210,216-218,240,242-243,247
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "05b4033620275d17c16f9a59020d45abe1594609",
+  "prompts": {},
+  "sessions": {
+    "s_6eab87361519a8": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1ac13-1fd0-7670-ae84-d58acaf2730c",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "jiangkuaixue123 <jiangxiaozhou111@163.com>"
+    }
+  }
+}
