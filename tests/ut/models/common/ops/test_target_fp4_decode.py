@@ -66,3 +66,77 @@ def test_public_api_requires_explicit_opt_in(opt_in):
         with pytest.raises(RuntimeError, match="reference conversion reached"):
             quantize(states)
         assert not calls
+
+
+@pytest.mark.parametrize(
+    "tp,available,mode,draft,expected",
+    [
+        (4, True, "none", False, True),
+        (8, True, "none", False, False),
+        (4, False, "none", False, False),
+        (4, True, "full", False, False),
+        (4, True, "piecewise", False, False),
+        (4, True, "none", True, False),
+        (4, True, "none", None, False),
+    ],
+)
+def test_only_target_tp4_eager_prefill(tp, available, mode, draft, expected):
+    context = SimpleNamespace(cudagraph_runtime_mode=mode)
+    if draft is not None:
+        context.is_draft_model = draft
+    env = {
+        "_FP4_DECODE_TP": 4,
+        "is_forward_context_available": lambda: available,
+        "get_forward_context": lambda: context,
+        "CUDAGraphMode": SimpleNamespace(NONE="none"),
+    }
+    eligible = load_function("attention.py", "_target_fp4_prefill", env)
+    assert eligible(tp) is expected
+
+
+@pytest.mark.parametrize(
+    "shape,compressed,expected",
+    [
+        ((1, 128), False, True),
+        ((8192, 128), False, True),
+        ((127, 32, 128), False, True),
+        ((1, 512), True, True),
+        ((8192, 512), True, True),
+        ((0, 128), False, False),
+        ((8193, 128), False, False),
+        ((8193, 512), True, False),
+        ((2, 64, 128), False, False),
+        ((2, 32, 512), True, False),
+        ((512,), True, False),
+        ((1, 2, 32, 128), False, False),
+    ],
+)
+def test_prefill_shape_boundaries(shape, compressed, expected):
+    env = {
+        "torch": SimpleNamespace(Tensor=object),
+        "_FP4_PREFILL_MAX_ROWS": 8192,
+        "_FP4_PREFILL_INDEX_HEADS": 32,
+        "_FP4_COMPRESSED_DIM": 512,
+        "_FP4_INDEX_DIM": 128,
+    }
+    eligible = load_function("attention_ops.py", "_fp4_prefill_shape", env)
+    assert eligible(SimpleNamespace(shape=shape, ndim=len(shape)), compressed=compressed) is expected
+
+
+@pytest.mark.parametrize("scale", ["e8m0", "e4m3"])
+def test_prefill_public_opt_in_dispatch(scale):
+    calls, output = [], object()
+
+    def dispatch(*args, **kwargs):
+        calls.append((args[2], kwargs))
+        return output
+
+    env = {
+        "torch": SimpleNamespace(Tensor=object),
+        "_group_shape": lambda *args: (127, 4, 32),
+        "_try_fp4_e8m0_aiv": dispatch if scale == "e8m0" else lambda *a, **kw: None,
+        "_try_fp4_e4m3_aiv": dispatch,
+    }
+    quantize = load_function("attention_ops.py", "fp4_quant_dequant", env)
+    assert quantize(object(), scale_format=scale, prefill_fusion=True) is output
+    assert calls == [(scale, {"prefill": True})]

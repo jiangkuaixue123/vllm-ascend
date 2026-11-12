@@ -768,6 +768,13 @@ class DeepseekV41Indexer(nn.Module):
             self.k_norm = DeepseekV41RMSNorm(config.index_head_dim, config.rms_norm_eps)
 
 
+def _target_fp4_prefill(tp):
+    if tp != _FP4_DECODE_TP or not is_forward_context_available():
+        return False
+    context = get_forward_context()
+    return context.cudagraph_runtime_mode == CUDAGraphMode.NONE and not getattr(context, "is_draft_model", True)
+
+
 def _target_fp4_decode(tp):
     if tp != _FP4_DECODE_TP or not is_forward_context_available():
         return False
@@ -944,9 +951,9 @@ class DeepseekV41Attention(nn.Module):
             latent = compressor.norm(latent)
             keys = self.indexer.k_norm(self.indexer.wk(latent))
             self.rotate(keys.unsqueeze(0), completed + 1 - ratio)
-            keys = fp4_quant_dequant(keys, 32, scale_format="e8m0")
+            keys = fp4_quant_dequant(keys, 32, scale_format="e8m0", prefill_fusion=_target_fp4_prefill(self.tp))
             self.rotate(latent.unsqueeze(0), completed + 1 - ratio)
-            latent = fp4_quant_dequant(latent, 16, scale_format="e4m3")
+            latent = fp4_quant_dequant(latent, 16, scale_format="e4m3", prefill_fusion=_target_fp4_prefill(self.tp))
             if metadata is not None:
                 slots = self.cache.slots(metadata, request_idx, completed)
                 self.cache.write_slots(slots, latent, 0, dim)
@@ -991,7 +998,7 @@ class DeepseekV41Attention(nn.Module):
             rows = slice(start, start + tile_rows)
             query = q[rows]
             self.rotate(query.unsqueeze(0), positions[rows])
-            query = fp4_quant_dequant(query, 32, scale_format="e8m0")
+            query = fp4_quant_dequant(query, 32, scale_format="e8m0", prefill_fusion=_target_fp4_prefill(self.tp))
             per_head = torch.einsum("shd,td->sht", query, shared.index_keys)
             per_head.relu_()
             per_head = per_head.to(torch.promote_types(per_head.dtype, weights.dtype))

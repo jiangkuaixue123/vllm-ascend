@@ -119,3 +119,17 @@ def test_component_latency(rows):
     fused_ms = timed_graph(fp4_e8m0_qdq, states)
     print({"rows": rows, "calls": CHAIN_LENGTH, "reference_ms": reference_ms, "fused_ms": fused_ms})
     assert fused_ms < reference_ms
+
+
+@pytest.mark.parametrize("rows", [127, 2048, 8192])
+@pytest.mark.parametrize("query", [False, True])
+@torch.inference_mode()
+def test_target_prefill_rows(rows, query):
+    torch.npu.set_device(0)
+    torch.manual_seed(20261113)
+    shape = (rows, 32, 128) if query else (rows, 128)
+    states = torch.randn(shape, device="npu", dtype=torch.bfloat16)
+    states.flatten()[-4:] = torch.tensor([0.25, -0.0, float("inf"), float("nan")], device="npu")
+    assert attention_ops._try_fp4_e8m0_aiv(states, 32, "e8m0", False, prefill=True) is not None
+    actual = attention_ops.fp4_quant_dequant(states, prefill_fusion=True)
+    exact(actual, reference(states))

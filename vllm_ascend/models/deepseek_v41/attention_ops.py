@@ -38,6 +38,8 @@ _FP4_COMPRESSED_DIM = 512
 _FP4_COMPRESSED_GROUP = 16
 _FP4_INDEX_DECODE_SHAPES = ((24, 128), (48, 128), (6, 32, 128), (12, 32, 128))
 _FP4_KV_DECODE_SHAPES = ((24, 512), (48, 512))
+_FP4_PREFILL_MAX_ROWS = 8192
+_FP4_PREFILL_INDEX_HEADS = 32
 
 
 def _power_of_two(exponent: torch.Tensor) -> torch.Tensor:
@@ -204,12 +206,20 @@ def fp8_quant_dequant(x: torch.Tensor, block_size: int = 32, *, inplace: bool = 
     return result
 
 
-def _try_fp4_e8m0_aiv(x: torch.Tensor, block_size: int, scale_format: str, inplace: bool):
+def _fp4_prefill_shape(x: torch.Tensor, *, compressed: bool) -> bool:
+    if x.ndim not in (2, 3) or not 0 < x.shape[0] <= _FP4_PREFILL_MAX_ROWS:
+        return False
+    if compressed:
+        return x.ndim == 2 and x.shape[-1] == _FP4_COMPRESSED_DIM
+    return x.shape[-1] == _FP4_INDEX_DIM and (x.ndim == 2 or x.shape[1] == _FP4_PREFILL_INDEX_HEADS)
+
+
+def _try_fp4_e8m0_aiv(x: torch.Tensor, block_size: int, scale_format: str, inplace: bool, *, prefill: bool = False):
     if (
         x.device.type != "npu"
         or x.dtype != torch.bfloat16
         or x.ndim not in (2, 3)
-        or tuple(x.shape) not in _FP4_INDEX_DECODE_SHAPES
+        or (not _fp4_prefill_shape(x, compressed=False) if prefill else tuple(x.shape) not in _FP4_INDEX_DECODE_SHAPES)
         or x.shape[-1] != _FP4_INDEX_DIM
         or x.numel() == 0
         or block_size != _FP8_DECODE_GROUP_SIZE
@@ -236,16 +246,19 @@ def _try_fp4_e8m0_aiv(x: torch.Tensor, block_size: int, scale_format: str, inpla
     from vllm_ascend.ops.triton.deepseek_v41_fp4_qdq import fp4_e8m0_qdq
 
     output = fp4_e8m0_qdq(x, inplace)
-    logger.info_once("TARGET_FP4_DECODE_RUNTIME scale=e8m0 pid=%s", os.getpid(), scope="process")
+    if prefill:
+        logger.info_once("TARGET_FP4_PREFILL_RUNTIME scale=e8m0 pid=%s", os.getpid(), scope="process")
+    else:
+        logger.info_once("TARGET_FP4_DECODE_RUNTIME scale=e8m0 pid=%s", os.getpid(), scope="process")
     return output
 
 
-def _try_fp4_e4m3_aiv(x: torch.Tensor, block_size: int, scale_format: str, inplace: bool):
+def _try_fp4_e4m3_aiv(x: torch.Tensor, block_size: int, scale_format: str, inplace: bool, *, prefill: bool = False):
     if (
         x.device.type != "npu"
         or x.dtype != torch.bfloat16
         or x.ndim != 2
-        or tuple(x.shape) not in _FP4_KV_DECODE_SHAPES
+        or (not _fp4_prefill_shape(x, compressed=True) if prefill else tuple(x.shape) not in _FP4_KV_DECODE_SHAPES)
         or x.shape[-1] != _FP4_COMPRESSED_DIM
         or block_size != _FP4_COMPRESSED_GROUP
         or scale_format != "e4m3"
@@ -271,7 +284,10 @@ def _try_fp4_e4m3_aiv(x: torch.Tensor, block_size: int, scale_format: str, inpla
     from vllm_ascend.ops.triton.deepseek_v41_fp4_e4m3_qdq import fp4_e4m3_qdq
 
     output = fp4_e4m3_qdq(x, inplace)
-    logger.info_once("TARGET_FP4_DECODE_RUNTIME scale=e4m3 pid=%s", os.getpid(), scope="process")
+    if prefill:
+        logger.info_once("TARGET_FP4_PREFILL_RUNTIME scale=e4m3 pid=%s", os.getpid(), scope="process")
+    else:
+        logger.info_once("TARGET_FP4_DECODE_RUNTIME scale=e4m3 pid=%s", os.getpid(), scope="process")
     return output
 
 
@@ -282,6 +298,7 @@ def fp4_quant_dequant(
     scale_format: str = "e8m0",
     inplace: bool = False,
     decode_fusion: bool = False,
+    prefill_fusion: bool = False,
 ) -> torch.Tensor:
     """Official FP4 QDQ: index Q/K use 32/E8M0, compressed KV uses 16/E4M3.
 
@@ -290,7 +307,13 @@ def fp4_quant_dequant(
     Neither rule may be replaced with BF16-only cache storage.
     """
     shape = _group_shape(x, block_size)
-    if decode_fusion:
+    if prefill_fusion:
+        fused = _try_fp4_e8m0_aiv(x, block_size, scale_format, inplace, prefill=True)
+        if fused is None:
+            fused = _try_fp4_e4m3_aiv(x, block_size, scale_format, inplace, prefill=True)
+        if fused is not None:
+            return fused
+    elif decode_fusion:
         fused = _try_fp4_e8m0_aiv(x, block_size, scale_format, inplace)
         if fused is None:
             fused = _try_fp4_e4m3_aiv(x, block_size, scale_format, inplace)
