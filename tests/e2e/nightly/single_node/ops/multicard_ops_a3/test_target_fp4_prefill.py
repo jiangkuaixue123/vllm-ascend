@@ -14,6 +14,7 @@ import test_target_index_overlap as index_native
 import test_target_query_overlap as native
 import torch
 import torch.distributed as dist
+from test_tp_aiv_collectives import tp_aiv_options
 from vllm.config import CUDAGraphMode
 
 from vllm_ascend.models.deepseek_v41 import attention, attention_ops
@@ -145,12 +146,13 @@ def run_case(layers, ends):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument("--tp-aiv", action="store_true")
     args = parser.parse_args()
     torch.set_num_threads(1)
     torch.npu.set_device(int(os.environ["LOCAL_RANK"]))
     torch.npu.matmul.allow_hf32 = False
     torch.npu.config.allow_internal_format = True
-    dist.init_process_group("hccl")
+    dist.init_process_group("hccl", pg_options=tp_aiv_options() if args.tp_aiv else None)
     try:
         assert dist.get_world_size() == TP and enable_custom_op()
         with pytest.MonkeyPatch.context() as patch, torch.inference_mode():

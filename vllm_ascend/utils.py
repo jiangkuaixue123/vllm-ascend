@@ -73,6 +73,7 @@ _ASCEND_CUSTOMOP_IS_REIGISTERED = False
 _DEFAULT_BUFFER_SIZE = 200
 _MIN_DP_BUFFER_SIZE = 50
 _DYNAMIC_EPLB_BUFFER_SIZE = 100
+_HCCL_PG_EXPANSION_AIV = 3
 _IS_MOE_MODEL = None
 _IS_DRAFTER_MOE_MODEL = None
 _IS_VL_MODEL = None
@@ -970,9 +971,43 @@ def npu_stream_switch(target_stream: torch.npu.Stream, *, enabled: bool = True):
 def create_hccl_pg_options(group_name: str):
     options = torch_npu._C._distributed_c10d.ProcessGroupHCCL.Options()
     hccl_config = get_hccl_config_for_pg_options(group_name) or {}
+    if group_name == "tp":
+        # Lazy import: process groups are created inside the worker config context.
+        from vllm.config import get_current_vllm_config_or_none
+
+        if _deepseek_v41_tp_aiv_enabled(get_current_vllm_config_or_none()):
+            hccl_config["hccl_op_expansion_mode"] = _HCCL_PG_EXPANSION_AIV
+            logger.info_once("DSV41_TP_AIV_RUNTIME: TP4 uses AIV; EP/MC2/DP options are unchanged")
     hccl_config["group_name"] = group_name
     options.hccl_config = hccl_config
     return options
+
+
+def _deepseek_v41_tp_aiv_enabled(vllm_config) -> bool:
+    if vllm_config is None:
+        return False
+    enabled = (vllm_config.additional_config or {}).get("dsv41_tp_aiv", False)
+    if not isinstance(enabled, bool):
+        raise ValueError("dsv41_tp_aiv must be a boolean")
+    if not enabled:
+        return False
+    parallel = vllm_config.parallel_config
+    hf_config = vllm_config.model_config.hf_config
+    if not (
+        getattr(hf_config, "model_type", None) == "deepseek_v41"
+        and parallel.tensor_parallel_size == 4
+        and parallel.data_parallel_size == 4
+        and parallel.data_parallel_size_local == 4
+        and parallel.pipeline_parallel_size == 1
+        and parallel.enable_expert_parallel
+        and not parallel.enable_dbo
+        and not parallel.enable_eplb
+        and parallel.prefill_context_parallel_size == 1
+        and parallel.decode_context_parallel_size == 1
+        and get_current_hardware_profile().supports(HardwareCapability.HCCL_AIV_TP_COMMUNICATION)
+    ):
+        raise ValueError("dsv41_tp_aiv requires the qualified single-node DeepSeek V4.1 DP4TP4 layout on A3")
+    return True
 
 
 def get_hccl_config_for_pg_options(group_name: str) -> dict | None:

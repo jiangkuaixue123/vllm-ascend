@@ -29,6 +29,26 @@ retains its original six/twelve-row execution.
 
 ## Optimization coverage
 
+### Optional TP communication policy
+
+For the single-node A3 DP4TP4 layout, `"dsv41_tp_aiv": true` in
+`--additional-config` selects HCCL AIV for the existing TP process group.
+The option defaults to false and requires a boolean. EP, MC2, DP and world
+groups keep their existing options. TP8, pipeline/context parallelism, DBO,
+EPLB and other model or hardware layouts are outside this option's scope.
+
+This uses TorchNPU's process-group setting `hccl_op_expansion_mode=3`;
+it does not set a global communication environment variable or create another
+process group. Keep only the TP group on AIV because concurrent AIV execution
+across multiple communicators is unsupported. CANN can select its AI CPU
+implementation for larger messages. The startup marker `DSV41_TP_AIV_RUNTIME`
+reports the configured policy, not the implementation of every collective.
+
+See the [TorchNPU process-group options](https://www.hiascend.com/document/detail/en/Pytorch/2600/ptmoddevg/Frameworkfeatures/docs/en/framework_feature_guide_pytorch/setting_HCCL_communicator_parameter.md)
+and [HCCL AIV constraints](https://www.hiascend.com/doc_center/source/en/CANNCommunityEdition/900/maintenref/envvar/envref_07_0096.html).
+
+### Retained model paths
+
 - HC delayed mixing, HC post, RMS and Sinkhorn: local three/six/twelve-row kernels.
 - Target query/rotary overlap, paged index scoring and slot arena: TP4/TP8
   dispatch with actual TP size; original arithmetic and collective order.
