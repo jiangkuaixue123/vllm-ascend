@@ -41,13 +41,26 @@ def make_cache(layer):
 
 
 @torch.inference_mode()
-def run_case(layers, ends):
+def run_case(layers, ends, *, narrow_index=False):
+    """Compare one optimization at a time over identical chunks, caches and weights."""
     caches = [[make_cache(layer) for layer in layers] for _ in range(2)]
     table = torch.arange(BLOCKS - 1, -1, -1, device="npu", dtype=torch.int32).unsqueeze(0)
     original_quantize = attention.fp4_quant_dequant
+    original_narrow_guard = attention._target_prefill_index_narrow
     used = set()
+    narrowed = []
+    original_eligible = attention._use_prefill_narrow_columns
     original_dispatch = {scale: getattr(attention_ops, f"_try_fp4_{scale}_aiv") for scale in ("e8m0", "e4m3")}
     with pytest.MonkeyPatch.context() as patch:
+        if narrow_index:
+
+            def observed_eligible(scores, k):
+                result = original_eligible(scores, k)
+                if result:
+                    narrowed.append((tuple(scores.shape), k))
+                return result
+
+            patch.setattr(attention, "_use_prefill_narrow_columns", observed_eligible)
         for scale, dispatch in original_dispatch.items():
 
             def observed(*args, dispatch=dispatch, scale=scale, **kwargs):
@@ -74,11 +87,15 @@ def run_case(layers, ends):
                     cache.metadata = lambda: metadata
 
                 def quantize(*args, **kwargs):
-                    kwargs["prefill_fusion"] = bool(index) and kwargs.get("prefill_fusion", False)
+                    kwargs["prefill_fusion"] = (narrow_index or bool(index)) and kwargs.get("prefill_fusion", False)
                     kwargs["decode_fusion"] = False
                     return original_quantize(*args, **kwargs)
 
                 patch.setattr(attention, "fp4_quant_dequant", quantize)
+                if narrow_index:
+                    patch.setattr(
+                        attention, "_target_prefill_index_narrow", original_narrow_guard if index else lambda tp: False
+                    )
 
             def complete(spans=spans, states=states):
                 runtime = attention.DeepseekV41Runtime(spans)
@@ -96,6 +113,7 @@ def run_case(layers, ends):
                 outputs.append(complete())
                 torch.npu.synchronize()
             assert used == {"e8m0", "e4m3"}
+            assert not narrow_index or narrowed
             for reference, candidate in zip(outputs[0], outputs[1]):
                 if isinstance(reference, torch.Tensor):
                     index_native.exact(candidate, reference)
@@ -124,6 +142,7 @@ def run_case(layers, ends):
                         + json.dumps(
                             {
                                 "status": "PASS",
+                                "optimization": "prefill_index_narrow" if narrow_index else "fp4_prefill",
                                 "layers": [layer.layer_id for layer in layers],
                                 "tokens": end,
                                 "parent": medians[0],
@@ -145,6 +164,7 @@ def run_case(layers, ends):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument("--narrow-index", action="store_true")
     args = parser.parse_args()
     torch.set_num_threads(1)
     torch.npu.set_device(int(os.environ["LOCAL_RANK"]))
@@ -167,6 +187,6 @@ if __name__ == "__main__":
             for ids in ((2,), (20, 24)):
                 layers = [index_native.make_layer(args.checkpoint, layer_id) for layer_id in ids]
                 for ends in ((127, 260, 517), (MAX_ROWS,)):
-                    run_case(layers, ends)
+                    run_case(layers, ends, narrow_index=args.narrow_index)
     finally:
         dist.destroy_process_group()
