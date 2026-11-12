@@ -79,20 +79,20 @@ class TPGroup:
         return result
 
 
-def checkpoint_tensor(path, index, suffix, selection=None):
-    name = f"layers.{CHECKPOINT_LAYER}.attn.{suffix}"
+def checkpoint_tensor(path, index, suffix, selection=None, *, layer_id=CHECKPOINT_LAYER):
+    name = f"layers.{layer_id}.attn.{suffix}"
     with safe_open(path / index[name], framework="pt", device="cpu") as source:
         value = source.get_tensor(name) if selection is None else source.get_slice(name)[selection]
     return value
 
 
-def make_layer(path):
+def make_layer(path, *, layer_id=CHECKPOINT_LAYER):
     """Load actual quantization types and original TP slices, without converting BF16 linears to W8A8."""
     index = json.loads((path / "quant_model_weights.safetensors.index.json").read_text())["weight_map"]
     layer = DeepseekV41Attention.__new__(DeepseekV41Attention)
     nn.Module.__init__(layer)
     layer.config = SimpleNamespace(o_lora_rank=OUTPUT_RANK)
-    layer.layer_id = CHECKPOINT_LAYER
+    layer.layer_id = layer_id
     layer.tp, layer.heads, layer.dim, layer.rope_dim = dist.get_world_size(), HEADS, HEAD_DIM, ROPE_DIM
     layer.local_heads, layer.groups = HEADS // dist.get_world_size(), GROUPS // dist.get_world_size()
     layer.ratio, layer.owns_kv, layer.dsa_cp = 0, False, True
@@ -125,20 +125,20 @@ def make_layer(path):
             selection = (slice(rank * shard, (rank + 1) * shard), slice(None))
         elif name == "wo_b":
             selection = (slice(None), slice(rank * shard, (rank + 1) * shard))
-        weight = checkpoint_tensor(path, index, name + ".weight", selection)
+        weight = checkpoint_tensor(path, index, name + ".weight", selection, layer_id=layer_id)
         assert weight.dtype == (torch.int8 if name == "wq_b" else torch.bfloat16)
         assert weight.shape == linear.weight.shape
         linear.weight.copy_(weight)
         if name == "wq_b":
             for field in ("weight_scale", "weight_offset"):
-                getattr(linear, field).copy_(checkpoint_tensor(path, index, name + "." + field))
+                getattr(linear, field).copy_(checkpoint_tensor(path, index, name + "." + field, layer_id=layer_id))
         linear.quant_method.process_weights_after_loading(linear)
         setattr(layer, name, linear)
     for name, width in (("q_norm", QUERY_RANK), ("kv_norm", HEAD_DIM)):
         norm = DeepseekV41RMSNorm(width, 1e-6).to(device="npu", dtype=torch.bfloat16)
-        norm.weight.copy_(checkpoint_tensor(path, index, name + ".weight"))
+        norm.weight.copy_(checkpoint_tensor(path, index, name + ".weight", layer_id=layer_id))
         setattr(layer, name, norm)
-    sink = checkpoint_tensor(path, index, "attn_sink")
+    sink = checkpoint_tensor(path, index, "attn_sink", layer_id=layer_id)
     assert sink.dtype == torch.bfloat16
     layer.attn_sink = nn.Parameter(sink.float().npu(), requires_grad=False)
     layer.register_buffer(

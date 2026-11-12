@@ -80,6 +80,9 @@ _OUTPUT_QDQ_TILE_ROWS = 256
 # A FULL graph uses a static context width even when only a few pages are live.
 # Tile the key axis; candidate-block and top-k selection still see all scores.
 _DECODE_INDEX_TILE_KEYS = 8192
+_INDEX_OVERLAP_LAYOUT = (32, 128)
+_INDEX_OVERLAP_TP = 4
+_INDEX_OVERLAP_ROWS = (6, 12)
 _DECODE_INDEX_SORT_ROWS = (3, 6, 12)
 _DECODE_INDEX_SORT_K = 512
 _DECODE_INDEX_SORT_MAX_WIDTH = 1 << 24
@@ -1031,7 +1034,7 @@ class DeepseekV41Attention(nn.Module):
             # The compressed source was written by this layer, including the current proposals.
             arena.source_generation += 1
 
-    def _decode_index(self, x, qr, pos, md, runtime):
+    def _decode_index(self, x, qr, pos, md, runtime, prepared=None):
         if not self.owns_index:
             if runtime.decode_topk is None:
                 raise RuntimeError("Missing V4.1 decode index source")
@@ -1041,11 +1044,14 @@ class DeepseekV41Attention(nn.Module):
             runtime.decode_topk = torch.empty((x.shape[0], 0), dtype=torch.int64, device=x.device)
             return
         groups = torch.arange(capacity, device=x.device).unsqueeze(0)
-        indexer = self.indexer
-        q = indexer.wq_b(qr)[0].view(-1, self.index_heads, self.config.index_head_dim)
-        self.rotate(q.unsqueeze(0), pos)
-        q = fp4_quant_dequant(q, 32, scale_format="e8m0")
-        weights = indexer.weights_proj(x)[0] * (self.config.index_head_dim**-0.5 * self.config.index_n_heads**-0.5)
+        if prepared is None:
+            indexer = self.indexer
+            q = indexer.wq_b(qr)[0].view(-1, self.index_heads, self.config.index_head_dim)
+            self.rotate(q.unsqueeze(0), pos)
+            q = fp4_quant_dequant(q, 32, scale_format="e8m0")
+            weights = indexer.weights_proj(x)[0] * (self.config.index_head_dim**-0.5 * self.config.index_n_heads**-0.5)
+        else:
+            q, weights = prepared
         scores = None
         if (
             q.device.type == "npu"
@@ -1249,6 +1255,30 @@ class DeepseekV41Attention(nn.Module):
         ids = torch.where(valid, columns, -1).to(torch.int32).unsqueeze(1)
         return selected, ids
 
+    def _prepare_overlapped_index(self, states, qr, pos, metadata):
+        # Called inside the qualified query stream. Cache state is first needed
+        # by scoring, so only these input/weight-dependent operations move.
+        if not (
+            self.tp == _INDEX_OVERLAP_TP
+            and states.shape[0] in _INDEX_OVERLAP_ROWS
+            and self.ratio in (1, 2)
+            and self.owns_index
+            and metadata.max_model_len // self.ratio > 0
+            and (self.index_heads, self.config.index_head_dim) == _INDEX_OVERLAP_LAYOUT
+            and isinstance(self.indexer.wq_b.quant_method, AscendLinearMethod)
+            and isinstance(self.indexer.wq_b.quant_method.quant_method, AscendW8A8DynamicLinearMethod)
+            and isinstance(self.indexer.weights_proj.quant_method, AscendUnquantizedLinearMethod)
+            and self.indexer.weights_proj.weight.dtype == torch.bfloat16
+        ):
+            return None
+        q = self.indexer.wq_b(qr)[0].view(-1, self.index_heads, self.config.index_head_dim)
+        self.rotate(q.unsqueeze(0), pos)
+        q = fp4_quant_dequant(q, 32, scale_format="e8m0")
+        weights = self.indexer.weights_proj(states)[0] * (
+            self.config.index_head_dim**-0.5 * self.config.index_n_heads**-0.5
+        )
+        return q, weights
+
     def _start_decode_query(self, states, metadata):
         stream = getattr(self, "_query_overlap_stream", None)
         if stream is None or metadata is None:
@@ -1295,8 +1325,9 @@ class DeepseekV41Attention(nn.Module):
             qr = self.q_norm(self.wq_a(states)[0])
             q = self.wq_b(qr)[0].view(states.shape[0], self.heads, self.dim)
             self.rotate(q.unsqueeze(0), pos)
+            prepared_index = self._prepare_overlapped_index(states, qr, pos, metadata)
             complete = stream.record_event()
-        return qr, q, complete, full_pos
+        return qr, q, complete, full_pos, prepared_index
 
     def _decode_forward(self, local_states, runtime):
         full_md = self.cache.metadata().decode
@@ -1322,13 +1353,24 @@ class DeepseekV41Attention(nn.Module):
             self._decode_compressed(gathered, full_pos, full_md, runtime)
             if self.owns_kv:
                 runtime.source_decode = md
+        prepared_index = None
         if pending_query is not None:
             # Cache preparation does not consume Q. Join at its first consumer.
-            qr, q, complete, _ = pending_query
+            qr, q, complete, _, prepared_index = pending_query
             main = torch.npu.current_stream(local_states.device)
             main.wait_event(complete)
             qr.record_stream(main)
             q.record_stream(main)
+            if prepared_index is not None:
+                for tensor in prepared_index:
+                    tensor.record_stream(main)
+                logger.info_once(
+                    "TARGET_INDEX_OVERLAP_RUNTIME pid=%d rows=%d layer=%d",
+                    os.getpid(),
+                    local_states.shape[0],
+                    self.layer_id,
+                    scope="process",
+                )
             logger.info_once(
                 "TARGET_QUERY_OVERLAP_V2_RUNTIME pid=%d rows=%d layer=%d",
                 os.getpid(),
@@ -1337,7 +1379,7 @@ class DeepseekV41Attention(nn.Module):
                 scope="process",
             )
         if self.ratio:
-            self._decode_index(x, qr, pos, md, runtime)
+            self._decode_index(x, qr, pos, md, runtime, prepared_index)
             extra = runtime.decode_topk.shape[-1]
         staged = self._try_decode_slot_arena(q, md, runtime, extra)
         if staged is None:
