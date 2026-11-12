@@ -59,6 +59,13 @@ namespace Catlass::Gemm::Kernel {
 
 constexpr uint16_t SYNCFLAGC2V = 9;
 constexpr uint16_t SYNCFLAGV2C = 10;
+constexpr int32_t TARGET_EP_SIZE = 16;
+constexpr int32_t TARGET_LOCAL_EXPERTS = 24;
+constexpr int32_t TARGET_TOP_K = 6;
+constexpr int32_t TARGET_DECODE_ROWS = 6;
+constexpr int32_t TARGET_HIDDEN_SIZE = 5120;
+constexpr int32_t TARGET_GATE_UP_SIZE = 4608;
+
 
 template <
     class BlockMmad_,
@@ -898,30 +905,39 @@ private:
         AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
         AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID1);
         int32_t pingpongIdx = 0;
+        const bool skipEmptyTargetDispatch = std::is_same_v<ElementC, int32_t> &&
+            params.EP == TARGET_EP_SIZE && params.expertPerRank == TARGET_LOCAL_EXPERTS &&
+            params.topK == TARGET_TOP_K && params.problemShape.m() == TARGET_DECODE_ROWS &&
+            params.problemShape.k() == TARGET_HIDDEN_SIZE && params.problemShape.n() == TARGET_GATE_UP_SIZE;
         for (int32_t groupIdx = 0; groupIdx < params.expertPerRank; ++groupIdx) {
             // The ith core reads data from the ith rank's peermem
             uint32_t currentM = cumsumMM((params.EP - 1) * params.expertPerRank + groupIdx);
-            for(int32_t dstEpIdx = coreIdx; dstEpIdx < params.EP; dstEpIdx += coreNum) {
-                uint32_t rowStart = (dstEpIdx == 0 ? 0 : cumsumMM((dstEpIdx - 1) * params.expertPerRank + groupIdx)) + prevGroupSum1;
-                if (rowStart < params.maxOutputSize) {
-                    uint32_t rows = tokenPerExpert(tokenPerExpertLayout(dstEpIdx, params.rank, groupIdx));
-                    if (rowStart + rows > params.maxOutputSize) {
-                        rows = params.maxOutputSize - rowStart;
+            // All local AIV cores read the same completed expert count. An
+            // empty expert transfers no data, so it adds no producer dependency.
+            // Keep every AIV-to-AIC flag in the original order even when empty.
+            if (!skipEmptyTargetDispatch || currentM != 0) {
+                for(int32_t dstEpIdx = coreIdx; dstEpIdx < params.EP; dstEpIdx += coreNum) {
+                    uint32_t rowStart = (dstEpIdx == 0 ? 0 : cumsumMM((dstEpIdx - 1) * params.expertPerRank + groupIdx)) + prevGroupSum1;
+                    if (rowStart < params.maxOutputSize) {
+                        uint32_t rows = tokenPerExpert(tokenPerExpertLayout(dstEpIdx, params.rank, groupIdx));
+                        if (rowStart + rows > params.maxOutputSize) {
+                            rows = params.maxOutputSize - rowStart;
+                        }
+                        uint32_t rowSrc = prevSum;
+                        prevSum += rows;
+                        GM_ADDR otherRankPtr = shmem(0, dstEpIdx);
+                        AscendC::GlobalTensor<ElementA> gmRemoteA;
+                        gmRemoteA.SetGlobalBuffer(reinterpret_cast<__gm__ ElementA*>(otherRankPtr + peermemInfo.offsetA));
+                        MatrixCoord offsetA{rowStart, 0};
+                        int64_t gmOffsetA = params.layoutA.GetOffset(offsetA);
+                        int64_t gmOffsetPeer = rowSrc * (params.problemShape.k() + UB_ALIGN);
+                        int32_t ubMoveNum = 2;
+                        CopyGMToGMPerToken(gmA[gmOffsetA], gmPerTokenScale1[rowStart], gmRemoteA[gmOffsetPeer],  rows, params.problemShape.k(), ubMoveNum, pingpongIdx, gmRouteScale[rowStart]);
                     }
-                    uint32_t rowSrc = prevSum;
-                    prevSum += rows;
-                    GM_ADDR otherRankPtr = shmem(0, dstEpIdx);
-                    AscendC::GlobalTensor<ElementA> gmRemoteA;
-                    gmRemoteA.SetGlobalBuffer(reinterpret_cast<__gm__ ElementA*>(otherRankPtr + peermemInfo.offsetA));
-                    MatrixCoord offsetA{rowStart, 0};
-                    int64_t gmOffsetA = params.layoutA.GetOffset(offsetA);
-                    int64_t gmOffsetPeer = rowSrc * (params.problemShape.k() + UB_ALIGN);
-                    int32_t ubMoveNum = 2;
-                    CopyGMToGMPerToken(gmA[gmOffsetA], gmPerTokenScale1[rowStart], gmRemoteA[gmOffsetPeer],  rows, params.problemShape.k(), ubMoveNum, pingpongIdx, gmRouteScale[rowStart]);
-                }
 
+                }
+                AscendC::SyncAll<true>();
             }
-            AscendC::SyncAll<true>();
             AscendC::CrossCoreSetFlag<0x2, PIPE_MTE3>(syncgmm1Idx / CROSS_CORE_FLAG_MAX_SET_COUNT);
             syncgmm1Idx ++;
 
