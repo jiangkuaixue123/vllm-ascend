@@ -1,0 +1,25 @@
+tests/e2e/nightly/one_card/test_shared_input_quant.py
+  s_6eab87361519a8::t_d54e762a628400 1-168
+vllm_ascend/models/common/ops/shared_input_quant.py
+  s_6eab87361519a8::t_d54e762a628400 1-60
+tests/ut/models/common/ops/test_shared_input_quant.py
+  s_6eab87361519a8::t_d54e762a628400 1-153
+vllm_ascend/models/deepseek_v41/moe.py
+  s_6eab87361519a8::t_a32c98a279b2e9 296,301,314-322,401-403
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "780bfc974b3ad951e6be453bfc6580b548ee3e4a",
+  "prompts": {},
+  "sessions": {
+    "s_6eab87361519a8": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1ac13-1fd0-7670-ae84-d58acaf2730c",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "jiangkuaixue123 <jiangxiaozhou111@163.com>"
+    }
+  }
+}
