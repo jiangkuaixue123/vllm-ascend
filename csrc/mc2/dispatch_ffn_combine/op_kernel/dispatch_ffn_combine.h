@@ -60,6 +60,9 @@ public:
 
 
 private:
+    template <class L1TileShape, class L0TileShape>
+    __aicore__ inline void ProcessTile();
+
     GM_ADDR xGM_;
     GM_ADDR weight1GM_;
     GM_ADDR weight2GM_;
@@ -171,6 +174,30 @@ __aicore__ inline void DispatchFFNCombine<TemplateMMA2ACFunc>::Init(GM_ADDR xGM,
 template <TemplateMMA2AClass>
 __aicore__ inline void DispatchFFNCombine<TemplateMMA2ACFunc>::Process()
 {
+    constexpr uint32_t SMALL_DECODE_ROWS = 6;
+    constexpr uint32_t TARGET_HIDDEN_SIZE = 5120;
+    constexpr uint32_t TARGET_GATE_UP_SIZE = 4608;
+    constexpr uint32_t TARGET_EP_SIZE = 16;
+    constexpr uint32_t TARGET_LOCAL_EXPERTS = 24;
+    constexpr uint32_t TARGET_TOP_K = 6;
+    if constexpr (std::is_same_v<CType_, float> && Nz_) {
+        if (m == SMALL_DECODE_ROWS && k == TARGET_HIDDEN_SIZE &&
+            n == TARGET_GATE_UP_SIZE && EP == TARGET_EP_SIZE && expertPerRank == TARGET_LOCAL_EXPERTS &&
+            topK == TARGET_TOP_K) {
+            // Narrower N provides more independent tasks for sparsely populated experts.
+            // Keep K groups short and double-buffered rather than the rejected deep-K
+            // narrow tile. INT32 accumulation and floating-point epilogues are unchanged.
+            ProcessTile<GemmShape<64, 128, 384>, GemmShape<64, 128, 64>>();
+            return;
+        }
+    }
+    ProcessTile<GemmShape<128, 256, 512>, GemmShape<128, 256, 128>>();
+}
+
+template <TemplateMMA2AClass>
+template <class L1TileShape, class L0TileShape>
+__aicore__ inline void DispatchFFNCombine<TemplateMMA2ACFunc>::ProcessTile()
+{
     // Define ArchTag
     using ArchTag = Arch::AtlasA2;
     constexpr bool enableUnitFlag = false;
@@ -197,7 +224,6 @@ __aicore__ inline void DispatchFFNCombine<TemplateMMA2ACFunc>::Process()
     LayoutB layoutB1 = LayoutBInitializer<LayoutB, BType_>::create(k, n);
     LayoutB layoutB2 = LayoutBInitializer<LayoutB, BType_>::create(k2, n2);
     using LayoutC = layout::RowMajor;
-    using L1TileShape = GemmShape<128, 256, 512>;   // M, N, K
 
     constexpr uint32_t workspaceStages = 2;
     constexpr uint32_t preloadStages = 1;
@@ -212,7 +238,6 @@ __aicore__ inline void DispatchFFNCombine<TemplateMMA2ACFunc>::Process()
         enableUnitFlag, enableShuffleK
     >;
 
-    using L0TileShape = GemmShape<128, 256, 128>;
     using AType = Gemm::GemmType<int8_t, layout::RowMajor>;
     using BType = Gemm::GemmType<int8_t, LayoutB>;
     static constexpr bool ROUTE_BEFORE_DOWN = std::is_same_v<CType_, float>;
