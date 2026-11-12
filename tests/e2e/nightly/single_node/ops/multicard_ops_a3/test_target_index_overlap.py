@@ -38,11 +38,13 @@ def make_layer(path, layer_id):
     layer.config = config
     layer.ratio = config.compress_ratios[layer_id]
     layer.owns_kv = layer_id in config.kv_source_layer_ids
-    layer.owns_index = True
+    layer.owns_index = layer_id in config.index_source_layer_ids
     layer.uses_local_kv = True
     layer.index_heads = INDEX_HEADS
     layer.q_norm.eps = layer.kv_norm.eps = config.rms_norm_eps
-    layer.frequencies.copy_(attention.rotary_frequencies(config, True))
+    layer.frequencies.copy_(attention.rotary_frequencies(config, bool(layer.ratio)))
+    if not layer.ratio or (not layer.owns_index and not layer.owns_kv):
+        return layer.eval()
     index = json.loads((path / "quant_model_weights.safetensors.index.json").read_text())["weight_map"]
 
     def weight(suffix):
@@ -145,7 +147,7 @@ def exact(actual, expected):
 
 
 @torch.inference_mode()
-def run_case(layers, rows, *, bind_quantizer=None):
+def run_case(layers, rows, *, bind_quantizer=None, optimization=None):
     """Compare graph operands/state first, then time whole native attention chains."""
     torch.manual_seed(827 + dist.get_rank())
     states = torch.randn(rows, native.HIDDEN, device="npu", dtype=torch.bfloat16)
@@ -153,7 +155,8 @@ def run_case(layers, rows, *, bind_quantizer=None):
     caches = [[make_cache(layer, md) for layer in layers] for _ in range(2)]
     methods = [layer._prepare_overlapped_index for layer in layers]
     for layer in layers:
-        layer.attention_kernel.pin_decode_plan(states.device, native.HEADS, rows, native.SELECTED_WIDTH)
+        selected_width = layer.config.sliding_window + (layer.config.index_topk if layer.ratio else 0)
+        layer.attention_kernel.pin_decode_plan(states.device, native.HEADS, rows, selected_width)
     observed = {}
     original_scores = attention.paged_index_scores
 
@@ -179,7 +182,7 @@ def run_case(layers, rows, *, bind_quantizer=None):
                 (
                     observed.get("query"),
                     observed.get("weights"),
-                    runtime.decode_topk,
+                    getattr(runtime, "decode_topk", None),
                     getattr(runtime, "decode_candidate_blocks", None),
                 )
             )
@@ -270,7 +273,7 @@ def run_case(layers, rows, *, bind_quantizer=None):
                     "candidate": medians[1],
                     "metrics": ["host_ms", "ready_ms"],
                     "scope": "full native compressed attention, index/candidate chain, cache, FIA and WO",
-                    "optimization": "fp4_decode" if bind_quantizer is not None else "index_overlap",
+                    "optimization": optimization or ("fp4_decode" if bind_quantizer is not None else "index_overlap"),
                     "limitation": "full static 153600 capacity; controlled live history up to384 tokens",
                 }
             ),
@@ -282,6 +285,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--fp4-decode", action="store_true")
+    parser.add_argument("--fixed-m-kv", action="store_true")
     args = parser.parse_args()
     torch.set_num_threads(1)
     torch.npu.set_device(int(os.environ["LOCAL_RANK"]))
@@ -302,21 +306,43 @@ if __name__ == "__main__":
                 "get_forward_context",
                 lambda: SimpleNamespace(cudagraph_runtime_mode=CUDAGraphMode.FULL, is_draft_model=False),
             )
-            chains = [[make_layer(args.checkpoint, layer_id) for layer_id in ids] for ids in ((2,), (20, 24))]
+            layer_ids = ((0,), (2, 3), (20, 24)) if args.fixed_m_kv else ((2,), (20, 24))
+            chains = [[make_layer(args.checkpoint, layer_id) for layer_id in ids] for ids in layer_ids]
+            fixed_m_methods = (
+                {model: model._try_gather_fixed_m_kv for models in chains for model in models}
+                if args.fixed_m_kv
+                else {}
+            )
+            fixed_m_calls = []
             # Match service startup: all native metadata is initialized before
             # capturing or replaying any attention graph on the worker.
             for models in chains:
                 for model in models:
                     for rows in (6, 12):
                         model.attention_kernel.pin_decode_plan(
-                            model.attn_sink.device, native.HEADS, rows, native.SELECTED_WIDTH
+                            model.attn_sink.device,
+                            native.HEADS,
+                            rows,
+                            model.config.sliding_window + (model.config.index_topk if model.ratio else 0),
                         )
             original_quantizer = attention.fp4_quant_dequant
             used_formats = set()
 
             def bind_quantizer(index):
+                if args.fixed_m_kv:
+                    for model, method in fixed_m_methods.items():
+
+                        def projected(states, *, method=method, model=model):
+                            result = method(states) if index else None
+                            if result is not None:
+                                fixed_m_calls.append((model.layer_id, states.shape[0]))
+                            return result
+
+                        patch.setattr(model, "_try_gather_fixed_m_kv", projected)
+
                 def quantize(*args, **kwargs):
-                    kwargs["decode_fusion"] = bool(index) and kwargs.get("decode_fusion", False)
+                    if not fixed_m_methods:
+                        kwargs["decode_fusion"] = bool(index) and kwargs.get("decode_fusion", False)
                     return original_quantizer(*args, **kwargs)
 
                 patch.setattr(attention, "fp4_quant_dequant", quantize)
@@ -335,7 +361,18 @@ if __name__ == "__main__":
             for models in chains:
                 for rows in (6, 12):
                     used_formats.clear()
-                    run_case(models, rows, bind_quantizer=bind_quantizer if args.fp4_decode else None)
+                    fixed_m_calls.clear()
+                    run_case(
+                        models,
+                        rows,
+                        bind_quantizer=bind_quantizer if args.fp4_decode or args.fixed_m_kv else None,
+                        optimization="fixed_m_kv_gather" if args.fixed_m_kv else None,
+                    )
+                    if args.fixed_m_kv:
+                        assert {layer_id for layer_id, _ in fixed_m_calls} == {
+                            model.layer_id for model in models if not model.owns_kv
+                        }
+                        assert all(local_rows == rows for _, local_rows in fixed_m_calls)
                     if args.fp4_decode:
                         assert used_formats == {"e8m0", "e4m3"}
     finally:

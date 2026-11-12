@@ -98,6 +98,8 @@ _QUERY_OVERLAP_ROWS = (3, 6, 12)
 _QUERY_OVERLAP_LAYOUT = (5120, 1280, 64, 512)
 _QUERY_OVERLAP_TP_SIZES = (4, 8)
 _QUERY_OVERLAP_QUERY_WIDTH = 6
+_FIXED_M_KV_LAYOUT = (4, 5120, 512)
+_FIXED_M_KV_ROWS = (6, 12)
 
 
 def _quantize_projection_input(output):
@@ -1344,11 +1346,53 @@ class DeepseekV41Attention(nn.Module):
             complete = stream.record_event()
         return qr, q, complete, full_pos, prepared_index
 
+    def _try_gather_fixed_m_kv(self, local_states):
+        """Keep the original GEMM shape and row offsets while gathering projected KV."""
+        tp, hidden_size, head_dim = _FIXED_M_KV_LAYOUT
+        if not (
+            local_states.device.type == "npu"
+            and is_forward_context_available()
+            and get_forward_context().cudagraph_runtime_mode == CUDAGraphMode.FULL
+            and getattr(get_forward_context(), "is_draft_model", True) is False
+            and self.dsa_cp
+            and self.tp == tp
+            and self.dim == head_dim
+            and not self.owns_kv
+            and self.sequence_group is not None
+            and self.sequence_group.world_size == tp
+            and local_states.dtype == torch.bfloat16
+            and local_states.ndim == 2
+            and local_states.shape[0] in _FIXED_M_KV_ROWS
+            and local_states.shape[1] == hidden_size
+            and local_states.is_contiguous()
+            and isinstance(getattr(self.wkv, "quant_method", None), AscendUnquantizedLinearMethod)
+            and self.wkv.weight.dtype == torch.bfloat16
+            and self.wkv.weight.shape == (head_dim, hidden_size)
+            and torch.is_inference_mode_enabled()
+            and get_ascend_device_type() == AscendDeviceType.A3
+        ):
+            return None
+        rows = local_states.shape[0]
+        offset = self.sequence_group.rank_in_group * rows
+        padded = local_states.new_zeros((rows * tp, hidden_size))
+        padded.narrow(0, offset, rows).copy_(local_states)
+        projected = self.wkv(padded)[0].narrow(0, offset, rows)
+        gathered = self.sequence_group.all_gather(projected.contiguous(), dim=0)
+        logger.info_once("TARGET_FIXED_M_KV_GATHER_RUNTIME: native full-M WKV, projected TP4 gather")
+        return gathered
+
     def _decode_forward(self, local_states, runtime, *, defer_output_mask=False):
         full_md = self.cache.metadata().decode
         pending_query = self._start_decode_query(local_states, full_md)
-        gathered, offset = self._sequence_inputs(local_states, "uniform_decode")
-        if full_md is None or gathered.shape[0] != full_md.active.shape[0]:
+        projected_kv = self._try_gather_fixed_m_kv(local_states)
+        if projected_kv is None:
+            gathered, offset = self._sequence_inputs(local_states, "uniform_decode")
+            global_rows = gathered.shape[0]
+        else:
+            gathered = None
+            offset = self.sequence_group.rank_in_group * local_states.shape[0]
+            global_rows = projected_kv.shape[0]
+        if full_md is None or global_rows != full_md.active.shape[0]:
             raise ValueError("V4.1 graph token rows must match the decode metadata bucket")
         local_md = full_md.shard(offset, local_states.shape[0]) if self.sequence_group is not None else full_md
         x, md = (local_states, local_md) if self.dsa_cp else (gathered, full_md)
@@ -1357,16 +1401,15 @@ class DeepseekV41Attention(nn.Module):
         if pending_query is None:
             qr = self.q_norm(self.wq_a(x)[0])
             q = self.wq_b(qr)[0].view(x.shape[0], self.heads, self.dim)
-            raw = self.kv_norm(self.wkv(gathered)[0])
+        raw = self.kv_norm(self.wkv(gathered)[0] if projected_kv is None else projected_kv)
+        if pending_query is None:
             self.rotate(q.unsqueeze(0), pos)
-        else:
-            raw = self.kv_norm(self.wkv(gathered)[0])
         self.rotate(raw.unsqueeze(0), full_pos)
         self.cache.decode_write(full_md, fp8_quant_dequant(raw, 32), 0, 0, full_md.active)
         extra = 0
         if self.ratio:
-            self._decode_compressed(gathered, full_pos, full_md, runtime)
             if self.owns_kv:
+                self._decode_compressed(gathered, full_pos, full_md, runtime)
                 runtime.source_decode = md
         prepared_index = None
         if pending_query is not None:
