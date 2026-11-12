@@ -88,6 +88,7 @@ _DECODE_INDEX_SORT_ROWS = (3, 6, 12)
 _DECODE_INDEX_SORT_K = 512
 _DECODE_INDEX_SORT_MAX_WIDTH = 1 << 24
 _DECODE_INDEX_TIE_WIDTHS = (76800, 153600)
+_PREFILL_INDEX_MAX_ROWS = 8192
 # Head widths and rotary tail supported by the V4.1 fused path.
 _PARTIAL_ROPE_HEAD_DIMS = (128, 512)
 _PARTIAL_ROPE_DIM = 64
@@ -557,7 +558,31 @@ def _use_float32_tie_columns(scores, k):
     )
 
 
-def topk_columns(scores, k):
+def _target_prefill_prefix_int32(tp):
+    if tp != _INDEX_OVERLAP_TP or not is_forward_context_available():
+        return False
+    context = get_forward_context()
+    return context.cudagraph_runtime_mode == CUDAGraphMode.NONE and not getattr(context, "is_draft_model", True)
+
+
+def _prefill_cutoff_ordinals(at_cutoff):
+    if (
+        at_cutoff.device.type == "npu"
+        and at_cutoff.ndim == 2
+        and at_cutoff.dtype == torch.bool
+        and 0 < at_cutoff.shape[0] <= _PREFILL_INDEX_MAX_ROWS
+        and 0 < at_cutoff.shape[-1] <= _DECODE_INDEX_SORT_K
+        and torch.is_inference_mode_enabled()
+    ):
+        # Each prefix counts at most 512 booleans. INT32 is exact; gather
+        # still receives the original INT64 indices after this conversion.
+        ordinal = at_cutoff.int().cumsum(-1, dtype=torch.int32).long() - 1
+        logger.info_once("TARGET_PREFILL_PREFIX_INT32_RUNTIME pid=%d", os.getpid(), scope="process")
+        return ordinal
+    return at_cutoff.long().cumsum(-1) - 1
+
+
+def topk_columns(scores, k, *, prefill=False):
     """Keep the FP32 top-k, preferring the lower column only at a tied cutoff."""
     columns = torch.arange(scores.shape[-1], device=scores.device, dtype=torch.int32)
     if k == 0 or k == scores.shape[-1]:
@@ -574,7 +599,7 @@ def topk_columns(scores, k):
     tied = torch.where(scores == cutoff, columns, scores.shape[-1])
     first = tied.topk(k, dim=-1, largest=False).values
     at_cutoff = top.values == cutoff
-    ordinal = at_cutoff.long().cumsum(-1) - 1
+    ordinal = _prefill_cutoff_ordinals(at_cutoff) if prefill else at_cutoff.long().cumsum(-1) - 1
     return torch.where(at_cutoff, first.gather(-1, ordinal.clamp_min(0)).long(), top.indices)
 
 
@@ -596,7 +621,7 @@ def sorted_topk_columns(scores, k):
     return indices.sort(-1).values
 
 
-def select_candidate_blocks(logits, compress_lens, topk_blocks, block_size, *, per_token=True):
+def select_candidate_blocks(logits, compress_lens, topk_blocks, block_size, *, per_token=True, prefill=False):
     width = logits.shape[-1]
     if width == 0:
         return torch.zeros_like(logits, dtype=torch.bool)
@@ -605,7 +630,8 @@ def select_candidate_blocks(logits, compress_lens, topk_blocks, block_size, *, p
     last = (compress_lens - 1) // block_size
     blocks = torch.arange(scores.shape[-1], device=logits.device)
     scores = scores.masked_fill(blocks == last, torch.inf)
-    top = topk_columns(scores, min(topk_blocks, scores.shape[-1]))
+    k = min(topk_blocks, scores.shape[-1])
+    top = topk_columns(scores, k, prefill=True) if prefill else topk_columns(scores, k)
     keep = torch.zeros_like(scores, dtype=torch.bool).scatter_(-1, top, scores.gather(-1, top) > -torch.inf)
     if per_token:
         return keep.repeat_interleave(block_size, -1)[..., :width]
@@ -994,6 +1020,7 @@ class DeepseekV41Attention(nn.Module):
         elif 0 <= candidate_layer < self.layer_id and shared.candidates is None:
             raise RuntimeError("Candidate source did not execute")
         columns = torch.arange(count, device=x.device)
+        prefill_prefix = _target_prefill_prefix_int32(self.tp)
         for start in range(0, x.shape[0], tile_rows):
             rows = slice(start, start + tile_rows)
             query = q[rows]
@@ -1010,11 +1037,15 @@ class DeepseekV41Attention(nn.Module):
             scores.masked_fill_(columns >= lengths, -torch.inf)
             if self.layer_id == candidate_layer:
                 shared.candidates[rows] = select_candidate_blocks(
-                    scores, lengths, self.config.candidate_topk_blocks, self.config.candidate_block_size
+                    scores,
+                    lengths,
+                    self.config.candidate_topk_blocks,
+                    self.config.candidate_block_size,
+                    prefill=prefill_prefix,
                 )
             elif 0 <= candidate_layer < self.layer_id:
                 scores.masked_fill_(~shared.candidates[rows], -torch.inf)
-            indices = topk_columns(scores, k).sort(-1).values
+            indices = topk_columns(scores, k, prefill=prefill_prefix).sort(-1).values
             topk[rows] = torch.where(indices < lengths, indices, -1)
         shared.topk = topk
         return shared.topk

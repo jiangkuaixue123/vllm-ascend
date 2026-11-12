@@ -41,10 +41,13 @@ def make_cache(layer):
 
 
 @torch.inference_mode()
-def run_case(layers, ends):
+def run_case(layers, ends, *, prefix_int32=False):
+    """Compare one optimization over identical chunks, caches and checkpoint weights."""
     caches = [[make_cache(layer) for layer in layers] for _ in range(2)]
     table = torch.arange(BLOCKS - 1, -1, -1, device="npu", dtype=torch.int32).unsqueeze(0)
     original_quantize = attention.fp4_quant_dequant
+    original_ordinals = attention._prefill_cutoff_ordinals
+    prefix_calls = []
     used = set()
     original_dispatch = {scale: getattr(attention_ops, f"_try_fp4_{scale}_aiv") for scale in ("e8m0", "e4m3")}
     with pytest.MonkeyPatch.context() as patch:
@@ -74,11 +77,21 @@ def run_case(layers, ends):
                     cache.metadata = lambda: metadata
 
                 def quantize(*args, **kwargs):
-                    kwargs["prefill_fusion"] = bool(index) and kwargs.get("prefill_fusion", False)
+                    kwargs["prefill_fusion"] = (prefix_int32 or bool(index)) and kwargs.get("prefill_fusion", False)
                     kwargs["decode_fusion"] = False
                     return original_quantize(*args, **kwargs)
 
                 patch.setattr(attention, "fp4_quant_dequant", quantize)
+                if prefix_int32:
+
+                    def ordinals(cutoff):
+                        if index:
+                            assert 0 < cutoff.shape[-1] <= attention._DECODE_INDEX_SORT_K
+                            prefix_calls.append(tuple(cutoff.shape))
+                            return original_ordinals(cutoff)
+                        return cutoff.long().cumsum(-1) - 1
+
+                    patch.setattr(attention, "_prefill_cutoff_ordinals", ordinals)
 
             def complete(spans=spans, states=states):
                 runtime = attention.DeepseekV41Runtime(spans)
@@ -96,6 +109,8 @@ def run_case(layers, ends):
                 outputs.append(complete())
                 torch.npu.synchronize()
             assert used == {"e8m0", "e4m3"}
+            # Short compressed histories return all columns without TopK.
+            assert not prefix_int32 or ends != (MAX_ROWS,) or prefix_calls
             for reference, candidate in zip(outputs[0], outputs[1]):
                 if isinstance(reference, torch.Tensor):
                     index_native.exact(candidate, reference)
@@ -124,6 +139,7 @@ def run_case(layers, ends):
                         + json.dumps(
                             {
                                 "status": "PASS",
+                                "optimization": "prefill_prefix_int32" if prefix_int32 else "fp4_prefill",
                                 "layers": [layer.layer_id for layer in layers],
                                 "tokens": end,
                                 "parent": medians[0],
@@ -145,6 +161,7 @@ def run_case(layers, ends):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument("--prefix-int32", action="store_true")
     args = parser.parse_args()
     torch.set_num_threads(1)
     torch.npu.set_device(int(os.environ["LOCAL_RANK"]))
@@ -167,6 +184,6 @@ if __name__ == "__main__":
             for ids in ((2,), (20, 24)):
                 layers = [index_native.make_layer(args.checkpoint, layer_id) for layer_id in ids]
                 for ends in ((127, 260, 517), (MAX_ROWS,)):
-                    run_case(layers, ends)
+                    run_case(layers, ends, prefix_int32=args.prefix_int32)
     finally:
         dist.destroy_process_group()
