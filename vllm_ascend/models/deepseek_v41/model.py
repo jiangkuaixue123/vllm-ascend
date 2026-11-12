@@ -104,6 +104,9 @@ class EngramQueryUnrotation(nn.Module):
         return hidden_states.float() @ self.matrix.T
 
 
+_TARGET_HEAD_STORAGE_TP = 4
+
+
 class DeepseekV41Block(nn.Module):
     def __init__(self, config, vllm_config, layer_id):
         super().__init__()
@@ -250,6 +253,17 @@ def read_parameter_slice(reader, key, parameter, module, tp_rank, tp_size):
         indices = module.shard_indices
         slices[0] = slice(indices.org_vocab_start_index, indices.org_vocab_end_index)
         value = source[tuple(slices)]
+        if (
+            isinstance(module, ParallelLMHead)
+            and parameter.device.type == "npu"
+            and value.dtype in (torch.float32, torch.bfloat16)
+            and parameter.dtype == torch.bfloat16
+        ):
+            # Reproduce the original FP32 parameter copy before the processor's
+            # device conversion, including BF16 checkpoint NaN encodings.
+            original_storage = torch.empty_like(value, device=parameter.device, dtype=torch.float32)
+            original_storage.copy_(value)
+            value = original_storage.to(parameter.dtype)
         parameter.zero_()
         parameter[: value.shape[0]].copy_(value)
         return
@@ -323,13 +337,18 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsMultiModal):
             [DeepseekV41Block(config, vllm_config, layer_id) for layer_id in range(config.num_hidden_layers)]
         )
         self.norm = DeepseekV41RMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.logits_processor = LogitsProcessor(config.vocab_size)
         self.head = ParallelLMHead(
             config.vocab_size,
             config.hidden_size,
-            params_dtype=torch.float32,
+            params_dtype=(
+                torch.bfloat16
+                if get_tensor_model_parallel_world_size() == _TARGET_HEAD_STORAGE_TP
+                and getattr(self.logits_processor, "head_dtype", None) == torch.bfloat16
+                else torch.float32
+            ),
             prefix="head",
         )
-        self.logits_processor = LogitsProcessor(config.vocab_size)
         self.model_path = Path(vllm_config.model_config.model)
         self.engram_store = None
         self.engram_hasher = None
@@ -657,6 +676,14 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsMultiModal):
         return (output, auxiliary) if self.aux_hidden_state_layers else output
 
     def compute_logits(self, hidden_states):
+        if hidden_states.device.type == "npu" and self.head.weight.dtype == torch.bfloat16:
+            logger.info_once(
+                "TARGET_HEAD_STORAGE_RUNTIME pid=%d parameter=%s projection=%s",
+                os.getpid(),
+                self.head.weight.dtype,
+                getattr(self.logits_processor, "head_dtype", None),
+                scope="process",
+            )
         return self.logits_processor(self.head, hidden_states.float())
 
     @torch.no_grad()
