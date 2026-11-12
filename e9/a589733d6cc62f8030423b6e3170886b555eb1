@@ -1,0 +1,40 @@
+tests/ut/models/common/ops/test_target_fp4_decode.py
+  s_6eab87361519a8::t_8000f2c17336d3 1-68
+vllm_ascend/models/deepseek_v41/attention_ops.py
+  s_6eab87361519a8::t_6ffd39e6df119d 42
+  s_6eab87361519a8::t_20427027b82599 10-11,36-41,207-277,284,293-298
+vllm_ascend/models/deepseek_v41/attention.py
+  s_6eab87361519a8::t_6ffd39e6df119d 775
+  s_6eab87361519a8::t_3eb98361bef668 771-774,776-777
+  s_6eab87361519a8::t_227f4d8d671484 85,1035-1036,1059,1284
+tests/e2e/nightly/one_card/test_fp4_e4m3_fused.py
+  s_6eab87361519a8::t_0a50f75463dea5 1-141
+tests/e2e/nightly/one_card/test_fp4_e8m0_fused.py
+  s_6eab87361519a8::t_211943a93a4090 1-121
+tests/e2e/nightly/single_node/ops/multicard_ops_a3/test_target_index_overlap.py
+  s_6eab87361519a8::t_b19c0bb920e464 20,148,168-170,224-225,273,284,314-334,337-340
+tests/ut/models/common/ops/test_fp4_e4m3_dispatch.py
+  s_6eab87361519a8::t_d5637f3889b98e 1-135
+tests/ut/models/common/ops/test_fp4_e8m0_dispatch.py
+  s_6eab87361519a8::t_a2103575609eea 1-135
+vllm_ascend/ops/triton/deepseek_v41_fp4_e4m3_qdq.py
+  s_6eab87361519a8::t_af0e6e28b2d304 1-74
+vllm_ascend/ops/triton/deepseek_v41_fp4_qdq.py
+  s_6eab87361519a8::t_a058240c313a5c 1-58
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "e9a589733d6cc62f8030423b6e3170886b555eb1",
+  "prompts": {},
+  "sessions": {
+    "s_6eab87361519a8": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1ac13-1fd0-7670-ae84-d58acaf2730c",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "jiangkuaixue123 <jiangxiaozhou111@163.com>"
+    }
+  }
+}
