@@ -1,0 +1,24 @@
+tests/e2e/nightly/one_card/test_hc_post_reuse.py
+  s_6eab87361519a8::t_a5e00d35dad290 22-32,87-94
+  s_6eab87361519a8::t_5699ce8df1add3 68
+  s_6eab87361519a8::t_2b1b5721bf7909 1-21,33-67,69-86
+vllm_ascend/ops/triton/hc_post.py
+  s_6eab87361519a8::t_2b1b5721bf7909 5-6,9,15-16,64-65,75-100,103-105,116-118
+  s_6eab87361519a8::t_a5e00d35dad290 66-74,106-115
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "f1ad972583862e0d43a47d1bb821fa14d66781f4",
+  "prompts": {},
+  "sessions": {
+    "s_6eab87361519a8": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1ac13-1fd0-7670-ae84-d58acaf2730c",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "jiangkuaixue123 <jiangxiaozhou111@163.com>"
+    }
+  }
+}
