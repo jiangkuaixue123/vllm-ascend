@@ -1,0 +1,25 @@
+tests/e2e/nightly/single_node/ops/multicard_ops_a3/test_target_index_overlap.py
+  s_6eab87361519a8::t_f900b7dd6f338c 1-312
+tests/e2e/nightly/single_node/ops/multicard_ops_a3/test_target_query_overlap.py
+  s_6eab87361519a8::t_44284bb3fa4472 82-83,89,95,128,134,139,141
+tests/ut/models/deepseek_v41/test_decode_index_tiles.py
+  s_6eab87361519a8::t_1e7e98d34210e1 14-15,58-64,203-209
+vllm_ascend/models/deepseek_v41/attention.py
+  s_6eab87361519a8::t_01bb1754e1b46c 83-85,1037,1047-1054,1258-1281,1328,1330,1356,1359,1364-1373,1382
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "a5e939415b3971bd71e25023d6a691e9f8c2dc4b",
+  "prompts": {},
+  "sessions": {
+    "s_6eab87361519a8": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1ac13-1fd0-7670-ae84-d58acaf2730c",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "jiangkuaixue123 <jiangxiaozhou111@163.com>"
+    }
+  }
+}
