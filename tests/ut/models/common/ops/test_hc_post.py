@@ -238,7 +238,7 @@ def test_block_only_defers_tp4_decode_masks_to_both_post_consumers(tp, decode, l
         ffn_norm=lambda value: value,
         post_residual=post_residual,
     )
-    env = {"_HC_DECODE_MASK_TP": 4}
+    env = {"_HC_DECODE_MASK_TP": 4, "try_start_hc_attention": lambda *args: None}
     exec(compile(ast.Module(body=[method], type_ignores=[]), str(path), "exec"), env)
     runtime = SimpleNamespace(decode=SimpleNamespace(active=mask) if decode else None)
     actual, next_pre = env["forward"](block, hidden, pre, runtime, mask if local_mask else None)

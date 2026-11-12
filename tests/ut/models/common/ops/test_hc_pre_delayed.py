@@ -231,6 +231,7 @@ def test_native_failure_is_not_hidden_by_an_unmeasured_fallback():
 
 def block_methods(env):
     env.setdefault("hc_post_fused", lambda *args: None)
+    env.setdefault("try_start_hc_attention", lambda *args: None)
     path = ROOT / "vllm_ascend/models/deepseek_v41/model.py"
     tree = ast.parse(path.read_text())
     block = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "DeepseekV41Block")

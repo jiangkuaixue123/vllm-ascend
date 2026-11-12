@@ -37,6 +37,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.model_executor.models.interfaces import SupportsMultiModal
 from vllm.model_executor.models.utils import _merge_multimodal_embeddings
 
+from vllm_ascend.models.common.ops.hc_attention_overlap import try_start_hc_attention
 from vllm_ascend.models.common.ops.hc_post import hc_post_fused
 from vllm_ascend.models.common.ops.hc_pre import hc_pre_delayed
 from vllm_ascend.models.common.ops.sequence_parallel import sp_all_gather, sp_shard
@@ -212,7 +213,12 @@ class DeepseekV41Block(nn.Module):
             # collective while avoiding empty NPU GEMMs and TP reductions.
             self.ffn(hidden_states.new_empty((0, self.config.hidden_size)))
             return hidden_states, pre_mix
-        attn_input, attn_pre, post, comb = self.pre_and_mixes(hidden_states, pre_mix, "attn", runtime)
+        pending = try_start_hc_attention(self, hidden_states, pre_mix, runtime)
+        if pending is None:
+            attn_input, attn_pre, post, comb = self.pre_and_mixes(hidden_states, pre_mix, "attn", runtime)
+        else:
+            attn_input, native_outputs, _ = pending
+            _, attn_pre, post, comb = native_outputs
         attn_input = self.attn_norm(attn_input)
         fuse_mask = (
             getattr(runtime, "decode", None) is not None
@@ -224,6 +230,8 @@ class DeepseekV41Block(nn.Module):
         else:
             attended = self.attn(attn_input, runtime)
         post_mask = decode_mask if fuse_mask else None
+        if pending is not None:
+            torch.npu.current_stream(hidden_states.device).wait_event(pending[2])
         hidden_states = self.post_residual(attended, hidden_states, post, comb, runtime, post_mask)
         ffn_input, ffn_pre, post, comb = self.pre_and_mixes(hidden_states, attn_pre, "ffn", runtime)
         ffn_input = self.ffn_norm(ffn_input)
