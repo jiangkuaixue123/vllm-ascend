@@ -1,0 +1,42 @@
+tests/e2e/nightly/single_node/ops/multicard_ops_a3/test_hc_attention_overlap.py
+  s_6eab87361519a8::t_d3ce680b3f64d9 98,127
+  s_6eab87361519a8::t_42b9cad34a3655 43-45,78-85,139-155,177-184,190-193
+  s_6eab87361519a8::t_620ab035d11da5 54
+  s_6eab87361519a8::t_776f2b2ece0150 1-42,46-53,55-77,86-97,99-126,128-138,156-176,185-189,194-199
+tests/ut/models/common/ops/test_hc_attention_overlap.py
+  s_6eab87361519a8::t_f9aa6e850cddf3 1-32,43-50,56-58,62-75,79-89,92-113,118-121,140-176
+  s_6eab87361519a8::t_3efb1b962b2cce 33-42,51-55,59-61,76-78,90-91,114-117,122-139
+tests/ut/models/common/ops/test_hc_post.py
+  s_6eab87361519a8::t_73160b41a870eb 241
+vllm_ascend/models/common/ops/hc_attention_overlap.py
+  s_6eab87361519a8::t_edc12eeecfc96c 31-32
+  s_6eab87361519a8::t_3efb1b962b2cce 74-81
+  s_6eab87361519a8::t_59ab5e66c6ca55 1-30,33-73,82-91
+tests/e2e/nightly/one_card/test_hc_attention_overlap.py
+  s_6eab87361519a8::t_3efb1b962b2cce 41-43,133-140
+  s_6eab87361519a8::t_73160b41a870eb 1-16,18-30,32-40,44-90,93-132
+  s_6eab87361519a8::t_831b5457be16b4 17,31
+  s_6eab87361519a8::t_bdbcce0572bd31 91-92
+tests/ut/models/common/ops/test_hc_pre_delayed.py
+  s_6eab87361519a8::t_73160b41a870eb 234
+vllm_ascend/ops/triton/deepseek_v41_hc_input.py
+  s_6eab87361519a8::t_59ab5e66c6ca55 1-45
+vllm_ascend/models/deepseek_v41/model.py
+  s_6eab87361519a8::t_59ab5e66c6ca55 40,216-221,233-234
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "ebbb012594b3dd6e8ade68c82a0a48ff0f129ee0",
+  "prompts": {},
+  "sessions": {
+    "s_6eab87361519a8": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1ac13-1fd0-7670-ae84-d58acaf2730c",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "jiangkuaixue123 <jiangxiaozhou111@163.com>"
+    }
+  }
+}
