@@ -293,10 +293,12 @@ class DeepseekV41MoEExpert(nn.Module):
         shared: bool = False,
         replicated_shared: bool = False,
         sequence_parallel: bool = False,
+        reuse_input_quant: bool = False,
     ):
         super().__init__()
         hidden, intermediate = config.hidden_size, config.moe_intermediate_size
         self.swiglu_limit = config.swiglu_limit
+        self._reuse_input_quant = reuse_input_quant and shared and replicated_shared and sequence_parallel
         sharded = shared and not replicated_shared
         self.reduce_shared = sharded and not sequence_parallel
         up_class = ColumnParallelLinear if sharded else ReplicatedLinear
@@ -309,7 +311,15 @@ class DeepseekV41MoEExpert(nn.Module):
         self.w3 = up_class(hidden, intermediate, prefix=f"{prefix}.w3", **common, **up_options)
 
     def forward(self, hidden_states: torch.Tensor, routing_weights: torch.Tensor | None = None) -> torch.Tensor:
-        activation = clipped_swiglu(self.w1(hidden_states), self.w3(hidden_states), self.swiglu_limit)
+        projections = None
+        if self._reuse_input_quant:
+            # Import NPU-specific methods only in the serving worker path.
+            from vllm_ascend.models.common.ops.shared_input_quant import shared_input_projections
+
+            projections = shared_input_projections(self.w1, self.w3, hidden_states)
+        if projections is None:
+            projections = self.w1(hidden_states), self.w3(hidden_states)
+        activation = clipped_swiglu(*projections, self.swiglu_limit)
         if routing_weights is not None:
             activation = activation * routing_weights
         output = self.w2(activation.to(hidden_states.dtype))
@@ -388,6 +398,9 @@ class DeepseekV41MoE(nn.Module):
             shared=True,
             replicated_shared=communication.replicated_shared,
             sequence_parallel=communication.sequence_parallel,
+            reuse_input_quant=(
+                prefix.startswith("layers.") and getattr(getattr(communication, "tp_group", None), "world_size", 0) == 4
+            ),
         )
         logger.info_once(
             "V4.1 MoE layout: sequence_parallel=%s replicated_shared=%s shared_w2_shape=%s",
