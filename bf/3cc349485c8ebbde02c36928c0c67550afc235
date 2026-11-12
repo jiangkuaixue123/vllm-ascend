@@ -1,0 +1,40 @@
+tests/ut/models/deepseek_v41/test_moe.py
+  s_6eab87361519a8::t_fdd368593ba7ea 549,551,563-564
+  s_6eab87361519a8::t_172970c93fab4f 276-277,300-302
+vllm_ascend/ops/triton/hc_post.py
+  s_6eab87361519a8::t_f6b773979f6f74 23-24,50,52-54,59,68-69
+  s_6eab87361519a8::t_51866df17e468f 51
+vllm_ascend/models/deepseek_v41/model.py
+  s_6eab87361519a8::t_f6b773979f6f74 70,193,195,197-200,205-206,216-227,231-235,240
+tests/e2e/nightly/one_card/test_hc_post_fused.py
+  s_6eab87361519a8::t_172970c93fab4f 116-164
+tests/ut/models/common/ops/test_hc_post.py
+  s_6eab87361519a8::t_172970c93fab4f 47,129-151,156-199
+  s_6eab87361519a8::t_366e3b2abebb6f 152-155
+  s_6eab87361519a8::t_45b3c526f70601 202-250
+  s_6eab87361519a8::t_3df75ad7356865 200-201
+tests/ut/models/deepseek_v41/test_attention.py
+  s_6eab87361519a8::t_366e3b2abebb6f 306-307,318-320,325-326,334-336
+vllm_ascend/models/deepseek_v41/attention.py
+  s_6eab87361519a8::t_f6b773979f6f74 1332,1408-1409,1412,1414
+vllm_ascend/models/deepseek_v41/moe.py
+  s_6eab87361519a8::t_f6b773979f6f74 460-462,476-477
+vllm_ascend/models/common/ops/hc_post.py
+  s_6eab87361519a8::t_f6b773979f6f74 16,38-46,51-52,58
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "bf3cc349485c8ebbde02c36928c0c67550afc235",
+  "prompts": {},
+  "sessions": {
+    "s_6eab87361519a8": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1ac13-1fd0-7670-ae84-d58acaf2730c",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "jiangkuaixue123 <jiangxiaozhou111@163.com>"
+    }
+  }
+}
