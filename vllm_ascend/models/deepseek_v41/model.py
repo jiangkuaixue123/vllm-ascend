@@ -250,6 +250,15 @@ def read_parameter_slice(reader, key, parameter, module, tp_rank, tp_size):
         indices = module.shard_indices
         slices[0] = slice(indices.org_vocab_start_index, indices.org_vocab_end_index)
         value = source[tuple(slices)]
+        if (
+            isinstance(module, ParallelLMHead)
+            and parameter.device.type == "npu"
+            and value.dtype == torch.float32
+            and parameter.dtype == torch.bfloat16
+        ):
+            # Match the logits processor's device conversion, including NaNs.
+            # A combined device/dtype copy may instead round on the CPU.
+            value = value.to(parameter.device).to(parameter.dtype)
         parameter.zero_()
         parameter[: value.shape[0]].copy_(value)
         return

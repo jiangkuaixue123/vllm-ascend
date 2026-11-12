@@ -50,6 +50,7 @@ _STAGING_WINDOW = 128
 _STAGING_HEAD_DIM = 512
 _STAGING_MAX_REQUESTS = 8
 _WITNESS_BATCH_SIZE = 4
+_DRAFT_HEAD_STORAGE_TP = 4
 
 
 class DSparkRequestSpans(Sequence):
@@ -505,12 +506,20 @@ class DeepseekV41DSparkForCausalLM(nn.Module):
         self.mtp[0].main_norm = DeepseekV41RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.mtp[0].embed = VocabParallelEmbedding(config.vocab_size, config.hidden_size, prefix="mtp.0.embed")
         self.mtp[-1].norm = DeepseekV41RMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.logits_processor = LogitsProcessor(config.vocab_size)
         self.mtp[-1].head = ParallelLMHead(
-            config.vocab_size, config.hidden_size, params_dtype=torch.float32, prefix=f"mtp.{count - 1}.head"
+            config.vocab_size,
+            config.hidden_size,
+            params_dtype=(
+                torch.bfloat16
+                if get_tensor_model_parallel_world_size() == _DRAFT_HEAD_STORAGE_TP
+                and getattr(self.logits_processor, "head_dtype", None) == torch.bfloat16
+                else torch.float32
+            ),
+            prefix=f"mtp.{count - 1}.head",
         )
         self.mtp[-1].markov_head = DSparkMarkov(config)
         self.mtp[-1].confidence_head = DSparkConfidence(config)
-        self.logits_processor = LogitsProcessor(config.vocab_size)
         self.model_path = Path(vllm_config.model_config.model)
 
     def embed_input_ids(self, input_ids):
@@ -548,6 +557,14 @@ class DeepseekV41DSparkForCausalLM(nn.Module):
         return hc_pre(hidden, pre)
 
     def compute_logits(self, hidden_states, spec_step_idx=0):
+        if hidden_states.device.type == "npu" and self.mtp[-1].head.weight.dtype == torch.bfloat16:
+            logger.info_once(
+                "DSPARK_HEAD_STORAGE_RUNTIME pid=%d parameter=%s projection=%s",
+                os.getpid(),
+                self.mtp[-1].head.weight.dtype,
+                getattr(self.logits_processor, "head_dtype", None),
+                scope="process",
+            )
         return self.logits_processor(self.mtp[-1].head, self.mtp[-1].norm(hidden_states).float())
 
     def compute_draft_logits(self, hidden_states):
