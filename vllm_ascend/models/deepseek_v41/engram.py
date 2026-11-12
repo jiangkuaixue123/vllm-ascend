@@ -27,7 +27,6 @@ SOFTWARE.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import math
 import mmap
@@ -182,7 +181,7 @@ class EngramRequestState:
 
     position: int = 0
     tail: tuple[int, ...] = ()
-    vocabulary_signature: str | None = None
+    vocabulary_signature: tuple[int, ...] | None = None
 
     def fork(self) -> EngramRequestState:
         return replace(self)
@@ -232,8 +231,7 @@ class EngramHasher:
                     offsets.append(offset)
                     offset += prime
             self.offsets.append(tuple(offsets))
-        identity = np.asarray(self.token_map, dtype="<i8").tobytes()
-        self.signature = hashlib.sha256(identity).hexdigest()
+        self.signature = self.token_map
 
     @classmethod
     def from_tokenizer(

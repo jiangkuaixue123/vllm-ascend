@@ -3961,10 +3961,13 @@ class NPUModelRunner(GPUModelRunner):
             dummy_compute_logits(hidden_states)
 
             if self.drafter and not profile_cpp:
+                # The independent V4.1 draft synchronizes its own query count;
+                # target graph capacity must not inflate an idle DP's batch.
+                v41_draft = isinstance(self.drafter, AscendDeepseekV41DSparkProposer)
                 self.drafter.dummy_run(
-                    num_tokens=num_tokens_padded,
+                    num_tokens=num_tokens_unpadded if v41_draft else num_tokens_padded,
                     with_prefill=with_prefill,
-                    num_reqs=num_reqs_padded,
+                    num_reqs=num_reqs if v41_draft else num_reqs_padded,
                     num_tokens_across_dp=num_tokens_across_dp,
                     aclgraph_runtime_mode=cudagraph_runtime_mode,
                     batch_descriptor=batch_desc,

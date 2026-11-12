@@ -171,6 +171,17 @@ def test_invalid_chunk_does_not_advance_request_state():
     assert empty.shape == (0, 1, 4) and state.position == 0
 
 
+def test_request_vocabulary_identity_preserves_equal_maps_and_rejects_different_maps():
+    left, right = make_hasher(), make_hasher()
+    state = left.new_state()
+    expected = left.hash_tokens([2, 3], state.fork(), start_position=0)
+    assert torch.equal(right.hash_tokens([2, 3], state.fork(), start_position=0), expected)
+    different = EngramHasher(left.layout, (0, 2, 1, 2, 3), compressed_vocab_size=4, pad_token_id=0)
+    with pytest.raises(ValueError, match="cursor/history"):
+        different.hash_tokens([2], state, start_position=0)
+    assert state.position == 0 and state.tail == ()
+
+
 def test_compressed_vocab_mismatch_fails_before_hashing():
     layout = EngramLayout.from_config(layout_config())
     with pytest.raises(ValueError, match="Compressed token map"):

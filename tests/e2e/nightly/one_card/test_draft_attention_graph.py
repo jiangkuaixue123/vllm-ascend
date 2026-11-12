@@ -160,6 +160,22 @@ def test_complete_native_outputs_refresh_history_cache_inputs_and_parameters(mod
         same(model.cache.field(0, 0, DIM), saved[3])
 
 
+@torch.inference_mode()
+def test_c1_attention_graph_survives_64_changed_history_replays(model, monkeypatch):
+    monkeypatch.setattr(dspark, "is_draft_dummy", lambda: False)
+    model._attention_graph = DraftAttentionGraph()
+    address = None
+    for step in range(64):
+        hidden, positions, _ = inputs(model, 8192 + step, step % 3, batch=1)
+        expected = parent(model, hidden, positions)
+        actual = model(hidden, positions)
+        torch.npu.synchronize()
+        same(actual, expected)
+        assert 1 in model._attention_graph.entries
+        assert address is None or actual.data_ptr() == address
+        address = actual.data_ptr()
+
+
 @pytest.mark.parametrize("start,dummy", [(32, False), (8192, True)])
 @torch.inference_mode()
 def test_real_dispatch_falls_back_for_short_history_and_dummy(model, monkeypatch, start, dummy):
