@@ -463,7 +463,10 @@ class IndexedMmapStore:
             raise ValueError("Row outside indexed tensor")
         width = item.shape[1] * STORAGE_TYPES[item.dtype][0]
         mapped = self._files[item.shard][1]
-        return b"".join(mapped[item.offset + row * width : item.offset + (row + 1) * width] for row in rows)
+        if len(rows) == 0 or width == 0:
+            return b""
+        view = np.ndarray((item.shape[0], width), dtype=np.uint8, buffer=mapped, offset=item.offset)
+        return view[np.asarray(rows, dtype=np.intp)].tobytes()
 
     def read_tensor(self, name: str, *, max_bytes: int, device: torch.device | str = "cpu") -> torch.Tensor:
         item = self.describe(name)
@@ -577,12 +580,16 @@ class MmapEngramEmbedding(nn.Module):
             positions, row_ids = zip(*chunk)
             weight_bytes = self.store.read_rows(self.prefix + ".weight", row_ids)
             scale_bytes = self.store.read_rows(self.prefix + ".scale", row_ids)
-            weights = torch.frombuffer(bytearray(weight_bytes), dtype=torch.int8)
-            scales = torch.frombuffer(bytearray(scale_bytes), dtype=torch.uint8)
-            values = decode_int8_e8m0_rows(
-                weights.reshape(len(chunk), self.embedding_dim).to(device),
-                scales.reshape(len(chunk), self.embedding_dim // E8M0_BLOCK_SIZE).to(device),
+            weights = torch.frombuffer(bytearray(weight_bytes), dtype=torch.int8).reshape(
+                len(chunk), self.embedding_dim
             )
+            scales = torch.frombuffer(bytearray(scale_bytes), dtype=torch.uint8).reshape(
+                len(chunk), self.embedding_dim // E8M0_BLOCK_SIZE
+            )
+            if 255 in scale_bytes:
+                # CPU and NPU BF16 casts use different NaN payloads.
+                weights, scales = weights.to(device), scales.to(device)
+            values = decode_int8_e8m0_rows(weights, scales).to(device)
             destination = torch.tensor(positions, dtype=torch.int64, device=device)
             output.index_copy_(0, destination, values)
         return output.reshape(*indices.shape, self.embedding_dim)
