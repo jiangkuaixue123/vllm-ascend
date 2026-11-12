@@ -1,0 +1,49 @@
+tests/e2e/nightly/one_card/test_dspark_fp8.py
+  s_6eab87361519a8::t_3b1d1b349b6658 7-20
+  s_6eab87361519a8::t_9273add05a5a65 50-88,91,93,109-110,112,124,146-148,152-153,158,166,168,197
+  s_6eab87361519a8::t_797e6f0f04b2bb 4-6
+  s_6eab87361519a8::t_a40fc96cd2155f 21-23,47-49
+  s_6eab87361519a8::t_38af1cec99bf58 89-90
+  s_6eab87361519a8::t_750a5b48101d7d 92
+  s_6eab87361519a8::t_979a85cc7f067d 94-96,106-108
+  s_6eab87361519a8::t_5aad7fcd5593f2 111
+  s_6eab87361519a8::t_a853f50fcaae9f 113-115,121-123
+  s_6eab87361519a8::t_16129a6db31abc 125-127,143-145
+  s_6eab87361519a8::t_879b90cb9e105d 149-151
+  s_6eab87361519a8::t_7f1c219fc57184 154-157
+  s_6eab87361519a8::t_15d92c6e377537 159-161,163-165
+  s_6eab87361519a8::t_5298d62d9b889c 167
+  s_6eab87361519a8::t_20f35512392599 169-171,194-196
+  s_6eab87361519a8::t_7b86e89d50ff72 198-200
+tests/ut/models/common/ops/test_dspark_fp8.py
+  s_6eab87361519a8::t_9273add05a5a65 77-80
+  s_6eab87361519a8::t_0bf21c6def4321 74-76
+  s_6eab87361519a8::t_ec11b9f0cda43b 81-83
+vllm_ascend/models/common/ops/dspark_fp8.py
+  s_6eab87361519a8::t_9273add05a5a65 11-12,52
+  s_6eab87361519a8::t_3b1d1b349b6658 38
+  s_6eab87361519a8::t_bf8081a2371ab3 8-10
+  s_6eab87361519a8::t_01c48f915db1d6 13-15,35-37
+  s_6eab87361519a8::t_2cc63e70d138ed 39-41,49-51
+  s_6eab87361519a8::t_86f551b970a625 53-55
+vllm_ascend/models/deepseek_v41/attention_ops.py
+  s_6eab87361519a8::t_b8069359cce1f3 195-200
+vllm_ascend/ops/triton/deepseek_v41_fp8_qdq.py
+  s_6eab87361519a8::t_c81e6643a867d4 65-89
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "23c2d94fd2714ca28952be018f1654fc59c53377",
+  "prompts": {},
+  "sessions": {
+    "s_6eab87361519a8": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1ac13-1fd0-7670-ae84-d58acaf2730c",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "jiangkuaixue123 <jiangxiaozhou111@163.com>"
+    }
+  }
+}
