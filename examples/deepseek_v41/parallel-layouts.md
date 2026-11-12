@@ -29,6 +29,32 @@ retains its original six/twelve-row execution.
 
 ## Optimization coverage
 
+### Optional six-row gather policy
+
+For single-node A3 DP4TP4, `"dsv41_small_gather_aiv": true` in
+`--additional-config` creates one auxiliary TP AIV communicator, owned and
+released by the existing group coordinator. The default is false; the option
+requires a boolean and rejects other model, hardware or parallel layouts.
+DBO, EPLB and pipeline/context parallelism are outside its scope.
+
+Only target full-graph decode all-gather of BF16 hidden states shaped
+`[6,5120]` uses that communicator. Twelve-row inputs, draft, prefill, other
+shapes/dtypes and all other collectives use their original groups. Capture
+sizes remain `[24,48]`. The main TP/EP/MC2/DP/world options do not change.
+The startup/run marker is `DSV41_SMALL_GATHER_AIV_RUNTIME`.
+
+The whole-TP AIV experiment is not retained: twelve-row BF16 all-gather
+replay returned nonzero values after zeroing its input. The six-row path and
+the original twelve-row path must both pass changing-input replay and full
+model consumer checks before measuring this narrower candidate.
+
+See [TorchNPU communication-domain settings](https://www.hiascend.com/document/detail/en/Pytorch/2600/ptmoddevg/Frameworkfeatures/docs/en/framework_feature_guide_pytorch/setting_HCCL_communicator_parameter.md)
+and [HCCL AIV constraints](https://www.hiascend.com/doc_center/source/en/CANNCommunityEdition/900/maintenref/envvar/envref_07_0096.html).
+Only one AIV communicator is used per worker; no global communication
+environment variable is set.
+
+### Retained model paths
+
 - HC delayed mixing, HC post, RMS and Sinkhorn: local three/six/twelve-row kernels.
 - Target query/rotary overlap, paged index scoring and slot arena: TP4/TP8
   dispatch with actual TP size; original arithmetic and collective order.

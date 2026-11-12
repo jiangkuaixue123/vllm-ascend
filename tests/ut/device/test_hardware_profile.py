@@ -42,7 +42,8 @@ _STANDARD_CAPABILITIES = frozenset(
 
 _EXPECTED_CAPABILITIES = {
     AscendDeviceType.A2: _STANDARD_CAPABILITIES,
-    AscendDeviceType.A3: _STANDARD_CAPABILITIES | {HardwareCapability.MC2_FULLMESH_V2_COMM},
+    AscendDeviceType.A3: _STANDARD_CAPABILITIES
+    | {HardwareCapability.MC2_FULLMESH_V2_COMM, HardwareCapability.HCCL_AIV_TP_COMMUNICATION},
     AscendDeviceType._310P: frozenset(
         {
             HardwareCapability.COMPATIBILITY_OP_IMPLEMENTATIONS,

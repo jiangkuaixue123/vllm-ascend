@@ -13,6 +13,7 @@ import pytest
 import test_target_query_overlap as native
 import torch
 import torch.distributed as dist
+from test_small_gather_aiv import small_gather_coordinator
 from torch import nn
 from vllm.config import CUDAGraphMode
 from vllm.model_executor.layers.linear import ReplicatedLinear
@@ -145,7 +146,7 @@ def exact(actual, expected):
 
 
 @torch.inference_mode()
-def run_case(layers, rows, *, bind_quantizer=None):
+def run_case(layers, rows, *, bind_quantizer=None, optimization=None):
     """Compare graph operands/state first, then time whole native attention chains."""
     torch.manual_seed(827 + dist.get_rank())
     states = torch.randn(rows, native.HIDDEN, device="npu", dtype=torch.bfloat16)
@@ -270,7 +271,7 @@ def run_case(layers, rows, *, bind_quantizer=None):
                     "candidate": medians[1],
                     "metrics": ["host_ms", "ready_ms"],
                     "scope": "full native compressed attention, index/candidate chain, cache, FIA and WO",
-                    "optimization": "fp4_decode" if bind_quantizer is not None else "index_overlap",
+                    "optimization": optimization or ("fp4_decode" if bind_quantizer is not None else "index_overlap"),
                     "limitation": "full static 153600 capacity; controlled live history up to384 tokens",
                 }
             ),
@@ -282,16 +283,33 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--fp4-decode", action="store_true")
+    parser.add_argument("--small-gather-aiv", action="store_true")
     args = parser.parse_args()
     torch.set_num_threads(1)
     torch.npu.set_device(int(os.environ["LOCAL_RANK"]))
     torch.npu.matmul.allow_hf32 = False
     torch.npu.config.allow_internal_format = True
     dist.init_process_group("hccl")
+    coordinator = None
     try:
         assert dist.get_world_size() == TP
         assert enable_custom_op()
+        coordinator = small_gather_coordinator() if args.small_gather_aiv else None
         with pytest.MonkeyPatch.context() as patch, torch.inference_mode():
+            small_gather_calls = []
+            if coordinator is not None:
+                patch.setattr(
+                    native.TPGroup, "small_gather_device_group", coordinator.small_gather_device_group, raising=False
+                )
+                patch.setattr(native.TPGroup, "device_group", coordinator.device_group)
+                original_all_gather = dist.all_gather_into_tensor
+
+                def observed_all_gather(*args, **kwargs):
+                    if kwargs.get("group") is coordinator.small_gather_device_group:
+                        small_gather_calls.append(tuple(args[1].shape))
+                    return original_all_gather(*args, **kwargs)
+
+                patch.setattr(dist, "all_gather_into_tensor", observed_all_gather)
             patch.setattr("vllm_ascend.utils.get_ascend_config", lambda: SimpleNamespace(weight_nz_mode=1))
             patch.setattr("vllm.model_executor.parameter.get_tensor_model_parallel_rank", dist.get_rank)
             patch.setattr("vllm.model_executor.parameter.get_tensor_model_parallel_world_size", lambda: TP)
@@ -315,13 +333,21 @@ if __name__ == "__main__":
             used_formats = set()
 
             def bind_quantizer(index):
+                if args.small_gather_aiv:
+                    patch.setattr(
+                        native.TPGroup,
+                        "small_gather_device_group",
+                        coordinator.small_gather_device_group if index else None,
+                    )
+
                 def quantize(*args, **kwargs):
-                    kwargs["decode_fusion"] = bool(index) and kwargs.get("decode_fusion", False)
+                    if coordinator is None:
+                        kwargs["decode_fusion"] = bool(index) and kwargs.get("decode_fusion", False)
                     return original_quantizer(*args, **kwargs)
 
                 patch.setattr(attention, "fp4_quant_dequant", quantize)
 
-            if args.fp4_decode:
+            if args.fp4_decode or args.small_gather_aiv:
                 for scale, name in (("e8m0", "_try_fp4_e8m0_aiv"), ("e4m3", "_try_fp4_e4m3_aiv")):
                     original_dispatch = getattr(attention_ops, name)
 
@@ -335,8 +361,19 @@ if __name__ == "__main__":
             for models in chains:
                 for rows in (6, 12):
                     used_formats.clear()
-                    run_case(models, rows, bind_quantizer=bind_quantizer if args.fp4_decode else None)
-                    if args.fp4_decode:
+                    small_gather_calls.clear()
+                    run_case(
+                        models,
+                        rows,
+                        bind_quantizer=bind_quantizer if args.fp4_decode or args.small_gather_aiv else None,
+                        optimization="small_gather_aiv" if args.small_gather_aiv else None,
+                    )
+                    if args.small_gather_aiv:
+                        assert bool(small_gather_calls) is (rows == 6)
+                        assert all(shape == (6, native.HIDDEN) for shape in small_gather_calls)
+                    if args.fp4_decode or args.small_gather_aiv:
                         assert used_formats == {"e8m0", "e4m3"}
     finally:
+        if coordinator is not None:
+            coordinator.destroy()
         dist.destroy_process_group()

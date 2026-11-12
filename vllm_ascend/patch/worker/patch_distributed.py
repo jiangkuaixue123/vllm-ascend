@@ -26,7 +26,7 @@ from vllm.distributed.parallel_state import GroupCoordinator, _get_unique_name, 
 
 from vllm_ascend.distributed.device_communicators.npu_communicator import NPUCommunicator
 from vllm_ascend.patch.worker._hccl_pg_registry import HcclPgKey, HcclPgRegistry, make_hccl_pg_key
-from vllm_ascend.utils import create_hccl_pg_options
+from vllm_ascend.utils import create_hccl_pg_options, create_small_gather_hccl_options
 
 _HCCL_PG_REGISTRY = HcclPgRegistry()
 logger = logging.getLogger(__name__)
@@ -125,6 +125,7 @@ class GroupCoordinatorPatch(GroupCoordinator):
         self.mq_broadcaster = None
         self.cpu_group = None
         self.device_group = None
+        self.small_gather_device_group = None
         self.device = None
         self.use_custom_op_call = True
         self.use_cpu_custom_send_recv = False
@@ -169,6 +170,23 @@ class GroupCoordinatorPatch(GroupCoordinator):
             elif self.backend == "hccl" and self.rank in ranks:
                 self._unshared_hccl_groups.append(device_group)
 
+            if (
+                self.backend == "hccl"
+                and (small_options := create_small_gather_hccl_options(self.group_name)) is not None
+            ):
+                small_group, small_key = _acquire_hccl_group(
+                    ranks=ranks,
+                    backend=self.backend,
+                    hccl_pg_options=small_options,
+                    reuse_domain="tp_small_gather",
+                )
+                if small_key is not None:
+                    self._acquired_hccl_keys.append(small_key)
+                elif self.rank in ranks:
+                    self._unshared_hccl_groups.append(small_group)
+                if self.rank in ranks:
+                    self.small_gather_device_group = small_group
+
             cpu_group = torch.distributed.new_group(ranks, backend="gloo") if create_cpu_group else None
             if self.rank in ranks:
                 if create_cpu_group:
@@ -192,6 +210,7 @@ class GroupCoordinatorPatch(GroupCoordinator):
             )
 
     def _release_hccl_resources(self) -> bool:
+        self.small_gather_device_group = None
         destroyed = False
         device_communicator = getattr(self, "device_communicator", None)
         if device_communicator is not None:

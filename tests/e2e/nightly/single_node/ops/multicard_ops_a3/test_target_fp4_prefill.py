@@ -14,6 +14,7 @@ import test_target_index_overlap as index_native
 import test_target_query_overlap as native
 import torch
 import torch.distributed as dist
+from test_small_gather_aiv import small_gather_coordinator
 from vllm.config import CUDAGraphMode
 
 from vllm_ascend.models.deepseek_v41 import attention, attention_ops
@@ -145,15 +146,23 @@ def run_case(layers, ends):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument("--small-gather-aiv", action="store_true")
     args = parser.parse_args()
     torch.set_num_threads(1)
     torch.npu.set_device(int(os.environ["LOCAL_RANK"]))
     torch.npu.matmul.allow_hf32 = False
     torch.npu.config.allow_internal_format = True
     dist.init_process_group("hccl")
+    coordinator = None
     try:
         assert dist.get_world_size() == TP and enable_custom_op()
+        coordinator = small_gather_coordinator() if args.small_gather_aiv else None
         with pytest.MonkeyPatch.context() as patch, torch.inference_mode():
+            if coordinator is not None:
+                patch.setattr(
+                    native.TPGroup, "small_gather_device_group", coordinator.small_gather_device_group, raising=False
+                )
+                patch.setattr(native.TPGroup, "device_group", coordinator.device_group)
             patch.setattr("vllm_ascend.utils.get_ascend_config", lambda: SimpleNamespace(weight_nz_mode=1))
             patch.setattr("vllm.model_executor.parameter.get_tensor_model_parallel_rank", dist.get_rank)
             patch.setattr("vllm.model_executor.parameter.get_tensor_model_parallel_world_size", lambda: TP)
@@ -169,4 +178,6 @@ if __name__ == "__main__":
                 for ends in ((127, 260, 517), (MAX_ROWS,)):
                     run_case(layers, ends)
     finally:
+        if coordinator is not None:
+            coordinator.destroy()
         dist.destroy_process_group()

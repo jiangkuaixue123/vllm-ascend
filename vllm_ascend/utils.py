@@ -73,6 +73,7 @@ _ASCEND_CUSTOMOP_IS_REIGISTERED = False
 _DEFAULT_BUFFER_SIZE = 200
 _MIN_DP_BUFFER_SIZE = 50
 _DYNAMIC_EPLB_BUFFER_SIZE = 100
+_HCCL_PG_EXPANSION_AIV = 3
 _IS_MOE_MODEL = None
 _IS_DRAFTER_MOE_MODEL = None
 _IS_VL_MODEL = None
@@ -972,6 +973,41 @@ def create_hccl_pg_options(group_name: str):
     hccl_config = get_hccl_config_for_pg_options(group_name) or {}
     hccl_config["group_name"] = group_name
     options.hccl_config = hccl_config
+    return options
+
+
+def create_small_gather_hccl_options(group_name: str):
+    """An opt-in, separately owned TP communicator for six-row target gathers."""
+    if group_name != "tp":
+        return None
+    # Process groups are initialized inside the worker's vLLM config context.
+    from vllm.config import get_current_vllm_config_or_none
+
+    config = get_current_vllm_config_or_none()
+    if config is None:
+        return None
+    enabled = (config.additional_config or {}).get("dsv41_small_gather_aiv", False)
+    if not isinstance(enabled, bool):
+        raise ValueError("dsv41_small_gather_aiv must be a boolean")
+    if not enabled:
+        return None
+    parallel = config.parallel_config
+    if not (
+        getattr(config.model_config.hf_config, "model_type", None) == "deepseek_v41"
+        and parallel.tensor_parallel_size == 4
+        and parallel.data_parallel_size == 4
+        and parallel.data_parallel_size_local == 4
+        and parallel.pipeline_parallel_size == 1
+        and parallel.enable_expert_parallel
+        and not parallel.enable_dbo
+        and not parallel.enable_eplb
+        and parallel.prefill_context_parallel_size == 1
+        and parallel.decode_context_parallel_size == 1
+        and get_current_hardware_profile().supports(HardwareCapability.HCCL_AIV_TP_COMMUNICATION)
+    ):
+        raise ValueError("dsv41_small_gather_aiv requires single-node DeepSeek V4.1 DP4TP4 on A3")
+    options = create_hccl_pg_options("tp_small_gather")
+    options.hccl_config = {**options.hccl_config, "hccl_op_expansion_mode": _HCCL_PG_EXPANSION_AIV}
     return options
 
 

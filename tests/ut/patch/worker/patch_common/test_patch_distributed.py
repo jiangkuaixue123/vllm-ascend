@@ -185,6 +185,7 @@ def _load_patch_distributed_module():
 
     npu_communicator_module.NPUCommunicator = FakeNPUCommunicator
     utils_module.create_hccl_pg_options = MagicMock(return_value=shared_hccl_options)
+    utils_module.create_small_gather_hccl_options = MagicMock(return_value=None)
 
     vllm_ascend_module.patch = vllm_ascend_patch
     vllm_ascend_patch.worker = vllm_ascend_patch_worker
@@ -282,6 +283,28 @@ def _calls_with_backend(module_env, backend: str) -> list[dict[str, object]]:
 
 def test_group_coordinator_is_patched(module_env):
     assert module_env.parallel_state_module.GroupCoordinator is module_env.module.GroupCoordinatorPatch
+
+
+def test_small_gather_group_is_owned_separately_and_reused(module_env):
+    options = RealisticFakeHcclOptions(hccl_config={"hccl_buffer_size": 200, "hccl_op_expansion_mode": 3})
+    module_env.utils_module.create_small_gather_hccl_options.side_effect = (
+        lambda name: options if name == "tp" else None
+    )
+    first = _make_group(module_env, group_name="tp")
+    second = _make_group(module_env, group_name="tp")
+    world = _make_group(module_env, group_name="world")
+    assert first.device_group is world.device_group
+    assert first.small_gather_device_group is second.small_gather_device_group
+    assert first.small_gather_device_group is not first.device_group
+    assert world.small_gather_device_group is None
+    assert len(_calls_with_backend(module_env, "hccl")) == 2
+    small_group = first.small_gather_device_group
+    first.destroy()
+    assert first.small_gather_device_group is None
+    assert call(small_group) not in module_env.destroy_process_group.call_args_list
+    second.destroy()
+    assert module_env.destroy_process_group.call_args_list.count(call(small_group)) == 1
+    world.destroy()
 
 
 def test_group_coordinator_preserves_backend_for_inherited_helpers(module_env):

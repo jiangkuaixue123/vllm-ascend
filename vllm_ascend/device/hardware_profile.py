@@ -31,6 +31,7 @@ class HardwareCapability(Enum):
     DYNAMIC_MX_QUANT_SCALE_ALG_ONE = auto()
     FP8_ATTENTION = auto()
     GDN_COMPATIBILITY = auto()
+    HCCL_AIV_TP_COMMUNICATION = auto()
     IRQ_CPU_RESERVATION = auto()
     LOCAL_KV_COMM_RESOURCE = auto()
     LORA_CUSTOM_OPS = auto()
@@ -131,7 +132,10 @@ _STANDARD_CAPABILITIES = frozenset(
         HardwareCapability.TRITON_BATCH_MEMCPY,
     }
 )
-_A3_CAPABILITIES = _STANDARD_CAPABILITIES | {HardwareCapability.MC2_FULLMESH_V2_COMM}
+_A3_CAPABILITIES = _STANDARD_CAPABILITIES | {
+    HardwareCapability.MC2_FULLMESH_V2_COMM,
+    HardwareCapability.HCCL_AIV_TP_COMMUNICATION,
+}
 _DEFAULT_WORKER_CLS = "vllm_ascend.worker.worker.NPUWorker"
 _HARDWARE_PROFILES: Mapping[AscendDeviceType, HardwareProfile] = MappingProxyType(
     {

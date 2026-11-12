@@ -69,13 +69,13 @@ class TPGroup:
     def all_gather(self, value, dim):
         assert dim == 0
         result = value.new_empty(value.shape[0] * dist.get_world_size(), *value.shape[1:])
-        dist.all_gather_into_tensor(result, value.contiguous())
+        dist.all_gather_into_tensor(result, value.contiguous(), group=self.device_group)
         return result
 
     def reduce_scatter(self, value, dim):
         assert dim == 0 and value.dtype == torch.float32
         result = value.new_empty(value.shape[0] // dist.get_world_size(), value.shape[1])
-        dist.reduce_scatter_tensor(result, value.contiguous())
+        dist.reduce_scatter_tensor(result, value.contiguous(), group=self.device_group)
         return result
 
 

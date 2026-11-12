@@ -100,6 +100,10 @@ _QUERY_OVERLAP_TP_SIZES = (4, 8)
 _QUERY_OVERLAP_QUERY_WIDTH = 6
 
 
+_SMALL_GATHER_TP_SIZE = 4
+_SMALL_GATHER_INPUT_SHAPE = (6, 5120)
+
+
 def _quantize_projection_input(output):
     """Consume the attention output; E4M3 quantization groups only its last dimension."""
     if output.shape[0] <= _OUTPUT_QDQ_TILE_ROWS:
@@ -1137,7 +1141,24 @@ class DeepseekV41Attention(nn.Module):
         if self.sequence_group is None:
             return hidden_states, 0
         group = self.sequence_group
-        gathered = group.all_gather(hidden_states.contiguous(), dim=0)
+        small_group = getattr(group, "small_gather_device_group", None)
+        use_small_gather = (
+            small_group is not None
+            and phase == "uniform_decode"
+            and group.world_size == _SMALL_GATHER_TP_SIZE
+            and hidden_states.shape == _SMALL_GATHER_INPUT_SHAPE
+            and hidden_states.dtype == torch.bfloat16
+            and hidden_states.device.type == "npu"
+            and is_forward_context_available()
+            and get_forward_context().cudagraph_runtime_mode == CUDAGraphMode.FULL
+            and getattr(get_forward_context(), "is_draft_model", True) is False
+        )
+        if use_small_gather:
+            gathered = hidden_states.new_empty((hidden_states.shape[0] * group.world_size, hidden_states.shape[1]))
+            dist.all_gather_into_tensor(gathered, hidden_states.contiguous(), group=small_group)
+            logger.info_once("DSV41_SMALL_GATHER_AIV_RUNTIME: target decode six-row BF16 gather")
+        else:
+            gathered = group.all_gather(hidden_states.contiguous(), dim=0)
         local_rows = hidden_states.shape[0]
         logger.info_once(
             "V4.1 sequence attention layout=%s phase=%s tp_rank=%d local_rows=%d global_rows=%d",
