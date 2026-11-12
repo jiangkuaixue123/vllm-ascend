@@ -27,6 +27,7 @@ constexpr int64_t CUBE_BLOCK = 16;
 constexpr int64_t K_SPLIT_ALIGNMENT = 256;
 constexpr int64_t K_LOOP_SIZE = 1024;
 constexpr int64_t D_TILE_SIZE = 2560;
+constexpr int64_t SINGLE_TILE_BUFFERS = 1;
 constexpr int64_t FLOAT_CACHE_LINE = 128;
 constexpr int64_t WORKSPACE_ALIGNMENT = 512;
 constexpr int64_t UB_RESERVE_BYTES = 8192;
@@ -37,14 +38,14 @@ int64_t RoundUp(int64_t value, int64_t alignment)
     return (value + alignment - 1) / alignment * alignment;
 }
 
-int64_t OutputUbBytes(int64_t splitCores)
+int64_t OutputUbBytes(int64_t splitCores, int64_t dTileSize, int64_t tileBuffers)
 {
     // Queues for two projections, comb projection, and both square-sum
     // allocations in the shared kernel. Each queue has two buffers.
     int64_t partials = DOUBLE_BUFFER * splitCores * sizeof(float) *
         (2 * ALIGNED_HC_WIDTH + HC_WIDTH * ALIGNED_HC_WIDTH + 2 * CUBE_BLOCK);
-    int64_t inputOutputTiles = (DOUBLE_BUFFER * sizeof(uint16_t) + sizeof(float)) *
-        (HC_WIDTH + 1) * D_TILE_SIZE;
+    int64_t inputOutputTiles = (tileBuffers * sizeof(uint16_t) + sizeof(float)) *
+        (HC_WIDTH + 1) * dTileSize;
     int64_t gateQueues = DOUBLE_BUFFER * (1 + HC_WIDTH) * ALIGNED_HC_WIDTH * sizeof(float);
     int64_t bases = (2 + HC_WIDTH) * ALIGNED_HC_WIDTH * sizeof(float);
     int64_t broadcasts = 2 * ALIGNED_HC_WIDTH * VECTOR_BLOCK_BYTES;
@@ -110,7 +111,12 @@ ge::graphStatus TilingForHcPreDelayed(gert::TilingContext *context)
     int64_t usedKCores = (k + splitK - 1) / splitK;
     // Include both legacy squareSumQue InitBuffer calls, both x/y buffers,
     // intermediate FP32 buffers, and the new previous-pre/diagnostic queues.
-    int64_t stage2UbBytes = OutputUbBytes(usedKCores);
+    // Six/twelve-row target decode consumes each x/y tile before the next one
+    // is allocated. One buffer lets the complete hidden dimension fit in UB.
+    // Keep the existing three-row TP8 schedule and projection reduction order.
+    int64_t dTileSize = rows == 3 ? D_TILE_SIZE : HIDDEN_SIZE;
+    int64_t tileBuffers = rows == 3 ? DOUBLE_BUFFER : SINGLE_TILE_BUFFERS;
+    int64_t stage2UbBytes = OutputUbBytes(usedKCores, dTileSize, tileBuffers);
     int64_t stage1Rows = (ubBytes - UB_RESERVE_BYTES) / (12 * K_LOOP_SIZE);
     if (stage2UbBytes + UB_RESERVE_BYTES > ubBytes || stage1Rows < 1) {
         return ge::GRAPH_FAILED;
@@ -131,7 +137,7 @@ ge::graphStatus TilingForHcPreDelayed(gert::TilingContext *context)
     data.set_cvLoopKSize(K_LOOP_SIZE);
     data.set_cubeCoreNum(cubeCores);
     data.set_stage1MFactor(stage1Rows);
-    // T <= 12: one vector core owns one token; each HC copy is read in two D tiles.
+    // T <= 12: one vector core owns one token.
     data.set_rowOfFormerBlock(1);
     data.set_rowOfTailBlock(1);
     data.set_rowLoopOfFormerBlock(1);
@@ -140,9 +146,9 @@ ge::graphStatus TilingForHcPreDelayed(gert::TilingContext *context)
     data.set_secondUsedCoreNum(rows);
     data.set_tailRowFactorOfFormerBlock(1);
     data.set_tailRowFactorOfTailBlock(1);
-    data.set_dLoop(HIDDEN_SIZE / D_TILE_SIZE);
-    data.set_dFactor(D_TILE_SIZE);
-    data.set_tailDFactor(D_TILE_SIZE);
+    data.set_dLoop(HIDDEN_SIZE / dTileSize);
+    data.set_dFactor(dTileSize);
+    data.set_tailDFactor(dTileSize);
     data.set_iterTimes(SINKHORN_ITERS);
     data.set_hcEps(HC_EPS);
     data.set_normEps(normEps == nullptr ? 1e-20f : *normEps);

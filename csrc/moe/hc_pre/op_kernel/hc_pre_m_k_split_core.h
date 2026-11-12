@@ -236,10 +236,14 @@ public:
             tilingData->hcMult * tilingData->hcMultAlign * sizeof(float));
         pipe->InitBuffer(squareSumQue, NUM_TWO, stage1UsedCoreNum *
         tilingData->stage2RowFactor * SQUARE_SUM_SIZE * sizeof(float));
-        pipe->InitBuffer(xQue, NUM_TWO, xQueNum2 * sizeof(T));
+        // Delayed decode's complete D tile has only one outstanding x/y pair;
+        // avoid reserving a second copy of that tile in the unified buffer.
+        constexpr int64_t SINGLE_TILE_BUFFERS = 1;
+        const int64_t tileBuffers = delayedPre && tilingData->dLoop == 1 ? SINGLE_TILE_BUFFERS : NUM_TWO;
+        pipe->InitBuffer(xQue, tileBuffers, xQueNum2 * sizeof(T));
         pipe->InitBuffer(squareSumQue, NUM_TWO, stage1UsedCoreNum *
         tilingData->stage2RowFactor * SQUARE_SUM_SIZE * sizeof(float));
-        pipe->InitBuffer(yQue, NUM_TWO,
+        pipe->InitBuffer(yQue, tileBuffers,
             tilingData->stage2RowFactor * RoundUp<T>(tilingData->dFactor) * sizeof(T));
         pipe->InitBuffer(postQue, NUM_TWO,
             tilingData->stage2RowFactor * tilingData->hcMultAlign * sizeof(float));
