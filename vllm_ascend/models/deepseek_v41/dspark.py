@@ -26,6 +26,7 @@ from vllm.v1.attention.backend import AttentionCGSupport, AttentionMetadataBuild
 
 from vllm_ascend.models.common.ops.draft_attention_graph import DraftAttentionGraph
 from vllm_ascend.models.common.ops.draft_context_graph import DraftContextGraph
+from vllm_ascend.models.common.ops.draft_ffn_graph import DraftFFNGraph
 
 from .attention import (
     DeepseekV41Attention,
@@ -426,6 +427,18 @@ class DSparkAttention(DeepseekV41Attention):
 class DSparkMoE(DeepseekV41MoE):
     """The draft block has all DP rows; SP experts own contiguous local rows."""
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._ffn_graph = DraftFFNGraph()
+
+    def _forward_experts(self, states, logits):
+        output = self.experts(hidden_states=states, router_logits=logits).float()
+        if output.shape != states.shape:
+            raise RuntimeError(f"Draft fused MoE returned {output.shape} for local token shard {states.shape}")
+        if states.shape[0]:
+            output = output + self._shared_output(states).float()
+        return output.to(states.dtype)
+
     def forward(self, states):
         comm = self.communication
         if not comm.sequence_parallel:
@@ -434,7 +447,13 @@ class DSparkMoE(DeepseekV41MoE):
         padded = F.pad(states, (0, 0, 0, -states.shape[0] % tp.world_size))
         width = padded.shape[0] // tp.world_size
         local = padded.narrow(0, tp.rank_in_group * width, width).contiguous()
-        output = super().forward(local)
+        if self.use_fused_runner and self._ffn_graph is not None:
+            logits = self.gate.routing_logits(local, decode=False, image_mask=None)
+            output = self._ffn_graph(self, local, logits)
+            if output is None:
+                output = self._forward_experts(local, logits)
+        else:
+            output = super().forward(local)
         if not width:
             return output
         return tp.all_gather(output, dim=0)[: states.shape[0]]
@@ -452,6 +471,8 @@ class DSparkStage(DeepseekV41Block):
         expert_config.n_routed_experts = config.dspark_n_routed_experts
         expert_config.num_experts_per_tok = config.dspark_num_experts_per_tok
         self.ffn = DSparkMoE(expert_config, vllm_config.quant_config, prefix + ".ffn")
+        if getattr(vllm_config, "lora_config", None) is not None:
+            self.ffn._ffn_graph = None
         self.attn_norm = DeepseekV41RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.ffn_norm = DeepseekV41RMSNorm(config.hidden_size, config.rms_norm_eps)
         width = (config.hc_mult + 2) * config.hc_mult
