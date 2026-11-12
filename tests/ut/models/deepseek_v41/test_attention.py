@@ -303,7 +303,8 @@ def graph_metadata(length, table, max_len, *, active=True):
 
 
 @pytest.mark.parametrize("ratio", [0, 1, 2])
-def test_static_decode_matches_eager_over_pages_and_pending_groups(make_layer, ratio):
+@pytest.mark.parametrize("defer_mask", [False, True])
+def test_static_decode_matches_eager_over_pages_and_pending_groups(make_layer, ratio, defer_mask):
     eager, graph = make_layer(ratio), make_layer(ratio)
     x, table = hidden_tokens(7), [3, 7, 6, 1]
     for layer in (eager, graph):
@@ -314,12 +315,15 @@ def test_static_decode_matches_eager_over_pages_and_pending_groups(make_layer, r
         md = graph_metadata(length, table, max_len=16)
         graph.cache.metadata = lambda md=md: md
         with torch.no_grad():
-            actual = graph(token, attention.DeepseekV41Runtime.for_decode(md))
+            actual = graph(token, attention.DeepseekV41Runtime.for_decode(md), defer_output_mask=defer_mask)
+            if defer_mask:
+                actual = torch.where(md.decode.active[:, None], actual, 0)
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         torch.testing.assert_close(paged_cache.bits(graph.cache), paged_cache.bits(eager.cache), rtol=0, atol=0)
 
 
-def test_static_decode_dummy_preserves_all_cache_values(make_layer):
+@pytest.mark.parametrize("defer_mask", [False, True])
+def test_static_decode_dummy_preserves_all_cache_values(make_layer, defer_mask):
     layer = make_layer(2)
     for bank in layer.cache.kv_cache:
         bank.uniform_(-1, 1)
@@ -327,7 +331,9 @@ def test_static_decode_dummy_preserves_all_cache_values(make_layer):
     md = graph_metadata(1, [0, 0, 0, 0], 16, active=False)
     layer.cache.metadata = lambda: md
     with torch.no_grad():
-        output = layer(hidden_tokens(1), attention.DeepseekV41Runtime.for_decode(md))
+        output = layer(hidden_tokens(1), attention.DeepseekV41Runtime.for_decode(md), defer_output_mask=defer_mask)
+        if defer_mask:
+            output = torch.where(md.decode.active[:, None], output, 0)
     torch.testing.assert_close(output, torch.zeros_like(output), rtol=0, atol=0)
     torch.testing.assert_close(paged_cache.bits(layer.cache), previous, rtol=0, atol=0)
 

@@ -113,3 +113,52 @@ def test_graph_component_latency(rows):
     fused_ms = timed_graph(hc_post_fused, args)
     print({"rows": rows, "calls": CHAIN_LENGTH, "reference_ms": reference_ms, "fused_ms": fused_ms})
     assert fused_ms < reference_ms
+
+
+@pytest.mark.parametrize("rows", [3, 6, 12])
+@torch.inference_mode()
+def test_masked_graph_preserves_inactive_nonfinite_and_refreshes_mask(rows):
+    torch.npu.set_device(0)
+    args = inputs(rows)
+    mask = torch.ones(rows, device="npu", dtype=torch.bool)
+    assert hc_post_fused(*args, mask) is not None
+    torch.npu.synchronize()
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph):
+        output = hc_post_fused(*args, mask)
+    address = output.data_ptr()
+    for case in range(4):
+        fresh = inputs(rows)
+        for destination, source in zip(args, fresh):
+            destination.copy_(source)
+        args[0][:, :4] = torch.tensor([float("nan"), float("inf"), -float("inf"), -0.0], device="npu")
+        args[2][:, 0] = -0.0
+        if case < 2:
+            mask.fill_(bool(case))
+        else:
+            mask.copy_(torch.arange(rows, device="npu") % 2 == case % 2)
+        graph.replay()
+        torch.npu.synchronize()
+        expected = hc_post(torch.where(mask[:, None], args[0], 0), *args[1:])
+        exact_output(output, expected)
+        assert output.data_ptr() == address
+
+
+@pytest.mark.parametrize("rows", [6, 12])
+@torch.inference_mode()
+def test_mask_fusion_complete_graph_latency(rows):
+    torch.npu.set_device(0)
+    args = inputs(rows)
+    mask = torch.arange(rows, device="npu") % 2 == 0
+
+    def previous(sub, residual, post, comb):
+        return hc_post_fused(torch.where(mask[:, None], sub, 0), residual, post, comb)
+
+    def candidate(sub, residual, post, comb):
+        return hc_post_fused(sub, residual, post, comb, mask)
+
+    exact_output(candidate(*args), previous(*args))
+    parent_ms = timed_graph(previous, args)
+    candidate_ms = timed_graph(candidate, args)
+    print({"rows": rows, "calls": CHAIN_LENGTH, "parent_masked_ms": parent_ms, "candidate_masked_ms": candidate_ms})
+    assert candidate_ms < parent_ms

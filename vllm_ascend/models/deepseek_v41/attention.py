@@ -1329,7 +1329,7 @@ class DeepseekV41Attention(nn.Module):
             complete = stream.record_event()
         return qr, q, complete, full_pos, prepared_index
 
-    def _decode_forward(self, local_states, runtime):
+    def _decode_forward(self, local_states, runtime, *, defer_output_mask=False):
         full_md = self.cache.metadata().decode
         pending_query = self._start_decode_query(local_states, full_md)
         gathered, offset = self._sequence_inputs(local_states, "uniform_decode")
@@ -1405,11 +1405,13 @@ class DeepseekV41Attention(nn.Module):
             )
         self.rotate(attended.unsqueeze(0), pos, inverse=True)
         output = self._project_output(attended, x.dtype)
+        if defer_output_mask:
+            return output
         return torch.where(local_md.active[:, None], output, 0)
 
-    def forward(self, hidden_states, runtime):
+    def forward(self, hidden_states, runtime, *, defer_output_mask=False):
         if runtime.decode is not None:
-            return self._decode_forward(hidden_states, runtime)
+            return self._decode_forward(hidden_states, runtime, defer_output_mask=defer_output_mask)
         metadata = self.cache.metadata()
         gathered, offset = self._sequence_inputs(hidden_states, "eager")
         queries_input = hidden_states if self.dsa_cp else gathered

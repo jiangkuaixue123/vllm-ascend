@@ -457,7 +457,9 @@ class DeepseekV41MoE(nn.Module):
             output = output + self._shared_output(hidden_states).float()
         return output.to(hidden_states.dtype)
 
-    def forward_decode(self, hidden_states: torch.Tensor, token_mask: torch.Tensor) -> torch.Tensor:
+    def forward_decode(
+        self, hidden_states: torch.Tensor, token_mask: torch.Tensor, *, defer_output_mask: bool = False
+    ) -> torch.Tensor:
         """Run the same collectives on every rank using fixed local decode slots."""
         if (
             hidden_states.ndim != 2
@@ -471,4 +473,6 @@ class DeepseekV41MoE(nn.Module):
         valid = token_mask.unsqueeze(-1)
         states = torch.where(valid, hidden_states, 0.0)
         output = self._routed_output(states, decode=True) + self._shared_output(states).float()
+        if defer_output_mask:
+            return output.to(states.dtype)
         return torch.where(valid, output.to(states.dtype), 0.0)

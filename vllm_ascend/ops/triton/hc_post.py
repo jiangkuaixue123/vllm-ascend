@@ -20,6 +20,8 @@ if HAS_TRITON and not envs.VLLM_BATCH_INVARIANT:
         post,
         comb,
         output,
+        token_mask,
+        MASK_SUBLAYER: tl.constexpr,
         HIDDEN: tl.constexpr,
         WIDTH: tl.constexpr,
         BLOCK: tl.constexpr,
@@ -45,11 +47,16 @@ if HAS_TRITON and not envs.VLLM_BATCH_INVARIANT:
         # ReduceSum starts from positive zero, including when all products are -0.
         mixed = tl.where(mixed == 0.0, 0.0, mixed)
         sub_value = tl.load(sub + token * HIDDEN + channel, valid, 0).to(tl.float32)
+        if MASK_SUBLAYER:
+            active = tl.load(token_mask + token) != 0
+            # Apply the original where before multiplying: inactive NaNs and
+            # signed zeros become positive zero while the residual is unchanged.
+            sub_value = tl.where(active, sub_value, 0.0)
         scaled = tl.load(post + token * WIDTH + stream) * sub_value
         result = scaled + mixed
         tl.store(output + offsets, result.to(tl.bfloat16), valid)
 
-    def hc_post4(sublayer_output, residual, post, comb):
+    def hc_post4(sublayer_output, residual, post, comb, token_mask=None):
         output = torch.empty_like(residual)
         grid = (sublayer_output.shape[0] * _HC_WIDTH, triton.cdiv(_HIDDEN_SIZE, _BLOCK_SIZE))
         _hc_post4_kernel[grid](
@@ -58,6 +65,8 @@ if HAS_TRITON and not envs.VLLM_BATCH_INVARIANT:
             post,
             comb,
             output,
+            sublayer_output if token_mask is None else token_mask,
+            MASK_SUBLAYER=token_mask is not None,
             HIDDEN=_HIDDEN_SIZE,
             WIDTH=_HC_WIDTH,
             BLOCK=_BLOCK_SIZE,

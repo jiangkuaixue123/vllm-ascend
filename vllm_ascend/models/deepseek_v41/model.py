@@ -67,6 +67,7 @@ from vllm_ascend.models.deepseek_v41.vision import embed_images, init_vision_mod
 from vllm_ascend.utils import enable_dsa_cp, enable_sp, shared_expert_dp_enabled
 
 MAX_DECODE_GRAPH_ROWS = 8
+_HC_DECODE_MASK_TP = 4
 
 
 def _decode_capture_sizes(compilation, query_width=1):
@@ -189,14 +190,20 @@ class DeepseekV41Block(nn.Module):
         self._hc_native_witness_pending = False
         logger.info("HC_NATIVE_RUNTIME_WITNESS %s", json.dumps(record, sort_keys=True, separators=(",", ":")))
 
-    def post_residual(self, sublayer_output, residual, post, comb, runtime):
+    def post_residual(self, sublayer_output, residual, post, comb, runtime, token_mask=None):
         if getattr(runtime, "decode", None) is not None:
-            output = hc_post_fused(sublayer_output, residual, post, comb)
+            output = hc_post_fused(sublayer_output, residual, post, comb, token_mask)
             if output is not None:
+                if token_mask is not None:
+                    logger.info_once(
+                        "HC_POST_MASK_FUSED_RUNTIME pid=%d rows=%d", os.getpid(), residual.shape[0], scope="process"
+                    )
                 if getattr(self, "_hc_post_fused_witness_pending", False):
                     logger.info("HC_POST_FUSED_RUNTIME pid=%s rows=%s", os.getpid(), residual.shape[0])
                     self._hc_post_fused_witness_pending = False
                 return output
+        if token_mask is not None:
+            sublayer_output = torch.where(token_mask[:, None], sublayer_output, 0)
         return hc_post(sublayer_output, residual, post, comb)
 
     def forward(self, hidden_states, pre_mix, runtime, decode_mask=None, image_mask=None):
@@ -206,17 +213,31 @@ class DeepseekV41Block(nn.Module):
             self.ffn(hidden_states.new_empty((0, self.config.hidden_size)))
             return hidden_states, pre_mix
         attn_input, attn_pre, post, comb = self.pre_and_mixes(hidden_states, pre_mix, "attn", runtime)
-        attended = self.attn(self.attn_norm(attn_input), runtime)
-        hidden_states = self.post_residual(attended, hidden_states, post, comb, runtime)
+        attn_input = self.attn_norm(attn_input)
+        fuse_mask = (
+            getattr(runtime, "decode", None) is not None
+            and decode_mask is not None
+            and self.attn.tp == _HC_DECODE_MASK_TP
+        )
+        if fuse_mask:
+            attended = self.attn(attn_input, runtime, defer_output_mask=True)
+        else:
+            attended = self.attn(attn_input, runtime)
+        post_mask = decode_mask if fuse_mask else None
+        hidden_states = self.post_residual(attended, hidden_states, post, comb, runtime, post_mask)
         ffn_input, ffn_pre, post, comb = self.pre_and_mixes(hidden_states, attn_pre, "ffn", runtime)
         ffn_input = self.ffn_norm(ffn_input)
         if getattr(runtime, "decode", None) is not None:
-            output = self.ffn.forward_decode(ffn_input, runtime.decode.active if decode_mask is None else decode_mask)
+            token_mask = runtime.decode.active if decode_mask is None else decode_mask
+            if fuse_mask:
+                output = self.ffn.forward_decode(ffn_input, token_mask, defer_output_mask=True)
+            else:
+                output = self.ffn.forward_decode(ffn_input, token_mask)
         elif image_mask is not None:
             output = self.ffn(ffn_input, image_mask=image_mask)
         else:
             output = self.ffn(ffn_input)
-        return self.post_residual(output, hidden_states, post, comb, runtime), ffn_pre
+        return self.post_residual(output, hidden_states, post, comb, runtime, post_mask), ffn_pre
 
 
 def read_parameter_slice(reader, key, parameter, module, tp_rank, tp_size):

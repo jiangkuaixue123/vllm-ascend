@@ -273,7 +273,8 @@ def test_checkpoint_names_are_global_and_only_owned_experts_allocate(tiny_linear
 
 
 @pytest.mark.parametrize("second_dp_active", [True, False])
-def test_decode_keeps_dp_bucket_ownership_when_slots_reorder_or_go_idle(tiny_linears, second_dp_active):
+@pytest.mark.parametrize("defer_mask", [False, True])
+def test_decode_keeps_dp_bucket_ownership_when_slots_reorder_or_go_idle(tiny_linears, second_dp_active, defer_mask):
     masks = [
         torch.tensor([True, False, True]),
         torch.tensor([False, second_dp_active, False]),
@@ -296,7 +297,9 @@ def test_decode_keeps_dp_bucket_ownership_when_slots_reorder_or_go_idle(tiny_lin
             layer.gate.weight.zero_()
             layer.gate.bias.copy_(torch.tensor([2.0, 0.0, 0.0, 1.0]))
             layer.experts[rank].w2.weight.fill_(rank + 1)
-        result = layer.forward_decode(inputs[dp_rank], masks[dp_rank])
+        result = layer.forward_decode(inputs[dp_rank], masks[dp_rank], defer_output_mask=defer_mask)
+        if defer_mask:
+            result = torch.where(masks[dp_rank][:, None], result, 0)
         expected = (4.75 * activation).narrow(0, dp_rank * 3, 3)
         torch.testing.assert_close(result, expected)
         assert group.calls == ep.calls == 1
@@ -543,8 +546,9 @@ def test_fused_runner_restores_outer_comm_on_failure(monkeypatch):
     from vllm_ascend.models.deepseek_v41 import fused_moe
 
     outer = object()
-    forward = SimpleNamespace(moe_comm_type="outer", moe_comm_method=outer)
+    forward = SimpleNamespace(moe_comm_type="outer", moe_comm_method=outer, padded_num_tokens=0)
     monkeypatch.setattr(fused_moe, "_EXTRA_CTX", forward)
+    monkeypatch.setattr(fused_moe, "is_forward_context_available", lambda: False)
     runner = SimpleNamespace(v41_comm=object())
 
     def fail(self, *args):
@@ -556,6 +560,8 @@ def test_fused_runner_restores_outer_comm_on_failure(monkeypatch):
     real = object.__new__(fused_moe.DeepseekV41FusedMoERunner)
     nn.Module.__init__(real)
     real.v41_comm = runner.v41_comm
+    real.v41_fused_mc2 = None
+    real.moe_config = SimpleNamespace(tp_group=SimpleNamespace(world_size=1))
     with pytest.raises(RuntimeError, match="test dispatch failed"):
         real.forward(torch.empty(0))
     assert forward.moe_comm_method is outer and forward.moe_comm_type == "outer"
