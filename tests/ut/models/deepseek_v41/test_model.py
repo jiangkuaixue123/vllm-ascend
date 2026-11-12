@@ -382,10 +382,11 @@ def staged_hash_model(paged_hash_model):
                     bucket_size,
                     model.engram_hasher.layout.hash_columns,
                     dtype=torch.long,
+                    device=device,
                 )
             out.zero_()
             if ids.shape[0]:
-                out[slots] = ids
+                out.index_copy_(0, torch.tensor(slots, dtype=torch.long, device=device), ids.to(device))
             return out
 
     model.layers.append(IdleRecordingBlock(cache))
@@ -491,6 +492,91 @@ def test_multirow_engram_keeps_per_bucket_storage_and_request_owned_history(stag
             assert addresses.setdefault(key, value.data_ptr()) == value.data_ptr()
         for key, old in previous_buckets.items():
             torch.testing.assert_close(model._decode_engram_values[key], old)
+
+
+@pytest.mark.parametrize("bucket", [24, 48])
+@pytest.mark.parametrize("device", ["cpu", "npu"])
+def test_packed_engram_header_history_matches_raw_tokens(staged_hash_model, bucket, device):
+    if device == "npu" and not torch.npu.is_available():
+        pytest.skip("NPU unavailable")
+    model = staged_hash_model
+    cache = model.layers[0].attn.cache
+    requests = bucket // 6
+    model._decode_capture_sizes = frozenset({bucket})
+    paged_cache.allocate(cache, requests * 8, 2, device=device)
+    tables = torch.arange(requests * 8, dtype=torch.int32, device=device).reshape(requests, 8)
+    history_column = cache.dim + cache.index_dim
+    addresses = {}
+    graph = None
+    for step in range(64):
+        cache.field(1, history_column, 1).zero_()
+        base = step % 4
+        live_requests = step % (requests + 1)
+        tokens = (torch.arange(bucket) + step) % 20
+        expected = torch.zeros(bucket, 2, model.engram_hasher.layout.hash_columns, dtype=torch.long)
+        for request in range(requests):
+            prefix = [(step + request + index) % 20 for index in range(base)]
+            if prefix:
+                cache.write_slots(
+                    request * 16 + torch.arange(base, device=device),
+                    torch.tensor(prefix, device=device).unsqueeze(-1),
+                    1,
+                    history_column,
+                )
+            if request < live_requests:
+                sequence = prefix + tokens[request * 6 : (request + 1) * 6].tolist()
+                expected[request * 6 : (request + 1) * 6] = model.engram_hasher.hash_tokens(
+                    sequence, model.engram_hasher.new_state(), start_position=0
+                )[-6:]
+        positions = base + torch.arange(bucket, device=device) % 6
+        active = torch.arange(bucket, device=device) // 6 < live_requests
+        slots = torch.arange(bucket, device=device) // 6 * 16 + positions
+        slots = torch.where(active, slots, -1)
+        positions = torch.where(active, positions, -99 if step % 2 else 99)
+        lengths = torch.where(active, positions + 1, 0)
+        table = tables.repeat_interleave(6, dim=0)
+        decode = DeepseekV41DecodeMetadata(lengths, slots, table, active, 16, query_width=6)
+        metadata = DeepseekV41Metadata([], table, slots, live_requests * 6, decode)
+        cache.metadata = lambda current=metadata: current
+        before = paged_cache.snapshot(cache)
+        assert model.prepare_decode_graph_inputs(tokens.to(device), positions) == live_requests * 6
+        for layer in model.engram_layer_ids:
+            value = model._decode_engram_values[bucket, layer]
+            torch.testing.assert_close(value.cpu(), expected[:, layer])
+            assert addresses.setdefault(layer, value.data_ptr()) == value.data_ptr()
+        expected_history = before[1].cpu().clone().view(torch.float32).reshape(-1)
+        live = slots[active].cpu().long()
+        expected_history[live] = tokens[: live.numel()].float()
+        torch.testing.assert_close(
+            paged_cache.bits(cache)[1].cpu(), expected_history.view(torch.int16).reshape(before[1].shape).cpu()
+        )
+        if device == "npu":
+            values = [model._decode_engram_values[bucket, layer] for layer in model.engram_layer_ids]
+            if graph is None:
+                _ = values[0] + values[1]
+                torch.npu.synchronize()
+                graph = torch.npu.NPUGraph()
+                with torch.npu.graph(graph):
+                    output = values[0] + values[1]
+            graph.replay()
+            torch.testing.assert_close(output.cpu(), expected.sum(dim=1))
+
+
+def test_idle_engram_capture_needs_no_bound_cache(staged_hash_model):
+    model = staged_hash_model
+    cache = model.layers[0].attn.cache
+    cache.kv_cache = None
+    decode = DeepseekV41DecodeMetadata(
+        torch.zeros(4, dtype=torch.long),
+        torch.full((4,), -1),
+        torch.zeros(4, 4, dtype=torch.int32),
+        torch.zeros(4, dtype=torch.bool),
+        8,
+    )
+    metadata = DeepseekV41Metadata([], decode.block_table_tensor, decode.slot_mapping, 0, decode)
+    cache.metadata = lambda: metadata
+    assert model.prepare_decode_graph_inputs(torch.zeros(4, dtype=torch.long), torch.full((4,), -1)) == 0
+    assert all(value.count_nonzero() == 0 for value in model._decode_engram_values.values())
 
 
 def test_graph_reports_live_rows_without_engram(staged_hash_model):

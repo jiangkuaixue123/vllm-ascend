@@ -560,6 +560,7 @@ class MmapEngramEmbedding(nn.Module):
         self.end_row = min(self.start_row + self.shard_rows, self.num_embeddings)
         self.chunk_rows = chunk_rows
 
+    @torch.profiler.record_function("v41.engram.lookup")
     def forward(self, indices: torch.Tensor, *, device: torch.device | str) -> torch.Tensor:
         if indices.device.type != "cpu" or indices.dtype not in (
             torch.int32,

@@ -471,6 +471,7 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsMultiModal):
             cache.write(metadata, stored.unsqueeze(-1), 1, history_column)
         return torch.cat(hashes, dim=0)
 
+    @torch.profiler.record_function("v41.engram.prepare_decode")
     def prepare_decode_graph_inputs(self, input_ids, positions, intermediate_tensors=None, inputs_embeds=None) -> int:
         """Stage each live request's Engram rows before replay and return its batch's live count."""
         if input_ids is None or input_ids.ndim != 1 or positions.shape != input_ids.shape:
@@ -485,16 +486,26 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsMultiModal):
         valid = decode.active & (decode.slot_mapping >= 0)
         if self.engram_hasher is None:
             return int(valid.sum().cpu())
-        # Copy the small header once. Logical request rows may have holes and
-        # change order; only the current block table identifies each history.
-        header = (
-            torch.stack((valid.long(), positions.long(), input_ids.long(), decode.slot_mapping.long()), dim=1)
-            .cpu()
-            .tolist()
-        )
-        live = [row for row, (active, _, _, _) in enumerate(header) if active]
         layout = self.engram_hasher.layout
         history_column = cache.dim + cache.index_dim
+        header_device = torch.stack(
+            (valid.long(), positions.long(), input_ids.long(), decode.slot_mapping.long()), dim=1
+        )
+        histories = None
+        history_width = layout.max_ngram_size - 1
+        if bucket > 1 and history_width and cache.kv_cache is not None and cache.pages()[1].shape[0]:
+            # Gather bounded history before the one D2H copy; dead/future slots
+            # are masked by decode_read, including negative startup positions.
+            shifts = torch.arange(history_width, 0, -1, device=input_ids.device)
+            past = positions.long()[:, None] - shifts
+            history = cache.decode_read(decode, past, 1, history_column, 1).squeeze(-1).long()
+            header = torch.cat((header_device, history), dim=1).cpu().tolist()
+            histories = [row[4:] for row in header]
+        else:
+            header = header_device.cpu().tolist()
+        # Logical rows may have holes or change order; the current block table
+        # remains the only authority for each request's history.
+        live = [row for row, values in enumerate(header) if values[0]]
         if live:
             logger.info_once("V4.1 staging an active token for full decode graph replay")
             physical = [header[row][3] for row in live]
@@ -503,21 +514,17 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsMultiModal):
             if any(not 0 <= header[row][1] < decode.max_model_len for row in live):
                 raise ValueError("Live Engram position outside the decode context")
             lookback = min(layout.max_ngram_size - 1, max(header[row][1] for row in live))
-            histories = [[] for _ in range(bucket)]
-            if lookback:
-                if bucket == 1:
-                    # Keep the single-row path's exact, bounded read.
-                    pos = header[0][1]
-                    past = torch.arange(pos - lookback, pos, device=input_ids.device)
-                    histories[0] = cache.read(decode, 0, past, 1, history_column, 1).flatten().long().cpu().tolist()
-                else:
-                    shifts = torch.arange(lookback, 0, -1, device=input_ids.device)
-                    past = positions.long()[:, None] - shifts
-                    histories = cache.decode_read(decode, past, 1, history_column, 1).squeeze(-1).long().cpu().tolist()
+            if histories is None:
+                histories = [[] for _ in range(bucket)]
+            if lookback and bucket == 1:
+                # Keep the single-row path's exact, bounded read.
+                pos = header[0][1]
+                past = torch.arange(pos - lookback, pos, device=input_ids.device)
+                histories[0] = cache.read(decode, 0, past, 1, history_column, 1).flatten().long().cpu().tolist()
             rows = []
             previous = -2
             for row in live:
-                _, pos, token, _ = header[row]
+                _, pos, token, _ = header[row][:4]
                 count = min(pos, lookback)
                 # Each packed verification query sees its own earlier proposals.
                 # On rejection the next query starts at the accepted boundary,
