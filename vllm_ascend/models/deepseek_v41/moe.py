@@ -275,6 +275,7 @@ class DeepseekV41Gate(nn.Module):
             renormalize,
             self.scaling_factor,
             self.temperature,
+            fuse_weights=gating_output.device.type == "npu" and get_tp_group().world_size == 4,
         )
 
     def forward(self, hidden_states: torch.Tensor):

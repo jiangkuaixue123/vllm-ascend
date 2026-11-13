@@ -17,6 +17,10 @@ ROUTER_NORMALIZATION_EPS = 1e-20
 _FUSED_HC_WIDTH = 4
 _FUSED_HC_ROUNDS = 20
 _FUSED_HC_EPS = 1e-6
+_TARGET_ROUTE_EXPERTS = 384
+_TARGET_ROUTE_TOP_K = 6
+_TARGET_ROUTE_MAX_ROWS = 12
+_TARGET_ROUTE_SCALE = 1.5
 
 
 def rms_norm(hidden_states: torch.Tensor, weight: torch.Tensor, eps: float = 1e-20) -> torch.Tensor:
@@ -169,6 +173,8 @@ def route_sqrtsoftplus(
     renormalize: bool = True,
     routed_scaling_factor: float = 1.5,
     gate_temperature: float = 1.0,
+    *,
+    fuse_weights: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Select experts with bias; weight them using the unbiased FP32 scores."""
     if not 1 <= top_k <= router_logits.shape[-1]:
@@ -177,6 +183,25 @@ def route_sqrtsoftplus(
         raise ValueError("gate_temperature must be positive")
     scores = F.softplus(router_logits.float() / gate_temperature).sqrt()
     indices = (scores + correction_bias.float()).topk(top_k, dim=-1).indices
+    if (
+        fuse_weights
+        and scores.device.type == "npu"
+        and torch.is_inference_mode_enabled()
+        and scores.ndim == 2
+        and 0 < scores.shape[0] <= _TARGET_ROUTE_MAX_ROWS
+        and scores.shape[1] == _TARGET_ROUTE_EXPERTS
+        and top_k == _TARGET_ROUTE_TOP_K
+        and renormalize
+        and routed_scaling_factor == _TARGET_ROUTE_SCALE
+        and scores.is_contiguous()
+        and indices.is_contiguous()
+    ):
+        # Keep score evaluation and expert selection on their existing path.
+        # Only the selected-score gather and normalization share one kernel.
+        from vllm_ascend.ops.triton.deepseek_v41_route_weights import selected_route_weights
+
+        if selected_route_weights is not None:
+            return selected_route_weights(scores, indices), indices
     weights = scores.gather(-1, indices)
     if renormalize and top_k > 1:
         weights = weights / (weights.sum(-1, keepdim=True) + ROUTER_NORMALIZATION_EPS)
