@@ -546,9 +546,8 @@ def _use_float32_tie_columns(scores, k):
     return (
         scores.device.type == "npu"
         and scores.ndim == 2
-        and scores.shape[0] in _DECODE_INDEX_SORT_ROWS
-        and scores.shape[-1] in _DECODE_INDEX_TIE_WIDTHS
         and k == _DECODE_INDEX_SORT_K
+        and k <= scores.shape[-1] <= _DECODE_INDEX_SORT_MAX_WIDTH
         and torch.is_inference_mode_enabled()
     )
 
@@ -559,7 +558,13 @@ def topk_columns(scores, k):
     if k == 0 or k == scores.shape[-1]:
         return columns[:k].long().expand(*scores.shape[:-1], k)
     top = scores.topk(k, dim=-1)
-    if HAS_TRITON and _use_float32_tie_columns(scores, k) and get_ascend_device_type() == AscendDeviceType.A3:
+    if (
+        HAS_TRITON
+        and _use_float32_tie_columns(scores, k)
+        and scores.shape[0] in _DECODE_INDEX_SORT_ROWS
+        and scores.shape[-1] in _DECODE_INDEX_TIE_WIDTHS
+        and get_ascend_device_type() == AscendDeviceType.A3
+    ):
         from vllm_ascend.ops.triton.deepseek_v41_index_ties import compact_tied_columns
 
         compacted = compact_tied_columns(scores, top.values, top.indices)
@@ -583,14 +588,7 @@ def topk_columns(scores, k):
 
 def sorted_topk_columns(scores, k):
     indices = topk_columns(scores, k)
-    if (
-        scores.device.type == "npu"
-        and scores.ndim == 2
-        and scores.shape[0] in _DECODE_INDEX_SORT_ROWS
-        and k == _DECODE_INDEX_SORT_K
-        and k <= scores.shape[-1] <= _DECODE_INDEX_SORT_MAX_WIDTH
-        and torch.is_inference_mode_enabled()
-    ):
+    if _use_float32_tie_columns(scores, k):
         # TopK indices are nonnegative and below the score width, so the
         # FP32 conversion is exact within this bound. Return int64 for page lookup.
         result = indices.float().sort(-1).values.long()
@@ -1008,7 +1006,7 @@ class DeepseekV41Attention(nn.Module):
                 )
             elif 0 <= candidate_layer < self.layer_id:
                 scores.masked_fill_(~shared.candidates[rows], -torch.inf)
-            indices = topk_columns(scores, k).sort(-1).values
+            indices = sorted_topk_columns(scores, k)
             topk[rows] = torch.where(indices < lengths, indices, -1)
         shared.topk = topk
         return shared.topk

@@ -383,3 +383,76 @@ def test_w8a8_grouped_capture_replay_on_npu(monkeypatch, top_k, chunked):
         graph.replay()
         torch.npu.synchronize()
         assert torch.count_nonzero(observed.cpu()) == 0
+
+
+@pytest.mark.parametrize("rows,placement", [(8192, "balanced"), (4097, "local"), (4097, "remote")])
+def test_prefill_chain_and_batch_match_original_target_width_on_npu(monkeypatch, rows, placement):
+    if not torch.npu.is_available():
+        pytest.skip("Ascend NPU is required")
+    from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ
+
+    hidden, intermediate, experts, local, top_k = 5120, 2304, 384, 24, 6
+    gen = torch.Generator().manual_seed(317)
+    states = torch.randn(rows, hidden, generator=gen).bfloat16().npu()
+    ids = (torch.arange(rows)[:, None] * top_k + torch.arange(top_k)) % experts
+    if placement == "local":
+        ids.remainder_(local)
+    elif placement == "remote":
+        ids = ids.remainder(experts - local) + local
+    ids = ids.to(torch.int32).npu()
+    route = torch.rand(rows, top_k, generator=gen).npu()
+    owned = torch.tensor([*range(local), *([-1] * (experts - local))], dtype=torch.int32).npu()
+    w1 = torch.randint(-8, 9, (local, hidden, 2 * intermediate), generator=gen, dtype=torch.int8).npu()
+    w2 = torch.randint(-8, 9, (local, intermediate, hidden), generator=gen, dtype=torch.int8).npu()
+    s1 = (torch.rand(local, 2 * intermediate, generator=gen) * 0.01 + 0.001).bfloat16().npu()
+    s2 = (torch.rand(local, hidden, generator=gen) * 0.01 + 0.001).bfloat16().npu()
+    comm = object.__new__(fused.DeepseekV41AllGatherComm)
+    comm.moe_config = SimpleNamespace(
+        experts_per_token=top_k,
+        num_experts=experts,
+        num_local_experts=local,
+        swiglu_limit=10.0,
+        activation="silu",
+        activation_situ_beta=None,
+        activation_situ_linear_beta=None,
+        swiglu_alpha=1.0,
+        swiglu_beta=0.0,
+    )
+    comm.token_dispatcher = comm._get_token_dispatcher()
+    monkeypatch.setattr(moe_comm_method, "_EXTRA_CTX", SimpleNamespace(moe_comm_method=comm))
+    monkeypatch.setattr(token_dispatcher, "get_ep_group", lambda: SimpleNamespace(rank_in_group=0))
+    monkeypatch.setattr(moe_mlp, "enable_fusion_gmmswigluquant", lambda: False)
+    monkeypatch.setattr(fused, "is_forward_context_available", lambda: False)
+    quantized, token_scale = fused.torch_npu.npu_dynamic_quant(states, dst_type=torch.int8)
+    inputs = build_fused_experts_input(
+        hidden_states=quantized,
+        pertoken_scale=token_scale,
+        topk_weights=route,
+        topk_ids=ids,
+        expert_map=owned,
+        w1=fused.torch_npu.npu_format_cast(w1, ACL_FORMAT_FRACTAL_NZ),
+        w2=fused.torch_npu.npu_format_cast(w2, ACL_FORMAT_FRACTAL_NZ),
+        w1_scale=s1,
+        w2_scale=s2,
+        dynamic_eplb=False,
+        quant_type=fused.QuantType.W8A8,
+    )
+    del w1, w2
+    with torch.inference_mode():
+        with monkeypatch.context() as reference:
+            reference.setattr(fused, "prefill_fusion_available", lambda states: False)
+            old = comm.fused_experts(inputs)
+            expected, counts = old.routed_out.cpu(), old.expert_tokens.cpu()
+            del old
+        torch.npu.synchronize()
+        torch.npu.reset_peak_memory_stats()
+        resident = torch.npu.memory_allocated()
+        result = comm.fused_experts(inputs)
+        torch.npu.synchronize()
+        peak = torch.npu.max_memory_allocated() - resident
+        print(f"PREFILL_WORKSPACE rows={rows} placement={placement} peak_bytes={peak}")
+        torch.testing.assert_close(result.routed_out.cpu(), expected, rtol=0, atol=0)
+        torch.testing.assert_close(result.expert_tokens.cpu(), counts, rtol=0, atol=0)
+        assert torch.isfinite(result.routed_out).all()
+        if placement == "remote":
+            assert torch.count_nonzero(result.routed_out) == 0

@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Preserve V4.1's per-route weight before quantizing the expert down projection."""
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
 
 import torch
 import torch_npu
@@ -15,17 +15,24 @@ from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
 from vllm_ascend.models.deepseek_v41.core import clipped_swiglu
 from vllm_ascend.ops.fused_moe.dataclass.fused_experts import build_fused_experts_input
+from vllm_ascend.ops.fused_moe.dataclass.token_dispatcher import MoEAllGatherCombineMetadata
 from vllm_ascend.ops.fused_moe.moe_comm_method import AllGatherCommImpl, FusedExpertsResult, FusedMC2CommImpl
 from vllm_ascend.ops.fused_moe.prepare_finalize import PrepareAndFinalizeWithAllGather
 from vllm_ascend.ops.fused_moe.routed_experts import AscendRoutedExperts, AscendUnquantizedFusedMoEMethod
 from vllm_ascend.ops.fused_moe.token_dispatcher import TokenDispatcherWithAllGather
 from vllm_ascend.ops.register_custom_ops import ep_pad_and_reduce_scatter
+from vllm_ascend.ops.triton.deepseek_v41_prefill_experts import (
+    prefill_combine_output,
+    prefill_fusion_available,
+    prefill_route_activation,
+)
 from vllm_ascend.quantization.method_adapters import AscendFusedMoEMethod
 from vllm_ascend.quantization.quant_type import QuantType
 
 # The native dispatcher allocates one expanded row per (gathered token, route),
 # including remote routes. Bound its local workspace independently of DP and EP.
 MAX_EAGER_ROUTED_TOKENS = 1024
+MAX_FUSED_PREFILL_ROUTED_TOKENS = 2048
 
 
 def dispatched_scales(row_ids, route_weights, owned, num_rows):
@@ -42,6 +49,11 @@ def dispatched_scales(row_ids, route_weights, owned, num_rows):
     return result
 
 
+@dataclass(frozen=True, slots=True)
+class DeepseekV41PrefillCombineMetadata(MoEAllGatherCombineMetadata):
+    route_scales: torch.Tensor
+
+
 class DeepseekV41Dispatcher(TokenDispatcherWithAllGather):
     def token_dispatch(self, token_dispatch_input):
         output = super().token_dispatch(token_dispatch_input)
@@ -52,7 +64,27 @@ class DeepseekV41Dispatcher(TokenDispatcherWithAllGather):
         scales = dispatched_scales(
             meta.expanded_row_idx, token_dispatch_input.topk_weights, owned, output.hidden_states.shape[0]
         )
-        return replace(output, topk_scales=scales, combine_metadata=replace(meta, topk_weights=owned.float()))
+        if prefill_fusion_available(output.hidden_states):
+            meta = DeepseekV41PrefillCombineMetadata(
+                topk_weights=owned.float(),
+                expanded_row_idx=meta.expanded_row_idx,
+                restore_shape=meta.restore_shape,
+                route_scales=scales,
+            )
+        else:
+            meta = replace(meta, topk_weights=owned.float())
+        return replace(output, topk_scales=scales, combine_metadata=meta)
+
+    def token_combine(self, hidden_states, combine_metadata, bias=None):
+        if isinstance(combine_metadata, DeepseekV41PrefillCombineMetadata):
+            output = prefill_combine_output(
+                hidden_states,
+                combine_metadata.route_scales,
+                combine_metadata.expanded_row_idx,
+                combine_metadata.topk_weights,
+            )
+            return output.view(combine_metadata.restore_shape)
+        return super().token_combine(hidden_states, combine_metadata, bias)
 
 
 def _grouped_projection(states, weights, groups, group_type, weight_scale=None, token_scale=None):
@@ -122,7 +154,13 @@ class DeepseekV41AllGatherComm(AllGatherCommImpl):
     def fused_experts(self, fused_experts_input):
         inputs = fused_experts_input
         rows = inputs.hidden_states.shape[0]
-        if rows <= MAX_EAGER_ROUTED_TOKENS or (
+        # Larger batches rely on the fused chain's smaller live intermediates.
+        chunk_size = (
+            MAX_FUSED_PREFILL_ROUTED_TOKENS
+            if prefill_fusion_available(inputs.hidden_states)
+            else MAX_EAGER_ROUTED_TOKENS
+        )
+        if rows <= chunk_size or (
             is_forward_context_available() and get_forward_context().cudagraph_runtime_mode == CUDAGraphMode.FULL
         ):
             return super().fused_experts(inputs)
@@ -132,8 +170,8 @@ class DeepseekV41AllGatherComm(AllGatherCommImpl):
         # finalize() receives one complete output in the original gather order.
         routed_out = inputs.hidden_states.new_empty(inputs.hidden_states.shape, dtype=torch.float32)
         counts = inputs.topk_ids.new_zeros((self.moe_config.num_local_experts,), dtype=torch.int64)
-        for start in range(0, rows, MAX_EAGER_ROUTED_TOKENS):
-            part = slice(start, start + MAX_EAGER_ROUTED_TOKENS)
+        for start in range(0, rows, chunk_size):
+            part = slice(start, start + chunk_size)
             routing = inputs.routing
             chunk = replace(
                 inputs,
@@ -169,11 +207,16 @@ class DeepseekV41AllGatherComm(AllGatherCommImpl):
             weights.w1_scale,
             inputs.dynamic_scale,
         )
-        gate, up = gate_up.chunk(2, dim=-1)
         factor = inputs.topk_scales.unsqueeze(-1)
         # Match the checkpoint's individual expert GEMMs: BF16 gate/up output,
         # FP32 nonlinear activation and route factor, then BF16 input to W2.
-        activation = (clipped_swiglu(gate, up, inputs.swiglu_limit) * factor).to(torch.bfloat16)
+        fused_prefill = prefill_fusion_available(inputs.hidden_states)
+        if fused_prefill:
+            activation = prefill_route_activation(gate_up, inputs.topk_scales, inputs.swiglu_limit)
+            del gate_up
+        else:
+            gate, up = gate_up.chunk(2, dim=-1)
+            activation = (clipped_swiglu(gate, up, inputs.swiglu_limit) * factor).to(torch.bfloat16)
         scale = None
         if quantized:
             activation, scale = torch_npu.npu_dynamic_quant(activation, dst_type=torch.int8)
@@ -181,9 +224,9 @@ class DeepseekV41AllGatherComm(AllGatherCommImpl):
         output = _grouped_projection(
             activation, weights.w2, inputs.group_list, inputs.group_list_type, weights.w2_scale, scale
         )
-        # GMM need only initialize rows covered by the local expert group list.
-        # Clear padding before native unpermute, which can otherwise read NaNs.
-        output = torch.where(factor != 0, output.float(), 0.0)
+        # The prefill consumer masks padding while reading BF16 expert rows.
+        if not fused_prefill:
+            output = torch.where(factor != 0, output.float(), 0.0)
         logger.info_once(
             "V4.1 grouped expert down projection executed: experts=%d top_k=%d quant=%s",
             self.moe_config.num_experts,
