@@ -59,6 +59,15 @@ namespace Catlass::Gemm::Kernel {
 
 constexpr uint16_t SYNCFLAGC2V = 9;
 constexpr uint16_t SYNCFLAGV2C = 10;
+constexpr uint32_t COMBINE_TARGET_EP_SIZE = 16;
+constexpr uint32_t COMBINE_TARGET_LOCAL_EXPERTS = 24;
+constexpr uint32_t COMBINE_TARGET_TOP_K = 6;
+constexpr uint32_t COMBINE_TARGET_DECODE_ROWS = 6;
+constexpr uint32_t COMBINE_TARGET_HIDDEN_SIZE = 5120;
+constexpr uint32_t COMBINE_TARGET_GATE_UP_SIZE = 4608;
+constexpr uint32_t COMBINE_COLUMN_ALIGNMENT = 32;
+constexpr uint32_t COMBINE_MIN_ROWS_PER_PEER = 2;
+
 
 template <
     class BlockMmad_,
@@ -1046,16 +1055,36 @@ private:
     void CombineV1(Params const &params, BlockEpilogue2 & blockEpilogue) {
         uint32_t n2 = params.problemShape.k();
         int32_t prevGroupSum2 = 0;
+        // The original peer-only assignment leaves excess AIV cores idle.
+        // Split each peer's columns into disjoint, aligned ranges instead.
+        const bool supportsTargetColumns = std::is_same_v<ElementC, int32_t> &&
+            params.EP == COMBINE_TARGET_EP_SIZE && params.expertPerRank == COMBINE_TARGET_LOCAL_EXPERTS &&
+            params.topK == COMBINE_TARGET_TOP_K && params.problemShape.m() == COMBINE_TARGET_DECODE_ROWS &&
+            n2 == COMBINE_TARGET_HIDDEN_SIZE && params.problemShape.n() == COMBINE_TARGET_GATE_UP_SIZE &&
+            coreNum >= params.EP && coreNum % params.EP == 0;
+
 
         icache_preload(8);
         for (uint32_t t_groupIdx = 0; t_groupIdx < params.expertPerRank; ++t_groupIdx) {
+            // Column splitting helps only when the expert has enough return
+            // rows. The completed expert count is common to all local cores.
+            const bool parallelTargetColumns = supportsTargetColumns &&
+                cumsumMM((params.EP - 1) * params.expertPerRank + t_groupIdx) >=
+                    params.EP * COMBINE_MIN_ROWS_PER_PEER;
+            const uint32_t columnLanes = parallelTargetColumns ? coreNum / params.EP : 1;
+            const uint32_t columnLane = parallelTargetColumns ? coreIdx / params.EP : 0;
+            const uint32_t columnsPerLane = AlignUp((n2 + columnLanes - 1) / columnLanes, COMBINE_COLUMN_ALIGNMENT);
+            const uint32_t columnStart = columnLane * columnsPerLane;
+            const uint32_t columnCount = columnStart + columnsPerLane < n2 ? columnsPerLane : n2 - columnStart;
+            const uint32_t peerStart = parallelTargetColumns ? coreIdx % params.EP : coreIdx;
+            const uint32_t peerStep = parallelTargetColumns ? params.EP : coreNum;
             int32_t flagId = t_groupIdx / CROSS_CORE_FLAG_MAX_SET_COUNT;
             AscendC::CrossCoreWaitFlag<0x2>(flagId);
             AscendC::SyncAll<true>();
 
             uint32_t groupIdx = t_groupIdx;
 
-            for(int32_t dstEpIdx = coreIdx; dstEpIdx < params.EP; dstEpIdx += coreNum) {
+            for(uint32_t dstEpIdx = peerStart; dstEpIdx < params.EP; dstEpIdx += peerStep) {
                 __gm__ void* dstPeermemPtr = shmem(peermemInfo.offsetD, dstEpIdx);
                 AscendC::GlobalTensor<ElementD2> gmRemotePeer;
                 gmRemotePeer.SetGlobalBuffer(reinterpret_cast<__gm__ ElementD2*>(dstPeermemPtr));
@@ -1069,15 +1098,15 @@ private:
                     int32_t tmpBlock = AlignUp(params.expertPerRank, FLAGSTRIDE);
                     //uint32_t dstRowOffset = preSumBeforeRank(dstEpIdx * tmpBlock + groupIdx);
                     uint32_t dstRowOffset = preSumBeforeRank(dstEpIdx * params.expertPerRank + groupIdx);
-                    MatrixCoord offsetC{srcRowOffset, 0};
-                    MatrixCoord offsetPeer{dstRowOffset, 0};
-                    MatrixCoord shapeC{dataRows, n2};
+                    MatrixCoord offsetC{srcRowOffset, columnStart};
+                    MatrixCoord offsetPeer{dstRowOffset, columnStart};
+                    MatrixCoord shapeC{dataRows, columnCount};
                     int64_t gmOffsetC = params.layoutD2.GetOffset(offsetC);
                     int64_t gmOffsetPeer = params.layoutD2.GetOffset(offsetPeer);
                     if constexpr (std::is_same_v<ElementA, int8_t>) {
                         if constexpr (std::is_same_v<ElementC, int32_t>) {
                             blockEpilogue.SetChannelScale(GetTensorAddr<float>(0, params.ptrScale2) +
-                                groupIdx * n2);
+                                groupIdx * n2 + columnStart);
                         }
                         blockEpilogue(gmC2[gmOffsetC], shapeC, gmPerTokenScale2[srcRowOffset], gmRemotePeer[gmOffsetPeer]);
                     } else {

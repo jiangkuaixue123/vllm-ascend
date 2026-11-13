@@ -151,16 +151,19 @@ public:
     {
         uint32_t blockM = shapeC.row();
         uint32_t blockN = shapeC.column();
+        // A caller may assign only a column slice, but successive token rows
+        // remain separated by the full hidden width in both global tensors.
+        const uint32_t rowStride = params.n2;
 
         uint32_t tileLoops = blockM;
 
         for (uint32_t loopIdx = 0; loopIdx < tileLoops; loopIdx ++) {
-            auto gmTileC = gmC[loopIdx * blockN];
+            auto gmTileC = gmC[loopIdx * rowStride];
             auto &ubC = ubCList[ubListId];
             auto &ubCFp32 = ubCFp32List[ubListId];
             auto &ubMul = ubMulList[ubListId];
             auto &ubD = ubDList[ubListId];
-            auto gmTileD = gmD[loopIdx * blockN];
+            auto gmTileD = gmD[loopIdx * rowStride];
             LayoutC layoutUbC{1, blockN};
 
             // Move C from GM workspace to UB

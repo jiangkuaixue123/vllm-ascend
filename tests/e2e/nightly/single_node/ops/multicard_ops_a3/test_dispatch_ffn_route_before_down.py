@@ -31,39 +31,69 @@ def _all_gather(tensor):
 
 
 def _reference(states, ids, routes, active, w1, w2, s1, s2, limit):
+    """Use the model's grouped W8A8 arithmetic with independent CPU routing."""
     rank, world = dist.get_rank(), dist.get_world_size()
     local_experts, rows = w1.shape[0], states.shape[0]
     states, ids, routes, active = (_all_gather(value) for value in (states, ids, routes, active))
-    q1, a1 = torch_npu.npu_dynamic_quant(states, dst_type=torch.int8)
+    groups = [[] for _ in range(local_experts)]
+    lower = rank * local_experts
+    for token, (token_ids, enabled) in enumerate(zip(ids.cpu().tolist(), active.cpu().tolist())):
+        if enabled:
+            for slot, expert in enumerate(token_ids):
+                if lower <= expert < lower + local_experts:
+                    groups[expert - lower].append((token, slot))
+    counts = torch.tensor([len(group) for group in groups], dtype=torch.int64, device=states.device)
+    pairs = [pair for group in groups for pair in group]
     expected = torch.zeros_like(states, dtype=torch.float32)
-    counts = []
-    for expert in range(local_experts):
-        gate_up = torch_npu.npu_quant_matmul(q1, w1[expert], s1[expert], pertoken_scale=a1, output_dtype=torch.bfloat16)
+
+    def grouped(values, weights, scale, token_scale):
+        return torch_npu.npu_grouped_matmul(
+            x=[values],
+            weight=[weights],
+            scale=[scale],
+            per_token_scale=[token_scale.reshape(-1)],
+            group_list=counts,
+            group_list_type=1,
+            group_type=0,
+            split_item=2,
+            output_dtype=torch.bfloat16,
+        )[0]
+
+    if pairs:
+        token_index = torch.tensor([pair[0] for pair in pairs], device=states.device)
+        slot_index = torch.tensor([pair[1] for pair in pairs], device=states.device)
+        q1, a1 = torch_npu.npu_dynamic_quant(states, dst_type=torch.int8)
+        gate_up = grouped(q1[token_index], w1, s1, a1[token_index])
         gate, up = gate_up.float().chunk(2, dim=-1)
-        selected = ids == (rank * local_experts + expert)
-        counts.append((selected & active[:, None]).sum().to(torch.int32))
-        factors = torch.where(selected, routes, 0.0).sum(-1, keepdim=True)
+        factors = routes[token_index, slot_index, None]
         activation = (torch.nn.functional.silu(gate.clamp(max=limit)) * up.clamp(-limit, limit) * factors).bfloat16()
         q2, a2 = torch_npu.npu_dynamic_quant(activation, dst_type=torch.int8)
-        result = torch_npu.npu_quant_matmul(q2, w2[expert], s2[expert], pertoken_scale=a2, output_dtype=torch.bfloat16)
-        expected.add_(torch.where(selected.any(-1, keepdim=True) & active[:, None], result.float(), 0.0))
+        result = grouped(q2, w2, s2, a2).float()
+        expected.index_add_(0, token_index, torch.where(factors != 0, result, 0.0))
     dist.all_reduce(expected)
     assert expected.shape[0] == rows * world
-    return expected[rank * rows : (rank + 1) * rows], torch.stack(counts)
+    return expected[rank * rows : (rank + 1) * rows], counts.to(torch.int32)
 
 
 @torch.inference_mode()
-def _case(local_experts, top_k, rows, hidden, intermediate):
+def _case(local_experts, top_k, rows, hidden, intermediate, *, concentrated=False, sparse=False, measure_replays=0):
     rank, world = dist.get_rank(), dist.get_world_size()
     generator = torch.Generator().manual_seed(191 + rank)
     states = torch.randn(rows, hidden, generator=generator).bfloat16().npu()
+    original_states = states.clone() if measure_replays else None
     # Distinct routes cover both local and remote ownership on every rank.
     route_ids = torch.argsort(torch.randn(rows, world * local_experts, generator=generator), -1)[:, :top_k]
+    if concentrated:
+        # At EP16, 6/12 local rows send 96/192 rows to each selected expert.
+        # This crosses the decode kernel's M=64 tile boundary, including a tail.
+        route_ids = torch.arange(top_k).expand(rows, -1).contiguous()
     ids = route_ids.to(torch.int32).contiguous().npu()
     routes = (torch.rand(rows, top_k, generator=generator) * 0.9 + 0.01).npu()
     routes[0, 0] = 0
     active = torch.ones(rows, dtype=torch.bool, device="npu")
     active[-1] = False
+    if sparse and rank != 0:
+        active.zero_()
     w1 = torch.randint(-16, 17, (local_experts, hidden, 2 * intermediate), generator=generator, dtype=torch.int8).npu()
     w2 = torch.randint(-16, 17, (local_experts, intermediate, hidden), generator=generator, dtype=torch.int8).npu()
     s1 = (torch.rand(local_experts, 2 * intermediate, generator=generator) * 0.03 + 0.005).bfloat16().npu()
@@ -105,7 +135,7 @@ def _case(local_experts, top_k, rows, hidden, intermediate):
     graph = torch.npu.NPUGraph()
     with torch.npu.graph(graph):
         execute()
-    for iteration in range(3):
+    for iteration in range(5):
         ids.copy_(route_ids.roll(iteration + 1, 0).to(device="npu", dtype=torch.int32))
         routes.mul_(0.73)
         if iteration == 1 and rank % 2:
@@ -113,6 +143,11 @@ def _case(local_experts, top_k, rows, hidden, intermediate):
         if iteration == 2:
             states.zero_()
             active.fill_(True)
+        if iteration == 3:
+            active.zero_()  # Every expert becomes empty on every rank.
+        if iteration == 4:
+            states.copy_(torch.randn(rows, hidden, generator=generator).bfloat16().npu())
+            active.fill_(rank == world - 1)  # Re-enable after an entirely empty replay.
         expected, expected_counts = _reference(states, ids, routes, active, w1, w2, s1, s2, 10.0)
         graph.replay()
         torch.npu.synchronize()
@@ -121,6 +156,43 @@ def _case(local_experts, top_k, rows, hidden, intermediate):
         assert torch.count_nonzero(output[~active].cpu()) == 0
         if iteration == 2:
             assert torch.count_nonzero(output.cpu()) == 0
+    if measure_replays:
+        # Restore nonzero inputs after the replay correctness cases. All ranks
+        # participate, and the slowest rank defines this collective-chain time.
+        states.copy_(original_states)
+        ids.copy_(route_ids.to(device="npu", dtype=torch.int32))
+        active.fill_(not sparse or rank == 0)
+        # The native operator writes inactive route IDs. Timed replays retain
+        # the same active mask; updated correctness calls restore IDs first.
+        graph.replay()
+        graph.replay()
+        torch.npu.synchronize()
+        dist.barrier()
+        start, end = torch.npu.Event(enable_timing=True), torch.npu.Event(enable_timing=True)
+        start.record()
+        for _ in range(measure_replays):
+            graph.replay()
+        end.record()
+        end.synchronize()
+        elapsed = torch.tensor([start.elapsed_time(end)], dtype=torch.float32, device=states.device)
+        rank_times = _all_gather(elapsed).cpu().tolist()
+        if rank == 0:
+            print(
+                "FUSED_MC2_ROUTE_BENCH "
+                + json.dumps(
+                    {
+                        "experts": local_experts * world,
+                        "top_k": top_k,
+                        "rows": rows,
+                        "concentrated": concentrated,
+                        "sparse": sparse,
+                        "replays": measure_replays,
+                        "slowest_rank_ms": max(rank_times),
+                        "rank_ms": rank_times,
+                    }
+                ),
+                flush=True,
+            )
     dist.barrier()
     if rank == 0:
         print(
@@ -134,8 +206,10 @@ def _case(local_experts, top_k, rows, hidden, intermediate):
                     "rows": rows,
                     "hidden": hidden,
                     "intermediate": intermediate,
+                    "concentrated": concentrated,
+                    "sparse": sparse,
                     "eager": True,
-                    "replays": 3,
+                    "replays": 5,
                     "rtol": NUMERICAL_RTOL,
                     "atol": NUMERICAL_ATOL,
                 }
@@ -144,13 +218,16 @@ def _case(local_experts, top_k, rows, hidden, intermediate):
         )
 
 
-def _run(full_shapes=False):
+def _run(full_shapes=False, measure_replays=0):
     enable_custom_op()
     torch.npu.config.allow_internal_format = True
     hidden, intermediate = (5120, 2304) if full_shapes else (256, 128)
     for experts, top_k in ((24, 6), (8, 3)):
         for rows in (6, 12):
-            _case(experts, top_k, rows, hidden, intermediate)
+            _case(experts, top_k, rows, hidden, intermediate, measure_replays=measure_replays)
+    for rows in (6, 12):
+        _case(24, 6, rows, hidden, intermediate, concentrated=True, measure_replays=measure_replays)
+    _case(24, 6, 6, hidden, intermediate, sparse=True, measure_replays=measure_replays)
 
 
 def _worker(rank, port):
@@ -172,10 +249,13 @@ def test_route_before_down_eager_and_replay():
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--full-shapes", action="store_true")
+    parser.add_argument("--measure-replays", type=int, default=0)
     args = parser.parse_args()
+    if args.measure_replays < 0:
+        parser.error("--measure-replays must be nonnegative")
     torch.npu.set_device(int(os.environ["LOCAL_RANK"]))
     dist.init_process_group("hccl")
     try:
-        _run(args.full_shapes)
+        _run(args.full_shapes, args.measure_replays)
     finally:
         dist.destroy_process_group()
