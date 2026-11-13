@@ -180,21 +180,38 @@ __aicore__ inline void DataCopyPABySlots(LocalTensor<T> &dstTensor,  // l1
                                          uint32_t sparseIndexStart)
 {
     uint32_t blockElementCnt = 32 / sizeof(T);
-    for (uint32_t row = 0; row < shape.copyRowNum; ++row) {
-        int32_t slotId = sparseIndicesGm.GetValue(sparseIndexBaseOffset + sparseIndexStart + row);
+    uint32_t row = 0;
+    int32_t nextSlot = shape.copyRowNum ? sparseIndicesGm.GetValue(sparseIndexBaseOffset + sparseIndexStart) : 0;
+    while (row < shape.copyRowNum) {
+        int32_t slotId = nextSlot;
+        bool invalid = slotId < 0;
         if (slotId < 0) {
             slotId = 0;
         }
         uint64_t blockId = static_cast<uint64_t>(slotId) / shape.blockSize;
         uint64_t blockOffset = static_cast<uint64_t>(slotId) % shape.blockSize;
+        // QK and PV share this copy path; preserve slot order and each page's head stride.
+        uint32_t limit = invalid ? 1 : Min(shape.copyRowNum - row, shape.blockSize - blockOffset);
+        uint32_t run = 1;
+        while (run < limit) {
+            nextSlot = sparseIndicesGm.GetValue(sparseIndexBaseOffset + sparseIndexStart + row + run);
+            if (static_cast<int64_t>(nextSlot) != static_cast<int64_t>(slotId) + run) {
+                break;
+            }
+            ++run;
+        }
         uint64_t offset = blockId * shape.kvStride;
         offset += static_cast<uint64_t>(startPos.n2Idx * shape.headDim * shape.blockSize) +
                   blockOffset * shape.headDim + startPos.dIdx;
 
         LocalTensor<T> tmpDstTensor = dstTensor[row * blockElementCnt];
         GlobalTensor<T> tmpSrcTensor = srcTensor[offset];
-        DataCopyGmNDToL1<T>(tmpDstTensor, tmpSrcTensor, 1, shape.copyRowNumAlign,
+        DataCopyGmNDToL1<T>(tmpDstTensor, tmpSrcTensor, run, shape.copyRowNumAlign,
                             shape.actHeadDim, shape.headDim);
+        row += run;
+        if (row < shape.copyRowNum && run == limit) {
+            nextSlot = sparseIndicesGm.GetValue(sparseIndexBaseOffset + sparseIndexStart + row);
+        }
     }
 }
 

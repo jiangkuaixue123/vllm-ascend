@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from vllm_ascend.ops import register_custom_ops as custom_ops
@@ -78,6 +79,48 @@ def test_sp_ep_fake_shapes_follow_uneven_local_chunks(monkeypatch):
 
     assert gathered.shape == (8, 4)
     assert reduced.shape == (3, 4)
+
+
+def test_actual_rows_keep_wire_capacity_and_rank_ownership(monkeypatch):
+    sizes = [2] * 4 + [0] * 4 + [3] * 4 + [1] * 4
+    capacity = 5  # Larger than every valid shard, including the largest DP.
+    parts = [torch.arange(n * 4).view(n, 4).float() + rank * 100 for rank, n in enumerate(sizes)]
+    wire = torch.stack([torch.nn.functional.pad(x, (0, 0, 0, capacity - len(x))) for x in parts])
+    compact = torch.cat(parts)
+    context = SimpleNamespace(
+        dp_metadata=SimpleNamespace(get_chunk_sizes_across_dp_rank=lambda: [capacity] * 16),
+        ep_actual_local_sizes=sizes,
+    )
+    monkeypatch.setattr(custom_ops, "get_forward_context", lambda: context)
+    for rank in range(16):
+
+        def gather(x, dim, rank=rank):
+            assert dim == 0
+            torch.testing.assert_close(x, wire[rank])
+            return wire.flatten(0, 1)
+
+        def scatter(x, dim, rank=rank):
+            assert dim == 0
+            torch.testing.assert_close(x, wire.flatten(0, 1))
+            return wire[rank] * 16
+
+        group = SimpleNamespace(world_size=16, rank_in_group=rank, all_gather=gather, reduce_scatter=scatter)
+        monkeypatch.setattr(custom_ops, "get_ep_group", lambda group=group: group)
+        actual = custom_ops._maybe_all_gather_and_maybe_unpad_impl(parts[rank])
+        torch.testing.assert_close(actual, compact)
+        reduced = custom_ops.ep_pad_and_reduce_scatter(actual, context.dp_metadata)
+        torch.testing.assert_close(reduced, parts[rank] * 16)
+        assert custom_ops._maybe_all_gather_and_maybe_unpad_fake(parts[rank]).shape == compact.shape
+        assert custom_ops._maybe_pad_and_reduce_fake(actual).shape == parts[rank].shape
+
+
+@pytest.mark.parametrize("actual", [[2, 2], [-1, 1, 3, 3], [2, 1, 3, 3]])
+def test_invalid_actual_ep_rows_fail_before_collective(monkeypatch, actual):
+    _patch_sp_ep_context(monkeypatch)
+    context = custom_ops.get_forward_context()
+    context.ep_actual_local_sizes = actual
+    with pytest.raises(ValueError, match="capacity"):
+        custom_ops._maybe_all_gather_and_maybe_unpad_impl(torch.empty(1, 4))
 
 
 def test_rope_fake_uses_requested_output_dtype():

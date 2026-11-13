@@ -13,6 +13,7 @@ from vllm_ascend.ops import register_custom_ops as custom_ops
 from vllm_ascend.ops.fused_moe import moe_comm_method, token_dispatcher
 from vllm_ascend.ops.fused_moe.dataclass import moe_mlp
 from vllm_ascend.ops.fused_moe.dataclass.fused_experts import build_fused_experts_input
+from vllm_ascend.ops.fused_moe.dataclass.prepare_finalize import MoEPrepareOutput
 
 
 def quantize(x, dst_type=torch.int8):
@@ -203,12 +204,13 @@ def test_v41_draft_scatter_returns_local_rows_even_with_multimodal_wrapper(monke
         ([3] * 8 + [0] * 8, [1] * 8 + [0] * 8, 12),
     ],
 )
-def test_ep_prepare_and_finalize_trim_physical_rows_to_the_input_shard(monkeypatch, physical, actual, rank):
+@pytest.mark.parametrize("compact", [False, True])
+def test_ep_prepare_and_finalize_trim_physical_rows_to_the_input_shard(monkeypatch, physical, actual, rank, compact):
     width = max(physical)
     parts = [torch.arange(n, dtype=torch.float32).view(-1, 1) + (r + 1) * 10 for r, n in enumerate(actual)]
     wire = torch.stack([torch.nn.functional.pad(rows, (0, 0, 0, width - len(rows))) for rows in parts])
     metadata = SimpleNamespace(get_chunk_sizes_across_dp_rank=lambda: physical)
-    context = SimpleNamespace(dp_metadata=metadata)
+    context = SimpleNamespace(dp_metadata=metadata, ep_actual_local_sizes=actual if compact else None)
     group = SimpleNamespace(world_size=16, rank_in_group=rank)
 
     def all_gather(x, dim):
@@ -233,13 +235,45 @@ def test_ep_prepare_and_finalize_trim_physical_rows_to_the_input_shard(monkeypat
     stage.moe_config = SimpleNamespace(is_sequence_parallel=True, pcp_size=1)
     prepared = stage.prepare(parts[rank], parts[rank])
     assert prepared.padded_hidden_states_shape == parts[rank].shape
-    packed = torch.cat([wire[r, :size] for r, size in enumerate(physical)])
+    packed = torch.cat([wire[r, :size] for r, size in enumerate(actual if compact else physical)])
     torch.testing.assert_close(prepared.hidden_states, packed)
     result = stage.finalize(prepared.hidden_states, True, prepared.padded_hidden_states_shape)
     torch.testing.assert_close(result, parts[rank] * 16)
     oversized = torch.zeros(physical[rank] + 1, 1)
     with pytest.raises(ValueError, match="exceed"):
         stage.prepare(oversized, oversized)
+
+
+@pytest.mark.parametrize(
+    "mode,draft,profile", [("NONE", False, False), ("FULL", False, False), ("NONE", True, False), ("NONE", False, True)]
+)
+def test_actual_ep_layout_is_only_installed_for_target_eager(monkeypatch, mode, draft, profile):
+    context = SimpleNamespace(
+        dp_metadata=SimpleNamespace(get_chunk_sizes_across_dp_rank=lambda: [8] * 16),
+        num_actual_tokens_across_dp=torch.tensor([5, 0, 32, 9]),
+        ep_actual_local_sizes=None,
+        cudagraph_runtime_mode=getattr(fused.CUDAGraphMode, mode),
+        is_draft_model=draft,
+        in_profile_run=profile,
+    )
+    monkeypatch.setattr(fused, "get_forward_context", lambda: context)
+    monkeypatch.setattr(fused, "get_ep_group", lambda: SimpleNamespace(world_size=16, rank_in_group=0))
+    monkeypatch.setattr(fused, "get_tensor_model_parallel_world_size", lambda: 4)
+    prepared = MoEPrepareOutput(
+        hidden_states=torch.zeros(2, 1),
+        router_logits=torch.zeros(2, 1),
+        mc2_mask=None,
+        padded_hidden_states_shape=None,
+        pertoken_scale=None,
+    )
+    monkeypatch.setattr(fused.PrepareAndFinalizeWithAllGather, "_prepare_with_ep_group", lambda *args: prepared)
+    stage = object.__new__(fused.DeepseekV41PrepareAndFinalize)
+    stage._prepare_with_ep_group(torch.zeros(2, 1), torch.zeros(2, 1))
+    expected = [2] * 4 + [0] * 4 + [8] * 4 + [3] * 4 if mode == "NONE" and not draft and not profile else None
+    assert context.ep_actual_local_sizes == expected
+    if expected is not None:
+        with pytest.raises(ValueError, match="disagree"):
+            stage._prepare_with_ep_group(torch.zeros(3, 1), torch.zeros(3, 1))
 
 
 @pytest.mark.parametrize("full", [False, True])
@@ -385,7 +419,9 @@ def test_w8a8_grouped_capture_replay_on_npu(monkeypatch, top_k, chunked):
         assert torch.count_nonzero(observed.cpu()) == 0
 
 
-@pytest.mark.parametrize("rows,placement", [(8192, "balanced"), (4097, "local"), (4097, "remote")])
+@pytest.mark.parametrize(
+    "rows,placement", [(8192, "balanced"), (4097, "local"), (4097, "remote"), (8652, "compact"), (16648, "compact")]
+)
 def test_prefill_chain_and_batch_match_original_target_width_on_npu(monkeypatch, rows, placement):
     if not torch.npu.is_available():
         pytest.skip("Ascend NPU is required")
@@ -438,11 +474,35 @@ def test_prefill_chain_and_batch_match_original_target_width_on_npu(monkeypatch,
         quant_type=fused.QuantType.W8A8,
     )
     del w1, w2
+    reference_inputs, kept_rows = inputs, None
+    if placement == "compact":
+        sizes = [41] * 8 + [2040] * 4 + [41] * 4 if rows == 8652 else ([41] * 4 + [2040] * 4) * 2
+        kept_rows = torch.cat([torch.arange(n) + rank * 2040 for rank, n in enumerate(sizes)]).npu()
+        padded_states = quantized.new_zeros((32640, hidden))
+        padded_states[kept_rows] = quantized
+        padded_scale = token_scale.new_zeros((32640,))
+        padded_scale[kept_rows] = token_scale
+        padded_ids = torch.arange(top_k, dtype=ids.dtype, device=ids.device).expand(32640, -1).clone()
+        padded_ids[kept_rows] = ids
+        padded_weights = route.new_ones((32640, top_k))
+        padded_weights[kept_rows] = route
+        reference_inputs = replace(
+            inputs,
+            hidden_states=padded_states,
+            topk_ids=padded_ids,
+            topk_weights=padded_weights,
+            routing=replace(inputs.routing, pertoken_scale=padded_scale),
+        )
     with torch.inference_mode():
         with monkeypatch.context() as reference:
             reference.setattr(fused, "prefill_fusion_available", lambda states: False)
-            old = comm.fused_experts(inputs)
-            expected, counts = old.routed_out.cpu(), old.expert_tokens.cpu()
+            old = comm.fused_experts(reference_inputs)
+            expected = (old.routed_out if kept_rows is None else old.routed_out[kept_rows]).cpu()
+            counts = (
+                old.expert_tokens.cpu()
+                if kept_rows is None
+                else torch.bincount(ids.cpu().flatten().long(), minlength=experts)[:local]
+            )
             del old
         torch.npu.synchronize()
         torch.npu.reset_peak_memory_stats()

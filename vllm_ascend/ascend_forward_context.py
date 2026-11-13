@@ -112,6 +112,7 @@ def set_ascend_forward_context(
     device_metadata_executor=None,
     has_sinks=False,
     eplb_heat_collection_status: bool = False,
+    num_actual_tokens_across_dp: torch.Tensor | None = None,
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
@@ -137,6 +138,8 @@ def set_ascend_forward_context(
         forward_context = get_forward_context()
         forward_context.draft_attn_metadatas = draft_attn_metadatas
         forward_context.device_metadata_executor = device_metadata_executor
+        forward_context.num_actual_tokens_across_dp = num_actual_tokens_across_dp
+        forward_context.ep_actual_local_sizes = None
 
         from vllm_ascend.ops.fused_moe.moe_comm_method import get_moe_comm_method
 

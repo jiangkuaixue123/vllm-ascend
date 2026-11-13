@@ -726,6 +726,7 @@ class NPUModelRunner(GPUModelRunner):
         is_draft_model: bool = False,
         cudagraph_mode: CUDAGraphMode = CUDAGraphMode.NONE,
         allow_dp_padding: bool = False,
+        num_actual_tokens: int | None = None,
     ) -> tuple[int, torch.Tensor | None, CUDAGraphMode]:
         # TODO: In vLLM, the only thing that needs to be synced is num_tokens, but in
         # our case, we still need to sync the other two flags as well. So we need to
@@ -733,6 +734,7 @@ class NPUModelRunner(GPUModelRunner):
         # even if we are running in eager mode, which harms performance.
         # FIXME: Restore the `or self.vllm_config.model_config.enforce_eager` here
         # immediately once the other two flags are no longer needed.
+        self._num_actual_tokens_across_dp = None
         if self.dp_size == 1:
             return num_tokens, None, cudagraph_mode
 
@@ -740,10 +742,18 @@ class NPUModelRunner(GPUModelRunner):
             num_tokens_after_padding = torch.tensor([num_tokens] * self.dp_size, device="cpu", dtype=torch.int32)
             return num_tokens, num_tokens_after_padding, cudagraph_mode
 
-        packed_tensor = torch.zeros(2, self.dp_size, device="cpu", dtype=torch.int32)
+        packed_tensor = torch.zeros(
+            3 if num_actual_tokens is not None else 2, self.dp_size, device="cpu", dtype=torch.int32
+        )
         packed_tensor[0][self.dp_rank] = num_tokens
         packed_tensor[1][self.dp_rank] = cudagraph_mode.value
+        if num_actual_tokens is not None:
+            packed_tensor[2][self.dp_rank] = num_actual_tokens
         dist.all_reduce(packed_tensor, group=get_dp_group().cpu_group)
+        if num_actual_tokens is not None:
+            # Keep model rows separate from graph/communication capacity in the
+            # existing CPU collective; never synchronize sizes per expert layer.
+            self._num_actual_tokens_across_dp = packed_tensor[2]
 
         # Unpack the results
         num_tokens_across_dp = packed_tensor[0, :]
@@ -2391,6 +2401,7 @@ class NPUModelRunner(GPUModelRunner):
                 aclgraph_runtime_mode=cudagraph_mode,
                 batch_descriptor=batch_desc,
                 num_actual_tokens=scheduler_output.total_num_scheduled_tokens,
+                num_actual_tokens_across_dp=self._num_actual_tokens_across_dp,
                 model_instance=self.model,
                 device_metadata_executor=active_device_metadata_executor,
                 skip_compiled=has_encoder_input,
@@ -3209,9 +3220,11 @@ class NPUModelRunner(GPUModelRunner):
         # Extra coordination when running data-parallel since we need to coordinate
         # across ranks
         should_ubatch, num_tokens_across_dp = False, None
+        self._num_actual_tokens_across_dp = None
         if self.vllm_config.parallel_config.data_parallel_size > 1:
             _, num_tokens_across_dp, synced_cudagraph_mode = self._sync_metadata_across_dp(
                 num_tokens=num_tokens_padded,
+                num_actual_tokens=num_tokens,
                 cudagraph_mode=cudagraph_mode,
                 allow_dp_padding=((cudagraph_mode != CUDAGraphMode.NONE)
                                   or enable_sp(self.vllm_config)
@@ -3942,6 +3955,7 @@ class NPUModelRunner(GPUModelRunner):
                 num_tokens_across_dp=num_tokens_across_dp,
                 in_profile_run=is_profile,
                 num_actual_tokens=num_tokens_padded,
+                num_actual_tokens_across_dp=self._num_actual_tokens_across_dp,
                 aclgraph_runtime_mode=cudagraph_runtime_mode,
                 batch_descriptor=batch_desc,
                 model_instance=self.model,

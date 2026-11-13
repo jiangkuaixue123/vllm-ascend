@@ -99,7 +99,7 @@ def test_prefill_combine_masks_padding_and_preserves_native_nonfinite_order(top_
             assert_exact(output, expected())
 
 
-@pytest.mark.parametrize("rows,top_k", [(1, 6), (129, 3), (2048, 6)])
+@pytest.mark.parametrize("rows,top_k", [(1, 6), (129, 3), (264, 6), (460, 6), (2048, 6)])
 def test_prefill_combine_keeps_fp32_slot_accumulation(rows, top_k):
     if not torch.npu.is_available():
         pytest.skip("requires Ascend NPU")

@@ -3,9 +3,12 @@
 """One A3 vector pass over complete BF16 groups for V4.1 window/output E4M3 QDQ."""
 
 import torch
+import torch_npu
+from vllm import envs
 from vllm.triton_utils import tl, triton
 
 from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num, init_device_properties_triton
+from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
 _QUALIFIED_VECTOR_CORES = 48
 _GROUP_SIZE = 32
@@ -61,4 +64,49 @@ def decode_fp8_qdq(x: torch.Tensor, inplace: bool):
     if inplace:
         # A raw Triton store bypasses the version change made by Tensor.copy_.
         torch.autograd.graph.increment_version(x)
+    return out
+
+
+@triton.jit
+def _pack_prefill(x, out, rows, total_groups, ROW_GROUPS: tl.constexpr, TP: tl.constexpr, G: tl.constexpr):
+    for tile in range(tl.program_id(0), tl.cdiv(total_groups, G), tl.num_programs(0)):
+        group = tile * G + tl.arange(0, G)
+        rank = group // (rows * ROW_GROUPS)
+        within = group % (rows * ROW_GROUPS)
+        source = (within // ROW_GROUPS) * (TP * ROW_GROUPS) + rank * ROW_GROUPS + within % ROW_GROUPS
+        cols = tl.arange(0, 32)[None, :]
+        values = tl.load(x + source[:, None] * 32 + cols, group[:, None] < total_groups, other=0)
+        tl.store(out + group[:, None] * 32 + cols, _bias_qdq(values), group[:, None] < total_groups)
+
+
+def pack_prefill_projection_input(x: torch.Tensor, tp: int):
+    """Quantize complete per-head groups while writing the BF16 all-to-all send layout."""
+    if (
+        x.device.type != "npu"
+        or x.dtype != torch.bfloat16
+        or x.layout != torch.strided
+        or x.ndim != 3
+        or x.shape[0] <= 256
+        or x.shape[1:] != (64, 512)
+        or tp not in (4, 8)
+        or not x.is_contiguous()
+        or x.is_neg()
+        or x.requires_grad
+        or not torch.is_inference_mode_enabled()
+        or torch.compiler.is_compiling()
+        or envs.VLLM_BATCH_INVARIANT
+        or x.storage_offset() % _GROUP_SIZE
+        or get_ascend_device_type() != AscendDeviceType.A3
+        or int(torch_npu.get_npu_format(x)) != int(torch_npu.Format.ND)
+    ):
+        return None
+    init_device_properties_triton()
+    cores = get_vectorcore_num()
+    if cores != _QUALIFIED_VECTOR_CORES:
+        return None
+    rows, heads, width = x.shape
+    out = torch.empty((tp * rows, heads // tp, width), dtype=x.dtype, device=x.device)
+    _pack_prefill[(cores,)](
+        x, out, rows, x.numel() // _GROUP_SIZE, ROW_GROUPS=heads // tp * width // _GROUP_SIZE, TP=tp, G=64
+    )
     return out

@@ -7,7 +7,7 @@ from dataclasses import dataclass, replace
 import torch
 import torch_npu
 from vllm.config.compilation import CUDAGraphMode
-from vllm.distributed import get_ep_group
+from vllm.distributed import get_ep_group, get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import logger
 
@@ -110,12 +110,29 @@ class DeepseekV41PrepareAndFinalize(PrepareAndFinalizeWithAllGather):
         local_shape = hidden_states.shape
         if router_logits.shape[0] != local_shape[0]:
             raise ValueError("V4.1 router and expert inputs must have the same number of token rows")
-        metadata = get_forward_context().dp_metadata
+        context = get_forward_context()
+        metadata = context.dp_metadata
         if metadata is not None:
             group = get_ep_group()
             sizes = metadata.get_chunk_sizes_across_dp_rank()
             if sizes is None or len(sizes) != group.world_size or local_shape[0] > sizes[group.rank_in_group]:
                 raise ValueError("V4.1 local tokens exceed the EP gather layout")
+            actual_sizes = getattr(context, "ep_actual_local_sizes", None)
+            counts = getattr(context, "num_actual_tokens_across_dp", None)
+            if (
+                actual_sizes is None
+                and counts is not None
+                and context.cudagraph_runtime_mode == CUDAGraphMode.NONE
+                and not context.is_draft_model
+                and not context.in_profile_run
+            ):
+                tp_size = get_tensor_model_parallel_world_size()
+                if counts.numel() * tp_size != group.world_size:
+                    raise ValueError("V4.1 DP token counts do not cover the EP group")
+                actual_sizes = [(n + tp_size - 1) // tp_size for n in counts.tolist() for _ in range(tp_size)]
+                context.ep_actual_local_sizes = actual_sizes
+            if actual_sizes is not None and local_shape[0] != actual_sizes[group.rank_in_group]:
+                raise ValueError("V4.1 local tokens disagree with the actual EP gather layout")
             if not local_shape[0] and max(sizes) > 0:
                 # Participate on an idle DP without invoking dynamic quant on
                 # an empty tensor. Gather padding is discarded after scatter.

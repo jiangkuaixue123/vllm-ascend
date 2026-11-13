@@ -11,6 +11,7 @@ from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
 _ROWS = 8
 _COLS = 256
+_COMBINE_COLS = 2048
 
 
 def prefill_fusion_available(states):
@@ -30,10 +31,8 @@ def prefill_fusion_available(states):
 if HAS_TRITON and not envs.VLLM_BATCH_INVARIANT:
     from vllm.triton_utils import tl, triton
 
-    @triton.jit
-    def _prefill_gate(
-        x, gate, M: tl.constexpr, INTERMEDIATE: tl.constexpr, LIMIT: tl.constexpr, R: tl.constexpr, C: tl.constexpr
-    ):
+    @triton.jit(do_not_specialize=["M"])
+    def _prefill_gate(x, gate, M, INTERMEDIATE: tl.constexpr, LIMIT: tl.constexpr, R: tl.constexpr, C: tl.constexpr):
         rows = tl.program_id(0) * R + tl.arange(0, R)
         cols = tl.program_id(1) * C + tl.arange(0, C)
         valid = (rows[:, None] < M) & (cols[None, :] < INTERMEDIATE)
@@ -42,13 +41,13 @@ if HAS_TRITON and not envs.VLLM_BATCH_INVARIANT:
             value = tl.where(value > LIMIT, LIMIT, value)
         tl.store(gate + rows[:, None] * INTERMEDIATE + cols[None, :], value, valid)
 
-    @triton.jit
+    @triton.jit(do_not_specialize=["M"])
     def _prefill_route(
         x,
         silu,
         factor,
         output,
-        M: tl.constexpr,
+        M,
         INTERMEDIATE: tl.constexpr,
         LIMIT: tl.constexpr,
         R: tl.constexpr,
@@ -68,43 +67,42 @@ if HAS_TRITON and not envs.VLLM_BATCH_INVARIANT:
         value = (activated * up) * scale[:, None]
         tl.store(output + offsets, value.to(tl.bfloat16), valid)
 
-    @triton.jit
+    @triton.jit(do_not_specialize=["M", "EXPANDED"])
     def _prefill_combine(
         x,
         factor,
         row_ids,
         owned,
         output,
-        M: tl.constexpr,
-        EXPANDED: tl.constexpr,
+        M,
+        EXPANDED,
         H: tl.constexpr,
         K: tl.constexpr,
-        R: tl.constexpr,
         C: tl.constexpr,
     ):
-        rows = tl.program_id(0) * R + tl.arange(0, R)
+        row = tl.program_id(0)
         cols = tl.program_id(1) * C + tl.arange(0, C)
-        valid = (rows[:, None] < M) & (cols[None, :] < H)
-        total = tl.full((R, C), 0, tl.float32)
+        valid = (row < M) & (cols < H)
+        total = tl.full((C,), 0, tl.float32)
         for slot in tl.static_range(K):
-            pair = rows * K + slot
-            index = tl.abs(tl.load(row_ids + pair, rows < M, 0))
-            in_range = (rows < M) & (index >= 0) & (index < EXPANDED)
-            scale = tl.load(factor + index, in_range, 0)
-            weight = tl.load(owned + pair, rows < M, 0)
+            pair = row * K + slot
+            index = tl.abs(tl.load(row_ids + pair, row < M, 0))
+            in_range = (row < M) & (index >= 0) & (index < EXPANDED)
+            weight = tl.load(owned + pair, row < M, 0)
             active = in_range & (weight != 0)
+            scale = tl.load(factor + index, active, 0)
             value = tl.load(
-                x + index[:, None] * H + cols[None, :],
-                valid & active[:, None] & (scale[:, None] != 0),
+                x + index * H + cols,
+                valid & active & (scale != 0),
                 0,
             ).to(tl.float32)
-            value = value * weight[:, None]
+            value = value * weight
             # Native unpermute skips zero weights, including NaN loads and additions.
             if slot == 0:
-                total = tl.where(active[:, None], value, 0.0)
+                total = tl.where(active, value, 0.0)
             else:
-                total = tl.where(active[:, None], total + value, total)
-        tl.store(output + rows[:, None] * H + cols[None, :], total, valid)
+                total = tl.where(active, total + value, total)
+        tl.store(output + row * H + cols, total, valid)
 
     def prefill_route_activation(gate_up, factor, limit):
         rows, width = gate_up.shape
@@ -137,7 +135,7 @@ if HAS_TRITON and not envs.VLLM_BATCH_INVARIANT:
         output = torch.empty((rows, hidden), dtype=torch.float32, device=states.device)
         if rows == 0:
             return output
-        _prefill_combine[(triton.cdiv(rows, _ROWS), triton.cdiv(hidden, _COLS))](
+        _prefill_combine[(rows, triton.cdiv(hidden, _COMBINE_COLS))](
             states,
             factor,
             row_ids,
@@ -147,8 +145,7 @@ if HAS_TRITON and not envs.VLLM_BATCH_INVARIANT:
             EXPANDED=expanded,
             H=hidden,
             K=top_k,
-            R=_ROWS,
-            C=_COLS,
+            C=_COMBINE_COLS,
             enable_fp_fusion=False,
         )
         return output

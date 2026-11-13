@@ -204,3 +204,32 @@ def test_native_attention_on_npu(mode, heads):
         ids[1, 2, 0] = 4
     graph.replay()
     verify(output)
+
+
+@pytest.mark.parametrize("heads", [8, 64])
+@torch.inference_mode()
+def test_native_contiguous_slots_preserve_page_boundaries_and_order(heads):
+    if importlib.util.find_spec("torch_npu") is None:
+        pytest.skip("Requires Ascend A3")
+    importlib.import_module("torch_npu")
+    if not torch.npu.is_available():
+        pytest.skip("Requires Ascend A3")
+    q, kv, sink = [value.npu() for value in inputs(1, 3, 257, heads=heads)]
+    # Runs cross physical pages and coexist with duplicates, reverse order and holes.
+    ids = torch.arange(7, 135).expand(1, 3, -1).clone().npu()
+    ids[0, 1, :8] = torch.tensor([15, 16, 17, -1, 256, 0, 0, 3]).npu()
+    ids[0, 2] = -1
+    op = native.DeepseekV41NativeAttention()
+
+    def run():
+        return op(q, kv, sink, ids, 512**-0.5, mode="DSA slot run correctness")
+
+    run()
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph):
+        output = run()
+    for shift in (0, 16):
+        ids[0, 0] = torch.arange(7 + shift, 135 + shift, device=q.device)
+        graph.replay()
+        expected = sparse_attn(q.cpu(), kv.cpu(), sink.cpu(), ids.cpu(), 512**-0.5)
+        torch.testing.assert_close(output.float().cpu(), expected.float(), rtol=0.025, atol=0.02)

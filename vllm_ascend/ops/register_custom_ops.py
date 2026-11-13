@@ -14,8 +14,8 @@ from vllm_ascend.ops.triton.muls_add import muls_add_triton
 from vllm_ascend.utils import is_vl_model
 
 
-def _get_ep_local_sizes(dp_metadata, ep_group) -> list[int] | None:
-    """Return the SP token layout when the MoE runner installed it."""
+def _get_ep_token_layout(dp_metadata, ep_group) -> tuple[list[int], int] | None:
+    """Return useful SP rows and the unchanged equal-size collective capacity."""
     if dp_metadata is None:
         return None
 
@@ -26,7 +26,16 @@ def _get_ep_local_sizes(dp_metadata, ep_group) -> list[int] | None:
 
     if local_sizes is None or len(local_sizes) != ep_group.world_size:
         return None
-    return [int(size) for size in local_sizes]
+    local_sizes = [int(size) for size in local_sizes]
+    capacity = max(local_sizes)
+    actual_sizes = getattr(get_forward_context(), "ep_actual_local_sizes", None)
+    if actual_sizes is not None:
+        if len(actual_sizes) != len(local_sizes) or any(
+            actual < 0 or actual > padded for actual, padded in zip(actual_sizes, local_sizes)
+        ):
+            raise ValueError("Actual EP token layout exceeds communication capacity")
+        local_sizes = actual_sizes
+    return local_sizes, capacity
 
 
 def _pad_to_ep_local_size(x: torch.Tensor, max_local_size: int) -> torch.Tensor:
@@ -45,17 +54,17 @@ def _maybe_all_gather_and_maybe_unpad_impl(x: torch.Tensor) -> torch.Tensor:
     forward_context = get_forward_context()
     dp_metadata = forward_context.dp_metadata
     ep_group = get_ep_group()
-    local_sizes = _get_ep_local_sizes(dp_metadata, ep_group)
-    if local_sizes is not None:
-        max_local_size = max(local_sizes)
+    layout = _get_ep_token_layout(dp_metadata, ep_group)
+    if layout is not None:
+        local_sizes, max_local_size = layout
         # all_gather 要求各 rank 输入等长：先 pad 到 max_local_size，
         # gather 后再按各 rank 真实的 local_sizes 截回。
         x = _pad_to_ep_local_size(x, max_local_size)
     # need to unpad from ep size
     x = ep_group.all_gather(x, 0)
     if dp_metadata is not None:
-        if local_sizes is not None:
-            x = x.view(len(local_sizes), max(local_sizes), *x.shape[1:])
+        if layout is not None:
+            x = x.view(len(local_sizes), max_local_size, *x.shape[1:])
             x = torch.cat([x[idx, :size] for idx, size in enumerate(local_sizes)], dim=0)
         else:
             num_tokens_across_dp_cpu = dp_metadata.num_tokens_across_dp_cpu
@@ -88,9 +97,11 @@ def ep_pad_and_reduce_scatter(x: torch.Tensor, dp_metadata) -> torch.Tensor:
         return get_ep_group().reduce_scatter(x, 0)
 
     ep_group = get_ep_group()
-    local_sizes = _get_ep_local_sizes(dp_metadata, ep_group)
-    if local_sizes is not None:
-        max_local_size = max(local_sizes)
+    layout = _get_ep_token_layout(dp_metadata, ep_group)
+    if layout is not None:
+        local_sizes, max_local_size = layout
+        if x.shape[0] != sum(local_sizes):
+            raise ValueError("Expert output rows do not match the EP token layout")
         padded_x = x.new_zeros((len(local_sizes), max_local_size, *x.shape[1:]))
         offset = 0
         for idx, size in enumerate(local_sizes):
@@ -117,8 +128,9 @@ def ep_pad_and_reduce_scatter(x: torch.Tensor, dp_metadata) -> torch.Tensor:
 def _maybe_all_gather_and_maybe_unpad_fake(x: torch.Tensor) -> torch.Tensor:
     forward_context = get_forward_context()
     ep_group = get_ep_group()
-    local_sizes = _get_ep_local_sizes(forward_context.dp_metadata, ep_group)
-    if local_sizes is not None:
+    layout = _get_ep_token_layout(forward_context.dp_metadata, ep_group)
+    if layout is not None:
+        local_sizes, _ = layout
         return torch.empty((sum(local_sizes), *x.shape[1:]), device=x.device, dtype=x.dtype)
 
     return torch.empty((x.shape[0] * ep_group.world_size, *x.shape[1:]), device=x.device, dtype=x.dtype)
@@ -127,8 +139,9 @@ def _maybe_all_gather_and_maybe_unpad_fake(x: torch.Tensor) -> torch.Tensor:
 def _maybe_pad_and_reduce_fake(x: torch.Tensor) -> torch.Tensor:
     forward_context = get_forward_context()
     ep_group = get_ep_group()
-    local_sizes = _get_ep_local_sizes(forward_context.dp_metadata, ep_group)
-    if local_sizes is not None:
+    layout = _get_ep_token_layout(forward_context.dp_metadata, ep_group)
+    if layout is not None:
+        local_sizes, _ = layout
         return torch.empty(
             (local_sizes[ep_group.rank_in_group], *x.shape[1:]),
             device=x.device,

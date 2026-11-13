@@ -63,11 +63,13 @@ from .core import rms_norm
 from .native_attention import DeepseekV41NativeAttention
 
 if HAS_TRITON and not envs.VLLM_BATCH_INVARIANT:
+    from vllm_ascend.ops.triton.deepseek_v41_fp8_qdq import pack_prefill_projection_input
     from vllm_ascend.ops.triton.deepseek_v41_paged_index_score import paged_index_scores, supports_paged_index_scores
     from vllm_ascend.ops.triton.deepseek_v41_paged_read import read_strided_cache_field
     from vllm_ascend.ops.triton.deepseek_v41_selected_kv import try_prepare_selected_kv
     from vllm_ascend.ops.triton.deepseek_v41_slot_arena import stage as stage_decode_arena
 else:
+    pack_prefill_projection_input = None
     paged_index_scores = None
     read_strided_cache_field = None
     try_prepare_selected_kv = None
@@ -1455,15 +1457,20 @@ class DeepseekV41Attention(nn.Module):
         return self._project_output(output, hidden_states.dtype)
 
     def _project_output(self, output, dtype):
+        quantized = False
         if self.dsa_cp:
             # Exchange local tokens and complete heads for complete tokens and
             # local heads. Each receiver owns the matching wo_a / wo_b slice.
-            send = output.reshape(-1, self.tp, self.local_heads, self.dim).transpose(0, 1).contiguous()
-            send = send.reshape(-1, self.local_heads, self.dim)
+            send = pack_prefill_projection_input(output, self.tp) if pack_prefill_projection_input is not None else None
+            quantized = send is not None
+            if send is None:
+                send = output.reshape(-1, self.tp, self.local_heads, self.dim).transpose(0, 1).contiguous()
+                send = send.reshape(-1, self.local_heads, self.dim)
             output = torch.empty_like(send)
             dist.all_to_all_single(output, send, group=self.sequence_group.device_group)
         output = output.view(-1, self.groups, self.local_heads * self.dim // self.groups)
-        output = _quantize_projection_input(output)
+        if not quantized:
+            output = _quantize_projection_input(output)
         projection = self.wo_a.weight.view(self.groups, self.config.o_lora_rank, -1)
         output = torch.einsum("sgd,grd->sgr", output, projection).flatten(1)
         if self.sequence_group is not None:

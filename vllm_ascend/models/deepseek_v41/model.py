@@ -608,6 +608,13 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsMultiModal):
         ):
             return self._forward_decode(input_ids, metadata)
         actual_tokens = metadata.num_actual_tokens if metadata else input_ids.numel()
+        if metadata is None and self.sequence_parallel:
+            context = get_forward_context()
+            counts = getattr(context, "num_actual_tokens_across_dp", None)
+            if counts is not None and not context.in_profile_run:
+                # Eager idle-DP runs lack attention metadata. Their model input
+                # must follow the same valid-row layout as the active DP ranks.
+                actual_tokens = int(counts[get_dp_group().rank_in_group])
         runtime = DeepseekV41Runtime(metadata.requests if metadata else [RequestSpan(0, actual_tokens, actual_tokens)])
         ids = input_ids[:actual_tokens]
         image_mask = image_token_mask[:actual_tokens] if image_token_mask is not None else None

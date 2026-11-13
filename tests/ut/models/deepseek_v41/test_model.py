@@ -614,6 +614,30 @@ def test_sequence_parallel_hc_keeps_local_rows_and_gathers_only_unpadded_tokens(
     assert observed == [(3, model.config.hidden_size)]
 
 
+@pytest.mark.parametrize("profile", [False, True])
+@pytest.mark.parametrize("actual", [0, 1, 5])
+def test_eager_dummy_uses_synced_model_rows_and_restores_runner_capacity(
+    paged_hash_model, monkeypatch, profile, actual
+):
+    model = paged_hash_model
+    model.sequence_parallel = True
+    model.layers[0].attn.cache.metadata = lambda: None
+    context = SimpleNamespace(num_actual_tokens_across_dp=torch.tensor([actual, 8160]), in_profile_run=profile)
+    monkeypatch.setattr(model_module, "get_forward_context", lambda: context)
+    monkeypatch.setattr(model_module, "get_dp_group", lambda: SimpleNamespace(rank_in_group=0))
+    monkeypatch.setattr(model, "_hash_tokens", lambda *args: None)
+    monkeypatch.setattr(model, "_start_hc", lambda x: (x, None))
+    monkeypatch.setattr(model, "_finish_hc", lambda x, mix, rows: x[:rows])
+    inputs = torch.ones(8160, dtype=torch.int64)
+    output = model(inputs, torch.arange(8160))
+    assert model.layers[0].local_token_counts == [8160 if profile else actual]
+    assert output.shape == (8160, model.config.hidden_size)
+    if profile or actual:
+        torch.testing.assert_close(output[0], model.embed(inputs[:1])[0])
+    if not profile:
+        assert torch.count_nonzero(output[actual:]) == 0
+
+
 def test_dspark_graph_buckets_and_aux_layer_input(paged_hash_model):
     config = SimpleNamespace(
         cudagraph_mode=model_module.CUDAGraphMode.FULL_DECODE_ONLY, cudagraph_capture_sizes=[24, 48]
