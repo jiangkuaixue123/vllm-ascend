@@ -34,6 +34,7 @@ from vllm_ascend.ops.fused_moe.token_dispatcher import TokenDispatcherWithAllGat
 from vllm_ascend.ops.register_custom_ops import ep_pad_and_reduce_scatter
 from vllm_ascend.ops.triton.deepseek_v41_prefill_experts import (
     prefill_combine_output,
+    prefill_dispatched_scales,
     prefill_fusion_available,
     prefill_route_activation,
 )
@@ -71,21 +72,21 @@ class DeepseekV41Dispatcher(TokenDispatcherWithAllGather):
         meta = output.combine_metadata
         expert_map = token_dispatch_input.routing.expert_map
         ids = token_dispatch_input.topk_ids
-        owned = torch.ones_like(ids, dtype=torch.bool) if expert_map is None else expert_map[ids.long()] >= 0
-        scales = dispatched_scales(
-            meta.expanded_row_idx,
-            token_dispatch_input.topk_weights,
-            owned,
-            output.hidden_states.shape[0],
-        )
         if prefill_fusion_available(output.hidden_states):
+            scales, owned = prefill_dispatched_scales(
+                meta.expanded_row_idx, token_dispatch_input.topk_weights, ids, expert_map, output.hidden_states.shape[0]
+            )
             meta = DeepseekV41PrefillCombineMetadata(
-                topk_weights=owned.float(),
+                topk_weights=owned,
                 expanded_row_idx=meta.expanded_row_idx,
                 restore_shape=meta.restore_shape,
                 route_scales=scales,
             )
         else:
+            owned = torch.ones_like(ids, dtype=torch.bool) if expert_map is None else expert_map[ids.long()] >= 0
+            scales = dispatched_scales(
+                meta.expanded_row_idx, token_dispatch_input.topk_weights, owned, output.hidden_states.shape[0]
+            )
             meta = replace(meta, topk_weights=owned.float())
         return replace(output, topk_scales=scales, combine_metadata=meta)
 

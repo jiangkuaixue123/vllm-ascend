@@ -141,3 +141,25 @@ def test_hc_small_and_cpu_fallback():
         pre = torch.ones(rows, 4, device=device)
         assert hc_prefill_prepare(x, pre) is None
         assert hc_prefill_post(x[:, 0].contiguous(), x, pre, torch.ones(rows, 4, 4, device=device)) is None
+
+
+@pytest.mark.parametrize("rows", [127, 128, 257, 2040])
+@torch.inference_mode()
+def test_batched_sinkhorn_matches_single_matrix_and_graph(rows):
+    from vllm_ascend.ops.triton.hc_sinkhorn import _sinkhorn4_kernel, hc_sinkhorn4
+
+    logits = torch.randn(rows, 4, 4, dtype=torch.float32, device="npu") * 30
+    reference = torch.empty_like(logits)
+
+    def check(actual):
+        _sinkhorn4_kernel[(rows,)](logits, reference, EPS=1e-6)
+        exact(actual, reference)
+
+    check(hc_sinkhorn4(logits))
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph):
+        actual = hc_sinkhorn4(logits)
+    for step in range(4):
+        logits.copy_(torch.randn_like(logits) * (step + 1) * 20)
+        graph.replay()
+        check(actual)

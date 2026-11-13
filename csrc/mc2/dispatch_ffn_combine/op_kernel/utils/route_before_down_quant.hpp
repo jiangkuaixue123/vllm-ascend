@@ -23,6 +23,10 @@ __aicore__ inline float QuantizeRouteBeforeDown(
     constexpr uint32_t SCALE_BLOCK_ELEMENTS = 8;
     constexpr float QUANT_MAX = 127.0f;
     constexpr float DEQUANT_FACTOR = 1.0f / QUANT_MAX;
+    constexpr uint32_t VECTOR_LANES = 64;
+    constexpr uint32_t MAX_VECTOR_REPEATS = 255;
+    const bool blockBroadcast = count >= VECTOR_LANES && count % VECTOR_LANES == 0 &&
+        count / VECTOR_LANES <= MAX_VECTOR_REPEATS;
 
     AscendC::SetFlag<AscendC::HardEvent::V_S>(EVENT_ID0);
     AscendC::WaitFlag<AscendC::HardEvent::V_S>(EVENT_ID0);
@@ -33,19 +37,26 @@ __aicore__ inline float QuantizeRouteBeforeDown(
         // Do not form 127/0 or 0*inf. Preserve the vendor's zero scale.
         AscendC::Duplicate(scratch, 0.0f, count);
     } else {
-        AscendC::Duplicate(scratch, maxAbs, count);
+        AscendC::Duplicate(scratch, maxAbs, blockBroadcast ? SCALE_BLOCK_ELEMENTS : count);
         AscendC::Duplicate(maxAndScale, QUANT_MAX, SCALE_BLOCK_ELEMENTS);
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::Div(maxAndScale, maxAndScale, scratch, SCALE_BLOCK_ELEMENTS);
         AscendC::PipeBarrier<PIPE_V>();
-        AscendC::SetFlag<AscendC::HardEvent::V_S>(EVENT_ID0);
-        AscendC::WaitFlag<AscendC::HardEvent::V_S>(EVENT_ID0);
-        const float reciprocal = maxAndScale.GetValue(0);
-        AscendC::SetFlag<AscendC::HardEvent::S_V>(EVENT_ID0);
-        AscendC::WaitFlag<AscendC::HardEvent::S_V>(EVENT_ID0);
-        AscendC::Duplicate(scratch, reciprocal, count);
-        AscendC::PipeBarrier<PIPE_V>();
-        AscendC::Mul(scratch, input, scratch, count);
+        if (blockBroadcast) {
+            // All eight reciprocal lanes are equal; reuse their UB block in each repeat.
+            const AscendC::BinaryRepeatParams broadcast{1, 1, 0, 8, 8, 0};
+            AscendC::Mul(scratch, input, maxAndScale, static_cast<uint64_t>(VECTOR_LANES),
+                static_cast<uint8_t>(count / VECTOR_LANES), broadcast);
+        } else {
+            AscendC::SetFlag<AscendC::HardEvent::V_S>(EVENT_ID0);
+            AscendC::WaitFlag<AscendC::HardEvent::V_S>(EVENT_ID0);
+            const float reciprocal = maxAndScale.GetValue(0);
+            AscendC::SetFlag<AscendC::HardEvent::S_V>(EVENT_ID0);
+            AscendC::WaitFlag<AscendC::HardEvent::S_V>(EVENT_ID0);
+            AscendC::Duplicate(scratch, reciprocal, count);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Mul(scratch, input, scratch, count);
+        }
     }
     AscendC::PipeBarrier<PIPE_V>();
 

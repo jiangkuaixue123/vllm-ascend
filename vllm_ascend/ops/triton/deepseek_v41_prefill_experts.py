@@ -36,6 +36,60 @@ if HAS_TRITON and not envs.VLLM_BATCH_INVARIANT:
         init_device_properties_triton,
     )
 
+    @triton.jit(do_not_specialize=["N", "EXPANDED"])
+    def _prefill_route_metadata(
+        row_ids,
+        weights,
+        ids,
+        expert_map,
+        indices,
+        values,
+        owned,
+        N,
+        EXPANDED,
+        HAS_MAP: tl.constexpr,
+        B: tl.constexpr,
+    ):
+        pair = tl.program_id(0) * B + tl.arange(0, B)
+        valid = pair < N
+        local = tl.full((B,), True, tl.int1)
+        if HAS_MAP:
+            expert = tl.load(ids + pair, valid, 0)
+            local = tl.load(expert_map + expert, valid, -1) >= 0
+        row = tl.abs(tl.load(row_ids + pair, valid, 0))
+        row = tl.minimum(row, EXPANDED - 1)
+        index = tl.where(local, row, EXPANDED + pair)
+        weight = tl.load(weights + pair, valid, 0)
+        weight = tl.where(weight == 0, 0.0, weight)
+        tl.store(indices + pair, index, valid)
+        tl.store(values + pair, weight, valid)
+        tl.store(owned + pair, local.to(tl.float32), valid)
+
+    def prefill_dispatched_scales(row_ids, weights, ids, expert_map, num_rows):
+        """Native routing gives every local pair a unique expanded row."""
+        pairs = weights.numel()
+        result = weights.new_zeros(num_rows + pairs)
+        indices = torch.empty((pairs,), dtype=torch.int64, device=weights.device)
+        values = torch.empty((pairs,), dtype=torch.float32, device=weights.device)
+        owned = torch.empty_like(weights, dtype=torch.float32)
+        _prefill_route_metadata[(triton.cdiv(pairs, 256),)](
+            row_ids,
+            weights,
+            ids,
+            ids if expert_map is None else expert_map,
+            indices,
+            values,
+            owned,
+            N=pairs,
+            EXPANDED=num_rows,
+            HAS_MAP=expert_map is not None,
+            B=256,
+            enable_fp_fusion=False,
+        )
+        # Remote pairs write separate scratch rows, so native scatter needs no reduction.
+        result.scatter_(0, indices, values)
+        return result[:num_rows], owned
+
     @triton.jit
     def _live_rows(groups, M, G: tl.constexpr, GB: tl.constexpr):
         if G:
@@ -210,5 +264,6 @@ if HAS_TRITON and not envs.VLLM_BATCH_INVARIANT:
         return output
 
 else:
+    prefill_dispatched_scales = None
     prefill_route_activation = None
     prefill_combine_output = None
