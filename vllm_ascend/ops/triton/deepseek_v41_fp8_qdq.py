@@ -79,8 +79,7 @@ def _pack_prefill(x, out, rows, total_groups, ROW_GROUPS: tl.constexpr, TP: tl.c
         tl.store(out + group[:, None] * 32 + cols, _bias_qdq(values), group[:, None] < total_groups)
 
 
-def pack_prefill_projection_input(x: torch.Tensor, tp: int):
-    """Quantize complete per-head groups while writing the BF16 all-to-all send layout."""
+def supports_prefill_projection_input(x: torch.Tensor, tp: int):
     if (
         x.device.type != "npu"
         or x.dtype != torch.bfloat16
@@ -99,14 +98,72 @@ def pack_prefill_projection_input(x: torch.Tensor, tp: int):
         or get_ascend_device_type() != AscendDeviceType.A3
         or int(torch_npu.get_npu_format(x)) != int(torch_npu.Format.ND)
     ):
-        return None
+        return False
     init_device_properties_triton()
     cores = get_vectorcore_num()
-    if cores != _QUALIFIED_VECTOR_CORES:
+    return cores == _QUALIFIED_VECTOR_CORES
+
+
+def pack_prefill_projection_input(x: torch.Tensor, tp: int):
+    """Quantize complete per-head groups while writing the BF16 all-to-all send layout."""
+    if not supports_prefill_projection_input(x, tp):
         return None
     rows, heads, width = x.shape
     out = torch.empty((tp * rows, heads // tp, width), dtype=x.dtype, device=x.device)
-    _pack_prefill[(cores,)](
+    _pack_prefill[(_QUALIFIED_VECTOR_CORES,)](
         x, out, rows, x.numel() // _GROUP_SIZE, ROW_GROUPS=heads // tp * width // _GROUP_SIZE, TP=tp, G=64
     )
     return out
+
+
+@triton.jit(do_not_specialize=["rows", "total_rows", "start"])
+def _pack_rotated_prefill(
+    x, cosine, sine, out, rows, total_rows, start, ROW_GROUPS: tl.constexpr, TP: tl.constexpr, G: tl.constexpr
+):
+    rank = tl.program_id(1)
+    cols = tl.arange(0, 32)
+    for tile in range(tl.program_id(0), tl.cdiv(rows * ROW_GROUPS, G), tl.num_programs(0)):
+        row = tile // (ROW_GROUPS // G)
+        within = tile % (ROW_GROUPS // G) * G
+        source = (row * (TP * ROW_GROUPS) + rank * ROW_GROUPS + within) * 32
+        # Four complete heads share one phase load, without per-group GM gathers.
+        values = tl.load(x + source + tl.arange(0, G * 32)).reshape(G, 32)
+        phase = row * 64 + tl.arange(0, 64)
+        co = tl.load(cosine + phase).reshape(1, 1, 2, 32)
+        si = tl.load(sine + phase).reshape(1, 1, 2, 32)
+        co = tl.broadcast_to(co, (G // 16, 8, 2, 32)).reshape(G, 32)
+        si = tl.broadcast_to(si, (G // 16, 8, 2, 32)).reshape(G, 32)
+        rotary = tl.arange(0, G) % 16 >= 14
+        partner = tl.gather(values.to(tl.float32), tl.broadcast_to((cols ^ 1)[None, :], (G, 32)), axis=1)
+        cross = partner * si
+        cross = tl.where(cols[None, :] % 2 == 0, -cross, cross)
+        rotated = (values.to(tl.float32) * co + cross).to(tl.bfloat16)
+        values = tl.where(rotary[:, None], rotated, values)
+        # Whole tiles divide each row; expose the contiguous write to avoid a scalar scatter lock.
+        destination = ((rank * total_rows + start) * ROW_GROUPS + tile * G) * 32
+        tl.store(out + destination + tl.arange(0, G * 32), _bias_qdq(values).reshape(G * 32))
+
+
+def pack_rotated_prefill_output(x, positions, frequencies, out, start, tp):
+    """Write one request span directly into its final prequantized TP send rows."""
+    rows = x.shape[0]
+    total_rows = out.shape[0] // tp
+    if x.shape != (rows, 64, 512) or positions.shape != (rows,) or not 0 <= start <= total_rows - rows:
+        raise ValueError("Invalid prefill projection span")
+    # Keep the stock rotary phase shape and sine/cosine implementation.
+    phases = positions.float().unsqueeze(-1) * frequencies
+    phases = torch.stack((phases, phases), dim=-1).view(rows, 1, 1, 64)
+    cosine, sine = phases.cos(), -phases.sin()
+    _pack_rotated_prefill[(_QUALIFIED_VECTOR_CORES // tp, tp)](
+        x.contiguous(),
+        cosine,
+        sine,
+        out,
+        rows,
+        total_rows,
+        start,
+        ROW_GROUPS=64 // tp * 16,
+        TP=tp,
+        G=64,
+        enable_fp_fusion=False,
+    )

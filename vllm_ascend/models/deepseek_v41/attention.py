@@ -63,13 +63,18 @@ from .core import rms_norm
 from .native_attention import DeepseekV41NativeAttention
 
 if HAS_TRITON and not envs.VLLM_BATCH_INVARIANT:
-    from vllm_ascend.ops.triton.deepseek_v41_fp8_qdq import pack_prefill_projection_input
+    from vllm_ascend.ops.triton.deepseek_v41_fp8_qdq import (
+        pack_prefill_projection_input,
+        pack_rotated_prefill_output,
+        supports_prefill_projection_input,
+    )
     from vllm_ascend.ops.triton.deepseek_v41_paged_index_score import paged_index_scores, supports_paged_index_scores
     from vllm_ascend.ops.triton.deepseek_v41_paged_read import read_strided_cache_field
     from vllm_ascend.ops.triton.deepseek_v41_selected_kv import try_prepare_selected_kv
     from vllm_ascend.ops.triton.deepseek_v41_slot_arena import stage as stage_decode_arena
 else:
     pack_prefill_projection_input = None
+    supports_prefill_projection_input = None
     paged_index_scores = None
     read_strided_cache_field = None
     try_prepare_selected_kv = None
@@ -295,6 +300,69 @@ class DeepseekV41Backend(AttentionBackend):
 _MAX_DECODE_SCATTER_BYTES = 384 * 1024 * 1024
 
 
+def _supports_eager_field_io(page, slots, updates=None):
+    if not (
+        page.device.type == "npu"
+        and page.ndim == 2
+        and page.shape[0] > 0
+        and page.shape[1] in (128, 512)
+        and page.stride() == (1024, 1)
+        and page.dtype in (torch.bfloat16, torch.float32)
+        and not page.requires_grad
+        and not page.is_neg()
+        and not page.is_conj()
+        and page.numel() * page.element_size() <= _MAX_DECODE_SCATTER_BYTES
+        and slots.device == page.device
+        and slots.ndim == 1
+        and slots.dtype == torch.int64
+        and 0 < slots.numel() <= 8192
+        and slots.is_contiguous()
+        and not slots.is_neg()
+        and torch.is_inference_mode_enabled()
+        and not envs.VLLM_BATCH_INVARIANT
+        and not torch.compiler.is_compiling()
+        and get_ascend_device_type() == AscendDeviceType.A3
+        and enable_custom_op()
+        and hasattr(torch.ops._C_ascend, "npu_scatter_nd_update_v2")
+    ):
+        return False
+    column = page.storage_offset() % page.stride(0)
+    end = page.storage_offset() - column + page.shape[0] * page.stride(0)
+    if column + page.shape[1] > page.stride(0) or end > torch.iinfo(torch.int32).max:
+        return False
+    if end * page.element_size() > page.untyped_storage().nbytes():
+        return False
+    tensors = (page, slots)
+    if updates is not None:
+        if (
+            updates.shape != (slots.numel(), page.shape[1])
+            or updates.device != page.device
+            or updates.dtype != page.dtype
+            or updates.requires_grad
+            or not updates.is_contiguous()
+            or updates.is_neg()
+            or updates.is_conj()
+            or updates.untyped_storage().data_ptr() == page.untyped_storage().data_ptr()
+        ):
+            return False
+        tensors += (updates,)
+    from torch_npu import get_npu_format
+
+    return all(get_npu_format(t) == 2 for t in tensors)
+
+
+def _read_eager_field(page, slots):
+    # Gather complete requested rows before slicing, avoiding a full-cache field copy.
+    stride = page.stride(0)
+    column = page.storage_offset() % stride
+    physical = page.as_strided(
+        (page.shape[0], stride),
+        (stride, 1),
+        storage_offset=page.storage_offset() - column,
+    )
+    return physical[slots][:, column : column + page.shape[1]].contiguous()
+
+
 def _supports_decode_scatter(page, slots, updates, md, source_ratio):
     if not (
         page.device.type == "npu"
@@ -426,11 +494,18 @@ class DeepseekV41Cache(nn.Module, AttentionLayerBase):
 
     def read(self, metadata, request_idx, positions, bank, offset, width):
         slots = self.slots(metadata, request_idx, positions)
-        return self.field(bank, offset, width)[slots]
+        page = self.field(bank, offset, width)
+        if _supports_eager_field_io(page, slots):
+            return _read_eager_field(page, slots)
+        return page[slots]
 
     def write_slots(self, slots, values, bank, offset):
         page = self.field(bank, offset, values.shape[-1])
-        page.index_copy_(0, slots.long(), values.to(page.dtype))
+        slots, updates = slots.long(), values.to(page.dtype)
+        if _supports_eager_field_io(page, slots, updates):
+            _scatter_decode_field(page, slots, updates)
+        else:
+            page.index_copy_(0, slots, updates)
 
     def write(self, metadata, values, bank, offset):
         slots = metadata.slot_mapping[: values.shape[0]].long()
@@ -1387,7 +1462,19 @@ class DeepseekV41Attention(nn.Module):
         qr = self.q_norm(self.wq_a(queries_input)[0])
         queries = self.wq_b(qr)[0].view(-1, self.heads, self.dim)
         raw_kv = self.kv_norm(self.wkv(gathered)[0])
-        output = torch.zeros_like(queries)
+        packed = (
+            self.dsa_cp
+            and self.rope_dim == 64
+            and supports_prefill_projection_input is not None
+            and supports_prefill_projection_input(queries, self.tp)
+            and enable_custom_op()
+            and hasattr(torch.ops._C_ascend, "inplace_partial_rotary_mul")
+        )
+        output = (
+            queries.new_zeros((self.tp * queries.shape[0], self.local_heads, self.dim))
+            if packed
+            else torch.zeros_like(queries)
+        )
         for request_idx, request in enumerate(runtime.requests):
             begin, end = request.begin, request.end
             if begin == end:
@@ -1452,16 +1539,27 @@ class DeepseekV41Attention(nn.Module):
                 mode="DSA target indexed prefill" if self.ratio else "SWA target causal prefill",
                 swa_window=None if self.ratio else self.config.sliding_window,
             )[0]
-            self.rotate(attended.unsqueeze(0), positions, inverse=True)
-            output[rows] = attended
-        return self._project_output(output, hidden_states.dtype)
+            if packed:
+                pack_rotated_prefill_output(attended, positions, self.frequencies, output, rows.start, self.tp)
+            else:
+                self.rotate(attended.unsqueeze(0), positions, inverse=True)
+                output[rows] = attended
+        return self._project_output(output, hidden_states.dtype, prequantized=packed)
 
-    def _project_output(self, output, dtype):
-        quantized = False
+    def _project_output(self, output, dtype, prequantized=False):
+        quantized = prequantized
         if self.dsa_cp:
             # Exchange local tokens and complete heads for complete tokens and
             # local heads. Each receiver owns the matching wo_a / wo_b slice.
-            send = pack_prefill_projection_input(output, self.tp) if pack_prefill_projection_input is not None else None
+            send = (
+                output
+                if prequantized
+                else (
+                    pack_prefill_projection_input(output, self.tp)
+                    if pack_prefill_projection_input is not None
+                    else None
+                )
+            )
             quantized = send is not None
             if send is None:
                 send = output.reshape(-1, self.tp, self.local_heads, self.dim).transpose(0, 1).contiguous()

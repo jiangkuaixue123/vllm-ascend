@@ -47,6 +47,7 @@ def make_block(*, pending=True, capturing=True, result=True, fail=False, change_
     context = SimpleNamespace(capturing=capturing)
     env = {
         "hc_pre_delayed": native,
+        "hc_prefill_prepare": lambda *args: None,
         "hc_pre": lambda x, previous: "fallback_y",
         "get_forward_context": lambda: context,
         "torch": SimpleNamespace(npu=SimpleNamespace(matmul=options)),

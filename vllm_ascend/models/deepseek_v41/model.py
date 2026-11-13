@@ -39,6 +39,7 @@ from vllm.model_executor.models.utils import _merge_multimodal_embeddings
 
 from vllm_ascend.models.common.ops.hc_post import hc_post_fused
 from vllm_ascend.models.common.ops.hc_pre import hc_pre_delayed
+from vllm_ascend.models.common.ops.hc_prefill import hc_prefill_post, hc_prefill_prepare
 from vllm_ascend.models.common.ops.sequence_parallel import sp_all_gather, sp_shard
 from vllm_ascend.models.deepseek_v41.attention import (
     DeepseekV41Attention,
@@ -162,6 +163,12 @@ class DeepseekV41Block(nn.Module):
                 if record_witness:
                     self._record_hc_native_witness(hf32_before)
                 return outputs
+        else:
+            prepared = hc_prefill_prepare(x, previous_pre)
+            if prepared is not None:
+                mixed, states = prepared
+                next_pre, post, comb = self.mixes(states, name)
+                return mixed, next_pre, post, comb
         next_pre, post, comb = self.mixes(x, name)
         return hc_pre(x, previous_pre), next_pre, post, comb
 
@@ -196,6 +203,10 @@ class DeepseekV41Block(nn.Module):
                 if getattr(self, "_hc_post_fused_witness_pending", False):
                     logger.info("HC_POST_FUSED_RUNTIME pid=%s rows=%s", os.getpid(), residual.shape[0])
                     self._hc_post_fused_witness_pending = False
+                return output
+        else:
+            output = hc_prefill_post(sublayer_output, residual, post, comb)
+            if output is not None:
                 return output
         return hc_post(sublayer_output, residual, post, comb)
 

@@ -99,4 +99,7 @@ def test_projection_consumer_preserves_bf16_result(tp):
         with patch.object(attention, "pack_prefill_projection_input", None):
             expected = attention.DeepseekV41Attention._project_output(layer, x, x.dtype)
         actual = attention.DeepseekV41Attention._project_output(layer, x, x.dtype)
+        packed = pack_prefill_projection_input(x, tp)
+        direct = attention.DeepseekV41Attention._project_output(layer, packed, x.dtype, prequantized=True)
     assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
+    assert torch.equal(direct.view(torch.int16), expected.view(torch.int16))

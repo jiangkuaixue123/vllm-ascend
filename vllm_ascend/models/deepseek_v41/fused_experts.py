@@ -15,10 +15,21 @@ from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
 from vllm_ascend.models.deepseek_v41.core import clipped_swiglu
 from vllm_ascend.ops.fused_moe.dataclass.fused_experts import build_fused_experts_input
-from vllm_ascend.ops.fused_moe.dataclass.token_dispatcher import MoEAllGatherCombineMetadata
-from vllm_ascend.ops.fused_moe.moe_comm_method import AllGatherCommImpl, FusedExpertsResult, FusedMC2CommImpl
+from vllm_ascend.ops.fused_moe.dataclass.moe_mlp import build_mlp_compute_input
+from vllm_ascend.ops.fused_moe.dataclass.token_dispatcher import (
+    MoEAllGatherCombineMetadata,
+    build_token_dispatch_input,
+)
+from vllm_ascend.ops.fused_moe.moe_comm_method import (
+    AllGatherCommImpl,
+    FusedExpertsResult,
+    FusedMC2CommImpl,
+)
 from vllm_ascend.ops.fused_moe.prepare_finalize import PrepareAndFinalizeWithAllGather
-from vllm_ascend.ops.fused_moe.routed_experts import AscendRoutedExperts, AscendUnquantizedFusedMoEMethod
+from vllm_ascend.ops.fused_moe.routed_experts import (
+    AscendRoutedExperts,
+    AscendUnquantizedFusedMoEMethod,
+)
 from vllm_ascend.ops.fused_moe.token_dispatcher import TokenDispatcherWithAllGather
 from vllm_ascend.ops.register_custom_ops import ep_pad_and_reduce_scatter
 from vllm_ascend.ops.triton.deepseek_v41_prefill_experts import (
@@ -62,7 +73,10 @@ class DeepseekV41Dispatcher(TokenDispatcherWithAllGather):
         ids = token_dispatch_input.topk_ids
         owned = torch.ones_like(ids, dtype=torch.bool) if expert_map is None else expert_map[ids.long()] >= 0
         scales = dispatched_scales(
-            meta.expanded_row_idx, token_dispatch_input.topk_weights, owned, output.hidden_states.shape[0]
+            meta.expanded_row_idx,
+            token_dispatch_input.topk_weights,
+            owned,
+            output.hidden_states.shape[0],
         )
         if prefill_fusion_available(output.hidden_states):
             meta = DeepseekV41PrefillCombineMetadata(
@@ -75,16 +89,21 @@ class DeepseekV41Dispatcher(TokenDispatcherWithAllGather):
             meta = replace(meta, topk_weights=owned.float())
         return replace(output, topk_scales=scales, combine_metadata=meta)
 
-    def token_combine(self, hidden_states, combine_metadata, bias=None):
+    def token_combine(self, hidden_states, combine_metadata, bias=None, *, out=None):
         if isinstance(combine_metadata, DeepseekV41PrefillCombineMetadata):
             output = prefill_combine_output(
                 hidden_states,
                 combine_metadata.route_scales,
                 combine_metadata.expanded_row_idx,
                 combine_metadata.topk_weights,
+                out=out,
             )
             return output.view(combine_metadata.restore_shape)
-        return super().token_combine(hidden_states, combine_metadata, bias)
+        result = super().token_combine(hidden_states, combine_metadata, bias)
+        if out is not None:
+            out.copy_(result)
+            return out
+        return result
 
 
 def _grouped_projection(states, weights, groups, group_type, weight_scale=None, token_scale=None):
@@ -168,6 +187,28 @@ class DeepseekV41AllGatherComm(AllGatherCommImpl):
             num_local_experts=self.moe_config.num_local_experts,
         )
 
+    def _prefill_chunk_into(self, inputs, destination):
+        """Keep chunk results in their final buffer without a second FP32 copy."""
+        assert _EXTRA_CTX.moe_comm_method is not None, "Missing communication context"
+        before_dispatch = torch.npu.current_stream().record_event()
+        dispatched = self.token_dispatcher.token_dispatch(build_token_dispatch_input(fused_experts_input=inputs))
+        mlp_input = build_mlp_compute_input(
+            fused_experts_input=inputs,
+            token_dispatch_output=dispatched,
+            moe_config=self.moe_config,
+        )
+        values, before_gmm2 = self._apply_mlp(mlp_input)
+        before_combine = torch.npu.current_stream().record_event()
+        result = self.token_dispatcher.token_combine(values, dispatched.combine_metadata, out=destination)
+        return FusedExpertsResult(
+            routed_out=result,
+            before_dispatch_evt=before_dispatch,
+            before_gmm2_evt=before_gmm2,
+            before_combine_evt=before_combine,
+            group_list_type=dispatched.group_list_type,
+            expert_tokens=dispatched.group_list,
+        )
+
     def fused_experts(self, fused_experts_input):
         inputs = fused_experts_input
         rows = inputs.hidden_states.shape[0]
@@ -201,13 +242,21 @@ class DeepseekV41AllGatherComm(AllGatherCommImpl):
                     mc2_mask=None if routing.mc2_mask is None else routing.mc2_mask[part],
                 ),
             )
-            result = super().fused_experts(chunk)
+            if prefill_fusion_available(inputs.hidden_states):
+                result = self._prefill_chunk_into(chunk, routed_out[part])
+            else:
+                result = super().fused_experts(chunk)
+                routed_out[part].copy_(result.routed_out)
             if start == 0:
                 before_dispatch = result.before_dispatch_evt
-            routed_out[part].copy_(result.routed_out)
             # AllGather dispatch returns per-expert counts (group_list_type=1).
             counts.add_(result.expert_tokens)
-        return replace(result, routed_out=routed_out, expert_tokens=counts, before_dispatch_evt=before_dispatch)
+        return replace(
+            result,
+            routed_out=routed_out,
+            expert_tokens=counts,
+            before_dispatch_evt=before_dispatch,
+        )
 
     def _apply_mlp(self, inputs):
         weights = inputs.weights
@@ -229,7 +278,12 @@ class DeepseekV41AllGatherComm(AllGatherCommImpl):
         # FP32 nonlinear activation and route factor, then BF16 input to W2.
         fused_prefill = prefill_fusion_available(inputs.hidden_states)
         if fused_prefill:
-            activation = prefill_route_activation(gate_up, inputs.topk_scales, inputs.swiglu_limit)
+            activation = prefill_route_activation(
+                gate_up,
+                inputs.topk_scales,
+                inputs.swiglu_limit,
+                groups=inputs.group_list if inputs.group_list_type == 1 else None,
+            )
             del gate_up
         else:
             gate, up = gate_up.chunk(2, dim=-1)
@@ -239,7 +293,12 @@ class DeepseekV41AllGatherComm(AllGatherCommImpl):
             activation, scale = torch_npu.npu_dynamic_quant(activation, dst_type=torch.int8)
         before_gmm2 = torch.npu.current_stream().record_event()
         output = _grouped_projection(
-            activation, weights.w2, inputs.group_list, inputs.group_list_type, weights.w2_scale, scale
+            activation,
+            weights.w2,
+            inputs.group_list,
+            inputs.group_list_type,
+            weights.w2_scale,
+            scale,
         )
         # The prefill consumer masks padding while reading BF16 expert rows.
         if not fused_prefill:
@@ -316,7 +375,10 @@ class _RouteBeforeDown:
             # A8W8 grouped matmul with BF16 output requires BF16 channel
             # scales. The FP32 view injected for fused SwiGLU kernels is distinct.
             if _EXTRA_CTX.moe_comm_type == MoECommType.FUSED_MC2:
-                weights = dict(w1_scale=layer.w13_weight_scale_fp32, w2_scale=layer.v41_w2_scale_fp32)
+                weights = dict(
+                    w1_scale=layer.w13_weight_scale_fp32,
+                    w2_scale=layer.v41_w2_scale_fp32,
+                )
             else:
                 weights = dict(w1_scale=layer.w13_weight_scale, w2_scale=layer.w2_weight_scale)
         elif quant != QuantType.NONE:
@@ -369,5 +431,7 @@ class DeepseekV41RoutedExperts(AscendRoutedExperts):
         if self.router is None:
             raise ValueError("Missing V4.1 expert router")
         return self.router._select_experts(
-            hidden_states=hidden_states, router_logits=router_logits, input_ids=input_ids
+            hidden_states=hidden_states,
+            router_logits=router_logits,
+            input_ids=input_ids,
         )

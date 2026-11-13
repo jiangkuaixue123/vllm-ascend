@@ -128,3 +128,65 @@ def test_prefill_combine_keeps_fp32_slot_accumulation(rows, top_k):
 def test_prefill_fusion_keeps_cpu_fallback():
     with torch.inference_mode():
         assert not fused.prefill_fusion_available(torch.empty((4096, 5120), dtype=torch.int8))
+
+
+@pytest.mark.parametrize("rows", [384, 12288])
+def test_live_expert_prefix_preserves_quantization_and_graph_counts(rows):
+    if not torch.npu.is_available():
+        pytest.skip("requires Ascend NPU")
+    width = 2304
+    x = torch.randn(rows, 2 * width, dtype=torch.bfloat16, device="npu")
+    factor = torch.rand(rows, device="npu")
+    groups = torch.zeros(24, dtype=torch.int64, device="npu")
+    groups[0] = 7
+
+    def execute():
+        activation = fused.prefill_route_activation(x, factor, 10.0, groups=groups)
+        return torch_npu.npu_dynamic_quant(activation, dst_type=torch.int8)
+
+    with torch.inference_mode():
+        execute()
+        graph = torch.npu.NPUGraph()
+        with torch.npu.graph(graph):
+            actual, scale = execute()
+        for count in (0, 7, min(768, rows), rows, 13, 0):
+            x.copy_(torch.randn_like(x) * 6)
+            x[count:].fill_(float("nan"))
+            groups.zero_()
+            groups[0] = count // 2
+            groups[7] = count - count // 2
+            factor.mul_(0.97)
+            graph.replay()
+            torch.npu.synchronize()
+            if count:
+                gate, up = x[:count].chunk(2, -1)
+                expected = (clipped_swiglu(gate, up, 10.0) * factor[:count, None]).bfloat16()
+                quantized, expected_scale = torch_npu.npu_dynamic_quant(expected, dst_type=torch.int8)
+                torch.testing.assert_close(actual[:count].cpu(), quantized.cpu(), rtol=0, atol=0)
+                assert_exact(scale[:count], expected_scale)
+
+
+@pytest.mark.parametrize("rows", [17, 264])
+def test_prefill_combine_writes_only_owned_output_slice(rows):
+    if not torch.npu.is_available():
+        pytest.skip("requires Ascend NPU")
+    width, k = 5120, 6
+    states = torch.randn(rows * k, width, dtype=torch.bfloat16, device="npu")
+    factor = torch.ones(rows * k, device="npu")
+    ids = torch.randperm(rows * k).int().npu()
+    owned = torch.ones(rows, k, device="npu")
+    full = torch.full((rows + 4, width), 123.0, device="npu")
+    destination = full[2:-2]
+    with torch.inference_mode():
+        graph = torch.npu.NPUGraph()
+        with torch.npu.graph(graph):
+            actual = fused.prefill_combine_output(states, factor, ids, owned, out=destination)
+        assert actual is destination
+        for step in range(3):
+            states.neg_()
+            ids.copy_(torch.roll(ids, 3))
+            owned[:, step].zero_()
+            graph.replay()
+            native = torch_npu.npu_moe_token_unpermute(states.float(), ids, probs=owned)
+            assert_exact(actual, native)
+            assert torch.all(full[:2] == 123).item() and torch.all(full[-2:] == 123).item()

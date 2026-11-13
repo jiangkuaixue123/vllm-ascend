@@ -231,6 +231,8 @@ def test_native_failure_is_not_hidden_by_an_unmeasured_fallback():
 
 def block_methods(env):
     env.setdefault("hc_post_fused", lambda *args: None)
+    env.setdefault("hc_prefill_prepare", lambda *args: None)
+    env.setdefault("hc_prefill_post", lambda *args: None)
     path = ROOT / "vllm_ascend/models/deepseek_v41/model.py"
     tree = ast.parse(path.read_text())
     block = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "DeepseekV41Block")
@@ -326,6 +328,7 @@ def test_prefill_and_draft_never_call_native_even_at_decode_shapes(rows, runtime
     marker = object()
     cls = block_methods({"hc_pre_delayed": unexpected, "hc_pre": lambda x, pre: marker})
     block = cls()
+    block.config = SimpleNamespace(rms_norm_eps=1e-20)
     gates = (object(), object(), object())
     block.mixes = lambda x, name: gates
     result = block.pre_and_mixes(TensorMetadata((rows, 4, 5120), "bf16"), object(), "attn", runtime)

@@ -64,6 +64,7 @@ def test_grouped_allgather_keeps_fp32_route_before_down(monkeypatch, top_k, quan
     if chunked:
         monkeypatch.setattr(fused, "MAX_EAGER_ROUTED_TOKENS", 2)
     monkeypatch.setattr(moe_comm_method, "_EXTRA_CTX", SimpleNamespace(moe_comm_method=comm))
+    monkeypatch.setattr(fused, "_EXTRA_CTX", SimpleNamespace(moe_comm_method=comm))
     monkeypatch.setattr(token_dispatcher, "get_ep_group", lambda: SimpleNamespace(rank_in_group=1))
     monkeypatch.setattr(moe_mlp, "enable_fusion_gmmswigluquant", lambda: False)
     monkeypatch.setattr(torch.npu, "current_stream", lambda: Mock())
@@ -357,6 +358,7 @@ def test_w8a8_grouped_capture_replay_on_npu(monkeypatch, top_k, chunked):
     )
     comm.token_dispatcher = comm._get_token_dispatcher()
     monkeypatch.setattr(moe_comm_method, "_EXTRA_CTX", SimpleNamespace(moe_comm_method=comm))
+    monkeypatch.setattr(fused, "_EXTRA_CTX", SimpleNamespace(moe_comm_method=comm))
     monkeypatch.setattr(token_dispatcher, "get_ep_group", lambda: SimpleNamespace(rank_in_group=1))
     monkeypatch.setattr(moe_mlp, "enable_fusion_gmmswigluquant", lambda: False)
     inputs = build_fused_experts_input(
@@ -456,6 +458,7 @@ def test_prefill_chain_and_batch_match_original_target_width_on_npu(monkeypatch,
     )
     comm.token_dispatcher = comm._get_token_dispatcher()
     monkeypatch.setattr(moe_comm_method, "_EXTRA_CTX", SimpleNamespace(moe_comm_method=comm))
+    monkeypatch.setattr(fused, "_EXTRA_CTX", SimpleNamespace(moe_comm_method=comm))
     monkeypatch.setattr(token_dispatcher, "get_ep_group", lambda: SimpleNamespace(rank_in_group=0))
     monkeypatch.setattr(moe_mlp, "enable_fusion_gmmswigluquant", lambda: False)
     monkeypatch.setattr(fused, "is_forward_context_available", lambda: False)
@@ -508,6 +511,10 @@ def test_prefill_chain_and_batch_match_original_target_width_on_npu(monkeypatch,
         torch.npu.reset_peak_memory_stats()
         resident = torch.npu.memory_allocated()
         result = comm.fused_experts(inputs)
+        assert all(
+            event is not None
+            for event in (result.before_dispatch_evt, result.before_gmm2_evt, result.before_combine_evt)
+        )
         torch.npu.synchronize()
         peak = torch.npu.max_memory_allocated() - resident
         print(f"PREFILL_WORKSPACE rows={rows} placement={placement} peak_bytes={peak}")
