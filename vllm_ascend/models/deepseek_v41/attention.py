@@ -599,6 +599,11 @@ def sorted_topk_columns(scores, k):
     return indices.sort(-1).values
 
 
+def _expand_candidate_blocks(keep, block_size, width):
+    # Fixed block sizes need a broadcast copy, not repeat-interleave routing.
+    return keep.unsqueeze(-1).expand(*keep.shape, block_size).flatten(-2)[..., :width]
+
+
 def select_candidate_blocks(logits, compress_lens, topk_blocks, block_size, *, per_token=True):
     width = logits.shape[-1]
     if width == 0:
@@ -611,7 +616,7 @@ def select_candidate_blocks(logits, compress_lens, topk_blocks, block_size, *, p
     top = topk_columns(scores, min(topk_blocks, scores.shape[-1]))
     keep = torch.zeros_like(scores, dtype=torch.bool).scatter_(-1, top, scores.gather(-1, top) > -torch.inf)
     if per_token:
-        return keep.repeat_interleave(block_size, -1)[..., :width]
+        return _expand_candidate_blocks(keep, block_size, width)
     return keep
 
 
@@ -619,7 +624,7 @@ def mask_candidate_columns_(scores, keep, block_size, source_width):
     """Broadcast one decision per block, including a partial final block."""
     if source_width != scores.shape[-1]:
         # Preserve the original dense broadcasting contract for unequal compression widths.
-        scores.masked_fill_(~keep.repeat_interleave(block_size, -1)[..., :source_width], -torch.inf)
+        scores.masked_fill_(~_expand_candidate_blocks(keep, block_size, source_width), -torch.inf)
         return
     blocks, tail = divmod(scores.shape[-1], block_size)
     end = blocks * block_size

@@ -94,14 +94,57 @@ def test_block_candidate_mask_broadcast_preserves_follower_bits(width, block_siz
     torch.testing.assert_close(follower.view(torch.int32), expected.view(torch.int32), rtol=0, atol=0)
 
 
-def test_block_mask_keeps_original_cross_width_broadcast():
-    keep = torch.tensor([[True], [False]])
-    follower = torch.arange(30).view(2, 15).float()
+@pytest.mark.parametrize("tensor_device", ["cpu", "npu"])
+def test_block_mask_keeps_original_cross_width_broadcast(tensor_device):
+    if tensor_device == "npu" and not torch.npu.is_available():
+        pytest.skip("requires Ascend NPU")
+    keep = torch.tensor([[True], [False]], device=tensor_device)
+    follower = torch.arange(30, device=tensor_device).view(2, 15).float()
     expected = follower.masked_fill(~keep, -torch.inf)
     attention.mask_candidate_columns_(follower, keep, block_size=8, source_width=1)
     torch.testing.assert_close(follower, expected)
     with pytest.raises(RuntimeError):
         attention.mask_candidate_columns_(follower, keep, block_size=8, source_width=7)
+
+
+@pytest.mark.parametrize(
+    "shape,block,width",
+    [
+        ((64, 1009), 8, 8072),
+        ((64, 1009), 8, 8067),
+        ((6, 1026), 8, 8208),
+        ((3, 19200), 8, 153600),
+        ((2, 3, 13), 4, 49),
+        ((2, 1), 8, 1),
+        ((2, 17), 1, 17),
+        ((2, 0), 8, 0),
+    ],
+)
+@pytest.mark.parametrize("tensor_device", ["cpu", "npu"])
+def test_candidate_block_expansion_exact_and_replay(shape, block, width, tensor_device):
+    if tensor_device == "npu" and not torch.npu.is_available():
+        pytest.skip("requires Ascend NPU")
+    gen = torch.Generator(device="cpu").manual_seed(731)
+    source = torch.randint(0, 2, (*shape[:-1], 2 * shape[-1]), generator=gen, dtype=torch.bool)
+    keep = source.to(tensor_device)[..., ::2]
+    expected = source[..., ::2].repeat_interleave(block, -1)[..., :width]
+    actual = attention._expand_candidate_blocks(keep, block, width)
+    torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
+    if tensor_device == "cpu" or not keep.numel():
+        return
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph):
+        replayed = attention._expand_candidate_blocks(keep, block, width).clone()
+    for iteration in range(64):
+        if iteration % 3:
+            source.logical_not_()
+        else:
+            source.fill_(iteration % 2 == 0)
+        keep.copy_(source[..., ::2])
+        graph.replay()
+        torch.npu.synchronize()
+        expected = source[..., ::2].repeat_interleave(block, -1)[..., :width]
+        torch.testing.assert_close(replayed.cpu(), expected, rtol=0, atol=0)
 
 
 def test_decode_index_empty_capacity_does_not_access_pages():
