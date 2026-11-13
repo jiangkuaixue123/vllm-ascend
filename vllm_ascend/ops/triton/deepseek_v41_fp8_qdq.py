@@ -126,19 +126,22 @@ def _pack_rotated_prefill(
         row = tile // (ROW_GROUPS // G)
         within = tile % (ROW_GROUPS // G) * G
         source = (row * (TP * ROW_GROUPS) + rank * ROW_GROUPS + within) * 32
-        # Four complete heads share one phase load, without per-group GM gathers.
+        # Eight heads share phase loads; only their rotary tail uses FP32 arithmetic.
         values = tl.load(x + source + tl.arange(0, G * 32)).reshape(G, 32)
         phase = row * 64 + tl.arange(0, 64)
-        co = tl.load(cosine + phase).reshape(1, 1, 2, 32)
-        si = tl.load(sine + phase).reshape(1, 1, 2, 32)
-        co = tl.broadcast_to(co, (G // 16, 8, 2, 32)).reshape(G, 32)
-        si = tl.broadcast_to(si, (G // 16, 8, 2, 32)).reshape(G, 32)
-        rotary = tl.arange(0, G) % 16 >= 14
-        partner = tl.gather(values.to(tl.float32), tl.broadcast_to((cols ^ 1)[None, :], (G, 32)), axis=1)
+        head_values = values.reshape(G // 16, 512)
+        rotary_cols = tl.arange(0, 64)
+        tail = tl.gather(
+            head_values, tl.broadcast_to((448 + rotary_cols)[None, :], (G // 16, 64)), axis=1
+        ).to(tl.float32)
+        co = tl.load(cosine + phase)[None, :]
+        si = tl.load(sine + phase)[None, :]
+        partner = tl.gather(tail, tl.broadcast_to((rotary_cols ^ 1)[None, :], (G // 16, 64)), axis=1)
         cross = partner * si
-        cross = tl.where(cols[None, :] % 2 == 0, -cross, cross)
-        rotated = (values.to(tl.float32) * co + cross).to(tl.bfloat16)
-        values = tl.where(rotary[:, None], rotated, values)
+        cross = tl.where(rotary_cols[None, :] % 2 == 0, -cross, cross)
+        rotated = (tail * co + cross).to(tl.bfloat16)
+        rotated = tl.broadcast_to(rotated.reshape(G // 16, 1, 2, 32), (G // 16, 8, 2, 32)).reshape(G, 32)
+        values = tl.where((tl.arange(0, G) % 16 >= 14)[:, None], rotated, values)
         # Whole tiles divide each row; expose the contiguous write to avoid a scalar scatter lock.
         destination = ((rank * total_rows + start) * ROW_GROUPS + tile * G) * 32
         tl.store(out + destination + tl.arange(0, G * 32), _bias_qdq(values).reshape(G * 32))
@@ -164,6 +167,6 @@ def pack_rotated_prefill_output(x, positions, frequencies, out, start, tp):
         start,
         ROW_GROUPS=64 // tp * 16,
         TP=tp,
-        G=64,
+        G=128,
         enable_fp_fusion=False,
     )
