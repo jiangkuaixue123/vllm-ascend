@@ -11,7 +11,7 @@ from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
 _ROWS = 8
 _COLS = 256
-_COMBINE_COLS = 2048
+_COMBINE_COLS = 8192
 
 
 def prefill_fusion_available(states):
@@ -67,9 +67,11 @@ if HAS_TRITON and not envs.VLLM_BATCH_INVARIANT:
 
     def prefill_dispatched_scales(row_ids, weights, ids, expert_map, num_rows):
         """Native routing gives every local pair a unique expanded row."""
+        import torch_npu
+
         pairs = weights.numel()
         result = weights.new_zeros(num_rows + pairs)
-        indices = torch.empty((pairs,), dtype=torch.int64, device=weights.device)
+        indices = torch.empty((pairs,), dtype=torch.int32, device=weights.device)
         values = torch.empty((pairs,), dtype=torch.float32, device=weights.device)
         owned = torch.empty_like(weights, dtype=torch.float32)
         _prefill_route_metadata[(triton.cdiv(pairs, 256),)](
@@ -86,8 +88,8 @@ if HAS_TRITON and not envs.VLLM_BATCH_INVARIANT:
             B=256,
             enable_fp_fusion=False,
         )
-        # Remote pairs write separate scratch rows, so native scatter needs no reduction.
-        result.scatter_(0, indices, values)
+        # The local prefix and per-pair remote scratch form disjoint overwrite destinations.
+        torch_npu.npu_scatter_nd_update_(result, indices[:, None], values)
         return result[:num_rows], owned
 
     @triton.jit

@@ -44,7 +44,7 @@ from vllm_ascend.quantization.quant_type import QuantType
 # The native dispatcher allocates one expanded row per (gathered token, route),
 # including remote routes. Bound its local workspace independently of DP and EP.
 MAX_EAGER_ROUTED_TOKENS = 1024
-MAX_FUSED_PREFILL_ROUTED_TOKENS = 2048
+MAX_FUSED_PREFILL_ROUTED_TOKENS = 4096
 
 
 def dispatched_scales(row_ids, route_weights, owned, num_rows):

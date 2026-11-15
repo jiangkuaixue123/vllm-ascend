@@ -14,6 +14,9 @@ from vllm_ascend.ops.triton.deepseek_v41_prefill_experts import prefill_dispatch
     [
         (129, "balanced"),
         (2048, "balanced"),
+        (4096, "balanced"),
+        (4097, "local"),
+        (4097, "remote"),
         (264, "local"),
         (264, "remote"),
         (129, "nomap"),
