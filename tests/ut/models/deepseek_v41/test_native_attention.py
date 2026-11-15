@@ -65,6 +65,123 @@ def test_slot_compaction_keeps_batch_stride_duplicates_and_masked_middle_rows():
     assert torch.all(slots[:, :, 5:] == -1)
 
 
+def test_prefill_slots_follow_source_identity_and_geometry(monkeypatch):
+    prepared = native.PrefillAttentionInputs()
+    positions = torch.arange(11, 14)
+    topk = torch.tensor([[2, -1, 0, 2], [-1, 2, -1, 1], [3, -1, -1, 3]])
+    compact = native.physical_indices
+    calls = []
+
+    def counted(*args):
+        calls.append(1)
+        return compact(*args)
+
+    monkeypatch.setattr(native, "physical_indices", counted)
+
+    def slots(source, query_start=11, raw_length=6, compressed_length=5):
+        pos = positions + query_start - 11
+        actual = prepared.prepare_slots(source, pos, query_start, 14, 8, raw_length, compressed_length, 4)
+        ids = native.prefill_indices(pos, 4, 14, 8, raw_length, source)
+        length = raw_length + compressed_length
+        assert torch.equal(actual, compact(ids, native.aligned_length(length, 16), length, 128))
+        return actual
+
+    first = slots(topk)
+    assert slots(topk) is first and len(calls) == 1
+    replacement = topk.flip(-1).contiguous()
+    assert slots(replacement) is not first and len(calls) == 2
+    slots(replacement, query_start=10)
+    slots(replacement, raw_length=7)
+    slots(replacement, compressed_length=4)
+    assert len(calls) == 5
+    prepared.slots = None  # The producer invalidates before publishing another top-k.
+    slots(replacement, compressed_length=4)
+    assert len(calls) == 6
+
+
+def test_prefill_workspace_refreshes_raw_and_compressed_and_bounds_residency():
+    caches = [native.PrefillAttentionInputs(), native.PrefillAttentionInputs()]
+    raw = torch.arange(5 * 512).reshape(5, 512).bfloat16()
+    compressed = torch.full((4, 512), 7, dtype=raw.dtype)
+    limit = 16 * 512 * raw.element_size()
+    workspace = caches[0].update_workspace(raw, compressed, limit)
+    assert torch.equal(workspace[0, :9], torch.cat((raw, compressed)))
+    assert torch.count_nonzero(workspace[0, 9:]) == 0
+    raw.add_(1)
+    assert caches[0].update_workspace(raw, compressed, limit) is workspace
+    assert torch.equal(workspace[0, :5], raw)
+    replacement = compressed + 3
+    caches[0].update_workspace(raw, replacement, limit)
+    assert torch.equal(workspace[0, 5:9], replacement)
+    assert caches[1].update_workspace(raw, compressed, limit - caches[0].workspace_bytes) is None
+    assert sum(c.workspace_bytes for c in caches) <= limit
+    # Ratio/length changes within the same aligned page must move the tail too.
+    caches[0].update_workspace(raw[:3], replacement.repeat(2, 1), limit)
+    assert torch.equal(caches[0].workspace[0, :11], torch.cat((raw[:3], replacement.repeat(2, 1))))
+    assert torch.count_nonzero(caches[0].workspace[0, 11:]) == 0
+    assert caches[0].update_workspace(raw.repeat(4, 1), compressed, limit) is None
+    assert caches[0].workspace_bytes == 0 and caches[0].compressed is None
+
+
+def test_prepared_prefill_uses_logical_length_and_existing_pages(backend, monkeypatch):
+    runner, _, calls = backend
+    q, kv, sink = inputs(1, 3, 13)
+    topk = torch.tensor([[2, -1, 0], [3, 1, 1], [-1, -1, 0]])
+    positions = torch.arange(6, 9)
+    indices = native.prefill_indices(positions, 4, 9, 0, 9, topk)
+    expected = runner._native(q, kv, sink, indices, 0.125, "reference", None)
+    prepared = native.PrefillAttentionInputs()
+    slots = prepared.prepare_slots(topk, positions, 6, 9, 0, 9, 4, 4)
+    pages = prepared.update_workspace(kv[0, :9], kv[0, 9:], 16 * 512 * 2)
+
+    def no_padding(*args, **kwargs):
+        raise AssertionError("Prepared pages must not be copied/padded again")
+
+    monkeypatch.setattr(native.F, "pad", no_padding)
+    actual = runner.prefill_with_physical_slots(q, pages[:, :13], sink, slots, 0.125, padded_kv=pages)
+    assert torch.equal(actual, expected)
+    assert calls[-1]["ori_kv"].data_ptr() == pages.data_ptr()
+    with pytest.raises(ValueError, match="aligned contiguous"):
+        runner.prefill_with_physical_slots(q, pages[:, :13], sink, slots, 0.125, padded_kv=pages[:, :13])
+
+
+@pytest.mark.parametrize("rows,raw_length,compressed_length", [(3, 17, 0), (257, 1027, 513), (2040, 8160, 8160)])
+@torch.inference_mode()
+def test_prefill_native_pages_and_consumer_reuse_on_npu(rows, raw_length, compressed_length):
+    if importlib.util.find_spec("torch_npu") is None:
+        pytest.skip("Requires Ascend A3")
+    importlib.import_module("torch_npu")
+    if not torch.npu.is_available():
+        pytest.skip("Requires Ascend A3")
+    runner = native.DeepseekV41NativeAttention()
+    q, kv, sink = (t.npu() for t in inputs(1, rows, raw_length + compressed_length, 64))
+    positions = torch.arange(raw_length - rows, raw_length, device=q.device)
+    width = min(512, compressed_length)
+    topk = torch.arange(width, device=q.device).flip(0).expand(rows, -1).clone()
+    topk[:, 1::3] = -1
+    prepared = native.PrefillAttentionInputs()
+    raw, compressed = kv[0, :raw_length].clone(), kv[0, raw_length:].clone()
+    slots = prepared.prepare_slots(
+        topk, positions, raw_length - rows, raw_length, 0, raw_length, compressed_length, 128
+    )
+    logical = native.prefill_indices(positions, 128, raw_length, 0, raw_length, topk)
+    for layer in range(3):
+        raw.add_(0.125)
+        if layer == 2:
+            compressed = compressed + 0.25
+        joint = torch.cat((raw, compressed)).unsqueeze(0)
+        expected = runner(q, joint, sink, logical, 512**-0.5, mode="retained prefill")
+        pages = prepared.update_workspace(raw, compressed, 32 * 1024 * 1024)
+        actual = runner.prefill_with_physical_slots(
+            q, pages[:, : joint.shape[1]], sink, slots, 512**-0.5, padded_kv=pages
+        )
+        assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
+        assert torch.equal(pages[:, : joint.shape[1]], joint)
+    # Budget fallback still reuses slots and the original native padding path.
+    actual = runner.prefill_with_physical_slots(q, joint, sink, slots, 512**-0.5)
+    assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
+
+
 def test_indexed_slot_math_and_plan_reuse(backend):
     runner, plans, calls = backend
     q, kv, sink = inputs(2, 6, 17)

@@ -3,6 +3,7 @@
 """Execute V4.1's selected latent attention on the A3 shared-KV operator."""
 
 import os
+from dataclasses import dataclass
 from functools import lru_cache
 
 import torch
@@ -36,6 +37,68 @@ def physical_indices(indices, page_stride, kv_length, sparse_width):
     packed = torch.full((batch, sequence, sparse_width + 1), -1, dtype=torch.int32, device=indices.device)
     packed.scatter_(-1, destinations, slots)
     return packed[..., :sparse_width].reshape(batch * sequence, 1, sparse_width).contiguous()
+
+
+def prefill_indices(positions, window_size, seq_len, first, raw_length, topk=None):
+    width = min(window_size, seq_len)
+    window = (positions - window_size + 1).clamp_min(0).unsqueeze(-1)
+    window = window + torch.arange(width, device=positions.device)
+    indices = torch.where(window <= positions.unsqueeze(-1), window - first, -1)
+    if topk is not None:
+        indices = torch.cat((indices, torch.where(topk >= 0, topk + raw_length, -1)), -1)
+    return indices.int().unsqueeze(0)
+
+
+@dataclass
+class PrefillAttentionInputs:
+    """One request in one eager forward; published top-k and compressed tensors are immutable."""
+
+    topk: torch.Tensor | None = None
+    geometry: tuple | None = None
+    slots: torch.Tensor | None = None
+    workspace: torch.Tensor | None = None
+    workspace_geometry: tuple | None = None
+    compressed: torch.Tensor | None = None
+
+    @property
+    def workspace_bytes(self):
+        return 0 if self.workspace is None else self.workspace.numel() * self.workspace.element_size()
+
+    def prepare_slots(self, topk, positions, query_start, seq_len, first, raw_length, compressed_length, window_size):
+        geometry = (
+            query_start,
+            positions.numel(),
+            seq_len,
+            first,
+            raw_length,
+            compressed_length,
+            window_size,
+            topk.shape,
+            topk.device,
+        )
+        if self.slots is None or self.topk is not topk or self.geometry != geometry:
+            indices = prefill_indices(positions, window_size, seq_len, first, raw_length, topk)
+            length = raw_length + compressed_length
+            width = aligned_length(indices.shape[-1], SPARSE_ALIGNMENT)
+            self.slots = physical_indices(indices, aligned_length(length, PAGE_SIZE), length, width)
+            self.topk, self.geometry = topk, geometry
+        return self.slots
+
+    def update_workspace(self, raw, compressed, available_bytes):
+        geometry = (raw.shape, compressed.shape, raw.dtype, raw.device)
+        if self.workspace_geometry != geometry:
+            self.workspace = self.compressed = None
+            self.workspace_geometry = None
+            stride = aligned_length(raw.shape[0] + compressed.shape[0], PAGE_SIZE)
+            if stride * raw.shape[1] * raw.element_size() > available_bytes:
+                return None
+            self.workspace = raw.new_zeros((1, stride, raw.shape[1]))
+            self.workspace_geometry = geometry
+        self.workspace[0, : raw.shape[0]].copy_(raw)
+        if self.compressed is not compressed:
+            self.workspace[0, raw.shape[0] : raw.shape[0] + compressed.shape[0]].copy_(compressed)
+            self.compressed = compressed
+        return self.workspace
 
 
 class DeepseekV41NativeAttention:
@@ -149,7 +212,36 @@ class DeepseekV41NativeAttention:
             return selected
         return self._native(q, kv, sink, slots, scale, "DSA target indexed decode", None, True, physical_slots=True)
 
-    def _native(self, q, kv, sink, indices, scale, mode, swa_window, uniform_decode=False, *, physical_slots=False):
+    def prefill_with_physical_slots(self, q, kv, sink, slots, scale, *, padded_kv=None):
+        """Real contiguous prefill rows, each proven by the caller to have a raw SWA key."""
+        return self._native(
+            q,
+            kv,
+            sink,
+            slots,
+            scale,
+            "DSA target indexed prefill",
+            None,
+            physical_slots=True,
+            padded_kv=padded_kv,
+            mask_empty_rows=False,
+        )
+
+    def _native(
+        self,
+        q,
+        kv,
+        sink,
+        indices,
+        scale,
+        mode,
+        swa_window,
+        uniform_decode=False,
+        *,
+        physical_slots=False,
+        padded_kv=None,
+        mask_empty_rows=True,
+    ):
         batch, sequence, heads, dim = q.shape
         if dim != LATENT_DIM or heads % 4 or q.dtype != torch.bfloat16 or kv.dtype != torch.bfloat16:
             raise ValueError(
@@ -158,10 +250,21 @@ class DeepseekV41NativeAttention:
         if sink.shape != (heads,) or sink.dtype != torch.float32:
             raise ValueError("A3 shared-KV attention requires a per-head FP32 sink")
         length = kv.shape[1]
-        if kv.shape != (batch, length, dim) or indices.shape[:2] != (batch, sequence):
+        index_rows = (batch * sequence, 1) if physical_slots else (batch, sequence)
+        if kv.shape != (batch, length, dim) or indices.shape[:2] != index_rows:
             raise ValueError("V4.1 Q, KV and index rows must agree")
         stride = aligned_length(length, PAGE_SIZE)
-        padded = F.pad(kv, (0, 0, 0, stride - length)) if stride != length else kv
+        if padded_kv is not None:
+            if (
+                padded_kv.shape != (batch, stride, dim)
+                or padded_kv.dtype != kv.dtype
+                or padded_kv.device != kv.device
+                or not padded_kv.is_contiguous()
+            ):
+                raise ValueError("V4.1 prepared KV must contain aligned contiguous pages")
+            padded = padded_kv
+        else:
+            padded = F.pad(kv, (0, 0, 0, stride - length)) if stride != length else kv
         pages = padded.contiguous().view(-1, PAGE_SIZE, 1, dim)
         slots = None
         if swa_window is not None:
@@ -198,7 +301,7 @@ class DeepseekV41NativeAttention:
             **common,
         )[0].reshape_as(q)
         logger.info_once("V4.1 native %s npu_sparse_attn_sharedkv heads=%d", mode, heads, scope="process")
-        if slots is not None:
+        if slots is not None and mask_empty_rows:
             # Rows masked by the scheduler have no valid slots. Keep their
             # result zero irrespective of how the kernel initializes empty rows.
             result = result.masked_fill((slots[:, 0, 0] < 0).reshape(batch, sequence, 1, 1), 0)

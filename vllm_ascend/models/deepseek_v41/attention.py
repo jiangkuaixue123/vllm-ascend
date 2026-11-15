@@ -60,7 +60,7 @@ from .attention_ops import (
     fp8_quant_dequant,
 )
 from .core import rms_norm
-from .native_attention import DeepseekV41NativeAttention
+from .native_attention import DeepseekV41NativeAttention, PrefillAttentionInputs, prefill_indices
 
 if HAS_TRITON and not envs.VLLM_BATCH_INVARIANT:
     from vllm_ascend.ops.triton.deepseek_v41_fp8_qdq import (
@@ -82,6 +82,8 @@ else:
 
 # Bound the per-head score tensor for eager prefill; cached candidates span the whole request.
 _INDEX_SCORE_TILE_BYTES = 32 * 1024 * 1024
+# Bound extra joint KV residency across all requests in one eager forward.
+_PREFILL_WORKSPACE_BYTES = 32 * 1024 * 1024
 # At TP4 this bounds each WO quantizer's temporary FP32 tensor to 8 MiB.
 _OUTPUT_QDQ_TILE_ROWS = 256
 # A FULL graph uses a static context width even when only a few pages are live.
@@ -715,6 +717,7 @@ class SharedRequestAttention:
     index_keys: torch.Tensor | None = None
     topk: torch.Tensor | None = None
     candidates: torch.Tensor | None = None
+    prefill: PrefillAttentionInputs = field(default_factory=PrefillAttentionInputs)
 
 
 @dataclass
@@ -806,6 +809,7 @@ class DeepseekV41Runtime:
     decode_candidate_blocks: torch.Tensor | None = None
     decode_candidate_width: int = 0
     slot_arena: DecodeSlotArena | None = None
+    prefill_workspace_bytes: int = 0
 
     @classmethod
     def for_decode(cls, metadata: DeepseekV41Metadata):
@@ -1044,6 +1048,7 @@ class DeepseekV41Attention(nn.Module):
             if shared.topk is None:
                 raise RuntimeError("Attention index source did not execute")
             return shared.topk
+        shared.prefill.slots = None
         count = shared.compressed.shape[0]
         if count == 0:
             shared.topk = torch.empty((x.shape[0], 0), device=x.device, dtype=torch.long)
@@ -1508,37 +1513,73 @@ class DeepseekV41Attention(nn.Module):
             positions = positions[lo - begin : hi - begin]
             q = queries[rows]
             self.rotate(q.unsqueeze(0), positions)
-            width = min(self.config.sliding_window, request.seq_len)
-            window = (positions - self.config.sliding_window + 1).clamp_min(0)
-            window = window.unsqueeze(-1) + torch.arange(width, device=hidden_states.device)
-            indices = torch.where(window <= positions.unsqueeze(-1), window - first, -1)
+            compressed_indices = None
             if self.ratio:
                 compressed_indices = self._index(queries_input[rows], qr[rows], positions, shared)
-                indices = torch.cat(
-                    (
-                        indices,
-                        torch.where(
-                            compressed_indices >= 0,
-                            compressed_indices + kv.shape[0],
-                            -1,
-                        ),
-                    ),
-                    -1,
+            query_start = request.start_pos + lo - begin
+            prepared = (
+                packed
+                and self.ratio
+                and self.config.sliding_window > 0
+                and first <= query_start
+                and query_start + hi - lo <= first + kv.shape[0]
+            )
+            if prepared:
+                inputs = shared.prefill
+                native_slots = inputs.prepare_slots(
+                    compressed_indices,
+                    positions,
+                    query_start,
+                    request.seq_len,
+                    first,
+                    kv.shape[0],
+                    shared.compressed.shape[0],
+                    self.config.sliding_window,
                 )
-                kv = torch.cat((kv, shared.compressed), 0)
+                previous_bytes = inputs.workspace_bytes
+                padded_kv = inputs.update_workspace(
+                    kv,
+                    shared.compressed,
+                    _PREFILL_WORKSPACE_BYTES - runtime.prefill_workspace_bytes + previous_bytes,
+                )
+                runtime.prefill_workspace_bytes += inputs.workspace_bytes - previous_bytes
+                length = kv.shape[0] + shared.compressed.shape[0]
+                kv = (
+                    padded_kv[:, :length]
+                    if padded_kv is not None
+                    else torch.cat((kv, shared.compressed), 0).unsqueeze(0)
+                )
+                attended = self.attention_kernel.prefill_with_physical_slots(
+                    q.unsqueeze(0),
+                    kv,
+                    self.attn_sink,
+                    native_slots,
+                    self.dim**-0.5,
+                    padded_kv=padded_kv,
+                )[0]
             else:
-                # The implicit SWA operator aligns Q with the suffix of KV.
-                # A CP shard can end before the last token of this request.
-                kv = kv[: kv.shape[0] - (end - hi)]
-            attended = self.attention_kernel(
-                q.unsqueeze(0),
-                kv.unsqueeze(0),
-                self.attn_sink,
-                indices.int().unsqueeze(0),
-                self.dim**-0.5,
-                mode="DSA target indexed prefill" if self.ratio else "SWA target causal prefill",
-                swa_window=None if self.ratio else self.config.sliding_window,
-            )[0]
+                indices = prefill_indices(
+                    positions,
+                    self.config.sliding_window,
+                    request.seq_len,
+                    first,
+                    kv.shape[0],
+                    compressed_indices,
+                )
+                if self.ratio:
+                    kv = torch.cat((kv, shared.compressed), 0)
+                else:
+                    # Implicit SWA queries end at the suffix of this CP rank's KV.
+                    kv = kv[: kv.shape[0] - (end - hi)]
+                attended = self.attention_kernel(
+                    q.unsqueeze(0),
+                    kv.unsqueeze(0),
+                    self.attn_sink,
+                    indices,
+                    self.dim**-0.5,
+                    mode="DSA target indexed prefill" if self.ratio else "SWA target causal prefill",
+                    swa_window=None if self.ratio else self.config.sliding_window,
+                )[0]
             if packed:
                 pack_rotated_prefill_output(attended, positions, self.frequencies, output, rows.start, self.tp)
             else:
