@@ -42,8 +42,7 @@ if HAS_TRITON and not envs.VLLM_BATCH_INVARIANT:
         weights,
         ids,
         expert_map,
-        indices,
-        values,
+        factor,
         owned,
         N,
         EXPANDED,
@@ -58,29 +57,23 @@ if HAS_TRITON and not envs.VLLM_BATCH_INVARIANT:
             local = tl.load(expert_map + expert, valid, -1) >= 0
         row = tl.abs(tl.load(row_ids + pair, valid, 0))
         row = tl.minimum(row, EXPANDED - 1)
-        index = tl.where(local, row, EXPANDED + pair)
         weight = tl.load(weights + pair, valid, 0)
         weight = tl.where(weight == 0, 0.0, weight)
-        tl.store(indices + pair, index, valid)
-        tl.store(values + pair, weight, valid)
+        # The preceding zero kernel owns initialization; native local rows are unique.
+        tl.store(factor + row, weight, valid & local)
         tl.store(owned + pair, local.to(tl.float32), valid)
 
     def prefill_dispatched_scales(row_ids, weights, ids, expert_map, num_rows):
         """Native routing gives every local pair a unique expanded row."""
-        import torch_npu
-
         pairs = weights.numel()
-        result = weights.new_zeros(num_rows + pairs)
-        indices = torch.empty((pairs,), dtype=torch.int32, device=weights.device)
-        values = torch.empty((pairs,), dtype=torch.float32, device=weights.device)
+        result = weights.new_zeros(num_rows)
         owned = torch.empty_like(weights, dtype=torch.float32)
         _prefill_route_metadata[(triton.cdiv(pairs, 256),)](
             row_ids,
             weights,
             ids,
             ids if expert_map is None else expert_map,
-            indices,
-            values,
+            result,
             owned,
             N=pairs,
             EXPANDED=num_rows,
@@ -88,9 +81,7 @@ if HAS_TRITON and not envs.VLLM_BATCH_INVARIANT:
             B=256,
             enable_fp_fusion=False,
         )
-        # The local prefix and per-pair remote scratch form disjoint overwrite destinations.
-        torch_npu.npu_scatter_nd_update_(result, indices[:, None], values)
-        return result[:num_rows], owned
+        return result, owned
 
     @triton.jit
     def _live_rows(groups, M, G: tl.constexpr, GB: tl.constexpr):
@@ -217,7 +208,7 @@ if HAS_TRITON and not envs.VLLM_BATCH_INVARIANT:
             C=_COLS,
             enable_fp_fusion=False,
         )
-        silu = F.silu(gate)
+        silu = F.silu(gate) if groups is None else torch.ops._C_ascend.prefill_prefix_silu(gate, groups)
         del gate
         output = torch.empty_like(silu, dtype=torch.bfloat16)
         _prefill_route[grid](
