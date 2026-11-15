@@ -230,7 +230,7 @@ def test_native_failure_is_not_hidden_by_an_unmeasured_fallback():
 
 
 def block_methods(env):
-    env.setdefault("hc_post_fused", lambda *args: None)
+    env.setdefault("hc_post_fused", lambda *args, **kwargs: None)
     env.setdefault("hc_prefill_prepare", lambda *args: None)
     env.setdefault("hc_prefill_post", lambda *args: None)
     path = ROOT / "vllm_ascend/models/deepseek_v41/model.py"

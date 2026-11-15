@@ -20,11 +20,13 @@ if HAS_TRITON and not envs.VLLM_BATCH_INVARIANT:
         post,
         comb,
         row_mask,
+        input_mask,
         output,
         HIDDEN: tl.constexpr,
         WIDTH: tl.constexpr,
         BLOCK: tl.constexpr,
         HAS_ROW_MASK: tl.constexpr,
+        HAS_INPUT_MASK: tl.constexpr,
     ):
         row_id = tl.program_id(0)
         token = row_id // WIDTH
@@ -47,6 +49,9 @@ if HAS_TRITON and not envs.VLLM_BATCH_INVARIANT:
         # ReduceSum starts from positive zero, including when all products are -0.
         mixed = tl.where(mixed == 0.0, 0.0, mixed)
         sub_value = tl.load(sub + token * HIDDEN + channel, valid, 0).to(tl.float32)
+        if HAS_INPUT_MASK:
+            input_live = tl.load(input_mask + token) != 0
+            sub_value = tl.where(input_live, sub_value, 0.0)
         scaled = tl.load(post + token * WIDTH + stream) * sub_value
         result = scaled + mixed
         if HAS_ROW_MASK:
@@ -54,7 +59,7 @@ if HAS_TRITON and not envs.VLLM_BATCH_INVARIANT:
             result = tl.where(active, result, 0.0)
         tl.store(output + offsets, result.to(tl.bfloat16), valid)
 
-    def hc_post4(sublayer_output, residual, post, comb, row_mask=None):
+    def hc_post4(sublayer_output, residual, post, comb, row_mask=None, input_mask=None):
         output = torch.empty_like(residual)
         grid = (sublayer_output.shape[0] * _HC_WIDTH, triton.cdiv(_HIDDEN_SIZE, _BLOCK_SIZE))
         _hc_post4_kernel[grid](
@@ -63,11 +68,13 @@ if HAS_TRITON and not envs.VLLM_BATCH_INVARIANT:
             post,
             comb,
             residual if row_mask is None else row_mask,
+            residual if input_mask is None else input_mask,
             output,
             HIDDEN=_HIDDEN_SIZE,
             WIDTH=_HC_WIDTH,
             BLOCK=_BLOCK_SIZE,
             HAS_ROW_MASK=row_mask is not None,
+            HAS_INPUT_MASK=input_mask is not None,
             enable_fp_fusion=False,
         )
         return output

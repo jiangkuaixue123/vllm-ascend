@@ -13,7 +13,7 @@ LATENT_DIM = 512
 SELECTED_WIDTH = 640
 
 
-def try_selected_fia(q, kv, sink, slots, scale, *, sink_source_dtype=None):
+def try_selected_fia(q, kv, sink, slots, scale, *, sink_source_dtype=None, mask_empty_rows=True):
     """Consume compact-prefix physical slots; retain duplicates and their order."""
     if (
         q.device.type != "npu"
@@ -64,4 +64,6 @@ def try_selected_fia(q, kv, sink, slots, scale, *, sink_source_dtype=None):
         # Original FP32 parameters retain the full-precision normalization.
         factor = torch.sigmoid(lse.reshape(rows, TARGET_HEADS, 1, 1) - sink.view(1, TARGET_HEADS, 1, 1))
         output = (output.float() * factor).to(q.dtype)
-    return output.transpose(1, 2).masked_fill((~valid[:, 0]).view(rows, 1, 1, 1), 0)
+    output = output.transpose(1, 2)
+    # Target HC masks inactive residual rows after the unchanged WO/TP consumers.
+    return output.masked_fill((~valid[:, 0]).view(rows, 1, 1, 1), 0) if mask_empty_rows else output

@@ -224,9 +224,9 @@ def check_graph_case(rows, alias, max_model_len, shard, reference=attention, obs
         # A separately supplied parent makes its own long-context guard decision.
         observe_real = bool(i % 2) or reference is not attention
 
-        def observe(*args, events=events, fixture=f, stage=original):
+        def observe(*args, events=events, fixture=f, stage=original, **kwargs):
             events.append((fixture.current_layer, args[-1]))
-            return stage(*args)
+            return stage(*args, **kwargs)
 
         with patch.object(f.module, "stage_decode_arena", observe if observe_real else None):
             f.run()

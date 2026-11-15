@@ -730,6 +730,21 @@ class DecodeSlotArena:
     source_generation: int = 0
     index_generation: int = 0
     staged_generation: tuple[int, int, int] | None = None
+    slots: torch.Tensor | None = None
+    slot_live: torch.Tensor | None = None
+    slot_inputs: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
+
+    def slots_for(self, md, topk, refresh):
+        inputs = (md.seq_lens, md.active, topk)
+        same_inputs = self.slot_inputs is not None and all(
+            a.data_ptr() == b.data_ptr() and a.shape == b.shape and a.stride() == b.stride()
+            for a, b in zip(inputs, self.slot_inputs)
+        )
+        if refresh or not same_inputs:
+            self.slots = self.slot_live = None
+        # Retain the source views so allocator reuse cannot imitate the old producer.
+        self.slot_inputs = inputs
+        return self.slots
 
     def values_for_shard(self, q, stream, grouped_row_start):
         shape = (q.shape[0] * 640, 512)
@@ -811,6 +826,7 @@ class DeepseekV41Runtime:
     slot_arena: DecodeSlotArena | None = None
     prefill_workspace_bytes: int = 0
     block_row_mask: torch.Tensor | None = None
+    attention_output_mask: torch.Tensor | None = None
 
     @classmethod
     def for_decode(cls, metadata: DeepseekV41Metadata):
@@ -1286,7 +1302,11 @@ class DeepseekV41Attention(nn.Module):
             return None
         generation = (arena.source_generation, arena.index_generation, self.ratio)
         refresh = previous != generation
-        ids = stage_decode_arena(values, raw, comp, md, src, topk, self.ratio, refresh)
+        cached_ids = arena.slots_for(md, topk, refresh)
+        ids = stage_decode_arena(values, raw, comp, md, src, topk, self.ratio, refresh, ids=cached_ids)
+        if cached_ids is None:
+            arena.slot_live = ids[:, 0, 0] >= 0
+        arena.slots = ids
         arena.staged_generation = generation
         return values.view(rows, 640, 512), ids, refresh
 
@@ -1446,8 +1466,16 @@ class DeepseekV41Attention(nn.Module):
             )[:, 0]
         else:
             pages, slots, refresh = staged
+            owned = getattr(runtime, "block_row_mask", None) is not None
+            if owned:
+                runtime.attention_output_mask = runtime.slot_arena.slot_live
             attended = self.attention_kernel.decode_with_physical_slots(
-                q.unsqueeze(1), pages, self.attn_sink, slots, self.dim**-0.5
+                q.unsqueeze(1),
+                pages,
+                self.attn_sink,
+                slots,
+                self.dim**-0.5,
+                mask_empty_rows=not owned,
             )[:, 0]
             logger.info_once(
                 f"V4.1 native slot arena layer={self.layer_id} rows={q.shape[0]} "

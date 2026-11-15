@@ -19,6 +19,7 @@ RAW_PAD = 144
 WIDTH = WIN + TOP
 SLOT_ROWS = 4
 SLOT_COLUMNS = 64
+SELECT_NAN_BITS = 32767
 
 
 @triton.jit
@@ -43,8 +44,19 @@ def _gather(
     PROMOTE: tl.constexpr,
     TILE: tl.constexpr,
     D: tl.constexpr,
+    FINAL_RAW: tl.constexpr = False,
+    NAN_BITS: tl.constexpr = SELECT_NAN_BITS,
 ):
     dims = tl.arange(0, D)
+    if FINAL_RAW:
+        lanes = tl.arange(0, 8)
+        first_active = tl.load(active + lanes, lanes < GROUP_ROWS, 0).to(tl.int32)
+        first_live = tl.sum(first_active, 0) > 0
+        if ROWS == 2:
+            second_active = tl.load(active + GROUP_ROWS + lanes, lanes < GROUP_ROWS, 0).to(tl.int32)
+            second_live = tl.sum(second_active, 0) > 0
+        else:
+            second_live = first_live
     for block in range(tl.program_id(0), tl.cdiv(ROWS * COUNT, TILE), tl.num_programs(0)):
         flat = block * TILE + tl.arange(0, TILE)
         ok = flat < ROWS * COUNT
@@ -72,7 +84,13 @@ def _gather(
         valid = live & (pos >= 0) & (slot >= 0) & (slot < PHYS)
         address = tl.where(valid, slot, 0) * STRIDE
         value = tl.load(field + address[:, None] + dims[None, :], mask=valid[:, None], other=0)
-        if PROMOTE:
+        if FINAL_RAW:
+            bits = value.to(tl.int32)
+            is_nan = ((bits & 32640) == 32640) & ((bits & 127) != 0)
+            value = tl.where(is_nan, NAN_BITS, bits)
+            group_live = tl.where(row == 0, first_live, second_live)
+            value = tl.where(group_live[:, None], value, 0).to(tl.int16)
+        elif PROMOTE:
             value = value.to(tl.int32) << 16
         tl.store(out + flat[:, None] * D + dims[None, :], value, mask=ok[:, None])
 
@@ -117,6 +135,32 @@ def read(field, metadata, ids, ratio, raw, dtype, destination):
     group_rows = min(QWIDTH, ids.shape[0])
     rows = ids.shape[0] // group_rows if raw else ids.shape[0]
     bits = torch.int32 if dtype == torch.float32 else torch.int16
+    if raw and rows in (1, 2):
+        # Both stock BF16 Select and promoted-FP32 Select/Cast canonicalize NaNs.
+        _gather[(min(triton.cdiv(rows * count, 8), get_vectorcore_num()),)](
+            field.view(torch.int16),
+            metadata.block_table_tensor,
+            metadata.seq_lens,
+            metadata.active,
+            ids,
+            destination.view(torch.int16),
+            group_rows,
+            rows,
+            count,
+            metadata.max_model_len,
+            128,
+            field.shape[0],
+            field.stride(0),
+            metadata.block_table_tensor.stride(0),
+            ids.stride(0),
+            ratio,
+            True,
+            False,
+            8,
+            DIM,
+            FINAL_RAW=True,
+        )
+        return
     tmp = torch.empty((rows, count, DIM), dtype=bits, device=field.device)
     grid = (min(triton.cdiv(rows * count, 8), get_vectorcore_num()),)
     _gather[grid](
@@ -146,7 +190,7 @@ def read(field, metadata, ids, ratio, raw, dtype, destination):
     destination.copy_(torch.where(live[:, None, None], tmp.view(dtype), 0.0).to(torch.bfloat16))
 
 
-def stage(arena, raw, comp, md, src, topk, ratio, refresh):
+def stage(arena, raw, comp, md, src, topk, ratio, refresh, ids=None):
     rows = topk.shape[0]
     group_rows = min(QWIDTH, rows)
     groups = rows // group_rows
@@ -166,9 +210,10 @@ def stage(arena, raw, comp, md, src, topk, ratio, refresh):
     read(raw, md, topk, ratio, True, comp.dtype, arena[: groups * UNION].view(groups, UNION, DIM))
     if refresh:
         read(comp, src, topk, ratio, False, comp.dtype, arena[cmp_base : cmp_base + rows * TOP].view(rows, TOP, DIM))
-    ids = torch.empty((rows, 1, WIDTH), dtype=torch.int32, device=raw.device)
-    _slots[(triton.cdiv(rows, SLOT_ROWS), triton.cdiv(WIDTH, SLOT_COLUMNS))](
-        md.seq_lens, md.active, topk, ids, group_rows, rows, cmp_base, topk.stride(0), SLOT_COLUMNS, SLOT_ROWS
-    )
+    if ids is None:
+        ids = torch.empty((rows, 1, WIDTH), dtype=torch.int32, device=raw.device)
+        _slots[(triton.cdiv(rows, SLOT_ROWS), triton.cdiv(WIDTH, SLOT_COLUMNS))](
+            md.seq_lens, md.active, topk, ids, group_rows, rows, cmp_base, topk.stride(0), SLOT_COLUMNS, SLOT_ROWS
+        )
     logger.info_once("TARGET_SLOT_ROWS_RUNTIME pid=%d rows=%d", os.getpid(), rows, scope="process")
     return ids

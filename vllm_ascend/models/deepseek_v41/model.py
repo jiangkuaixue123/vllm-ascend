@@ -199,12 +199,11 @@ class DeepseekV41Block(nn.Module):
 
     def post_residual(self, sublayer_output, residual, post, comb, runtime):
         row_mask = getattr(runtime, "block_row_mask", None)
+        input_mask = getattr(runtime, "attention_output_mask", None)
+        if input_mask is not None:
+            runtime.attention_output_mask = None
         if getattr(runtime, "decode", None) is not None:
-            output = (
-                hc_post_fused(sublayer_output, residual, post, comb)
-                if row_mask is None
-                else hc_post_fused(sublayer_output, residual, post, comb, row_mask=row_mask)
-            )
+            output = hc_post_fused(sublayer_output, residual, post, comb, row_mask=row_mask, input_mask=input_mask)
             if output is not None:
                 if getattr(self, "_hc_post_fused_witness_pending", False):
                     logger.info("HC_POST_FUSED_RUNTIME pid=%s rows=%s", os.getpid(), residual.shape[0])
@@ -214,10 +213,14 @@ class DeepseekV41Block(nn.Module):
             output = hc_prefill_post(sublayer_output, residual, post, comb)
             if output is not None:
                 return output
+        if input_mask is not None:
+            sublayer_output = torch.where(input_mask[:, None], sublayer_output, 0)
         output = hc_post(sublayer_output, residual, post, comb)
         return output if row_mask is None else torch.where(row_mask[:, None, None], output, 0)
 
     def forward(self, hidden_states, pre_mix, runtime, decode_mask=None, image_mask=None):
+        if getattr(runtime, "decode", None) is not None:
+            runtime.attention_output_mask = None
         if hidden_states.shape[0] == 0:
             # Other DP replicas can be active. Participate in every expert
             # collective while avoiding empty NPU GEMMs and TP reductions.

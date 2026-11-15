@@ -13,7 +13,7 @@ _HIDDEN_SIZE = 5120
 _ND_FORMAT = 2
 
 
-def hc_post_fused(sublayer_output, residual, post, comb, *, row_mask=None):
+def hc_post_fused(sublayer_output, residual, post, comb, *, row_mask=None, input_mask=None):
     """Return the fused decode result, or None for unsupported metadata."""
     if (
         sublayer_output.device.type != "npu"
@@ -42,6 +42,13 @@ def hc_post_fused(sublayer_output, residual, post, comb, *, row_mask=None):
         or not row_mask.is_contiguous()
     ):
         return None
+    if input_mask is not None and (
+        input_mask.shape != sublayer_output.shape[:1]
+        or input_mask.dtype != torch.bool
+        or input_mask.device != sublayer_output.device
+        or not input_mask.is_contiguous()
+    ):
+        return None
     from torch_npu import get_npu_format
 
     if any(get_npu_format(tensor) != _ND_FORMAT for tensor in (sublayer_output, residual, post, comb)):
@@ -51,4 +58,4 @@ def hc_post_fused(sublayer_output, residual, post, comb, *, row_mask=None):
 
     if hc_post4 is None:
         return None
-    return hc_post4(sublayer_output, residual, post, comb, row_mask)
+    return hc_post4(sublayer_output, residual, post, comb, row_mask, input_mask)

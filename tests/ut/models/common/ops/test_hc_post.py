@@ -44,7 +44,7 @@ def load_dispatcher():
     calls = []
     output = object()
     env = {
-        "torch": SimpleNamespace(bfloat16="bf16", float32="fp32", is_inference_mode_enabled=lambda: True),
+        "torch": SimpleNamespace(bfloat16="bf16", float32="fp32", bool="bool", is_inference_mode_enabled=lambda: True),
         "get_ascend_device_type": lambda: "A3",
         "AscendDeviceType": SimpleNamespace(A3="A3"),
         "get_npu_format": lambda value: value.npu_format,
@@ -126,6 +126,19 @@ def test_kernel_failures_are_not_hidden():
         env["hc_post_fused"](*inputs())
 
 
+@pytest.mark.parametrize("changes", [{}, {"shape": (5,)}, {"dtype": "fp32"}, {"contiguous": False}])
+def test_sublayer_mask_is_independent_and_validated(changes):
+    env, calls, output = load_dispatcher()
+    mask = tensor((6,), "bool")
+    for name, value in changes.items():
+        setattr(mask, name, value)
+    actual = env["hc_post_fused"](*inputs(), input_mask=mask)
+    if changes:
+        assert actual is None and not calls
+    else:
+        assert actual is output and calls[0][-1] is mask
+
+
 @pytest.mark.parametrize("decode", [False, True])
 @pytest.mark.parametrize("supported", [False, True])
 def test_actual_model_method_only_fuses_decode(decode, supported):
@@ -136,8 +149,9 @@ def test_actual_model_method_only_fuses_decode(decode, supported):
     fused, reference = object(), object()
     calls = []
     env = {
-        "hc_post_fused": lambda *args: calls.append("fused") or (fused if supported else None),
+        "hc_post_fused": lambda *args, **kwargs: calls.append("fused") or (fused if supported else None),
         "hc_post": lambda *args: calls.append("reference") or reference,
+        "hc_prefill_post": lambda *args: None,
     }
     exec(compile(ast.Module(body=[method], type_ignores=[]), str(path), "exec"), env)
     runtime = SimpleNamespace(decode=object() if decode else None)

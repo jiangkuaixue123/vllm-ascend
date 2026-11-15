@@ -210,9 +210,11 @@ class DeepseekV41NativeAttention:
             raise RuntimeError("V4.1 attention requires Ascend's npu_sparse_attn_sharedkv custom operator")
         return self._native(q, kv, sink, indices, scale, mode, swa_window, uniform_decode)
 
-    def decode_with_physical_slots(self, q, kv, sink, slots, scale):
+    def decode_with_physical_slots(self, q, kv, sink, slots, scale, *, mask_empty_rows=True):
         """Uniform target decode with absolute slots already packed in original logical order."""
-        selected = try_selected_fia(q, kv, sink, slots, scale, sink_source_dtype=self.sink_source_dtype)
+        selected = try_selected_fia(
+            q, kv, sink, slots, scale, sink_source_dtype=self.sink_source_dtype, mask_empty_rows=mask_empty_rows
+        )
         if selected is not None:
             if self.sink_source_dtype == torch.bfloat16:
                 logger.info_once(
@@ -230,7 +232,18 @@ class DeepseekV41NativeAttention:
                 scope="process",
             )
             return selected
-        return self._native(q, kv, sink, slots, scale, "DSA target indexed decode", None, True, physical_slots=True)
+        return self._native(
+            q,
+            kv,
+            sink,
+            slots,
+            scale,
+            "DSA target indexed decode",
+            None,
+            True,
+            physical_slots=True,
+            mask_empty_rows=mask_empty_rows,
+        )
 
     def prefill_with_physical_slots(self, q, kv, sink, slots, scale, *, padded_kv=None, slot_table=None):
         """Real contiguous prefill rows, each proven by the caller to have a raw SWA key."""
