@@ -13,7 +13,7 @@ from vllm import envs
 from vllm.triton_utils import HAS_TRITON
 
 from vllm_ascend.models.deepseek_v41 import attention_ops as ops
-from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
+from vllm_ascend.utils import AscendDeviceType, enable_custom_op, get_ascend_device_type
 
 pytestmark = pytest.mark.skipif(
     not HAS_TRITON or get_ascend_device_type() != AscendDeviceType.A3, reason="A3 Triton only"
@@ -23,40 +23,63 @@ if HAS_TRITON:
     from vllm_ascend.ops.triton import deepseek_v41_fp8_qdq as aiv
 
 
-class KernelLaunches:
-    def __init__(self, kernel):
-        self.kernel = kernel
-        self.calls = []
+@pytest.fixture(autouse=True)
+def native_extension():
+    torch.npu.set_device(0)
+    assert enable_custom_op()
 
-    def __getitem__(self, grid):
-        def call(x, out, *, NTILES, G):
-            compiled = self.kernel[grid](x, out, NTILES=NTILES, G=G)
-            self.calls.append((grid, NTILES, G, x.dtype, out.dtype, x.data_ptr() == out.data_ptr(), compiled))
-            return compiled
 
-        return call
+@pytest.mark.parametrize("elements", [0, 32, 288, 4128])
+@torch.inference_mode()
+def test_native_group_tails_and_guards(elements):
+    words = torch.full((elements + 64,), 12345, dtype=torch.int16, device="npu")
+    x = words[32:-32].view(torch.bfloat16).view(-1, 32)
+    if elements:
+        x.copy_(torch.linspace(-2, 2, elements, device="cpu").view(x.shape))
+    for value in (0.5, float("inf"), float("nan")):
+        if elements:
+            x[-1, 0] = value
+        with patch.object(envs, "VLLM_BATCH_INVARIANT", True):
+            expected = ops.fp8_quant_dequant(x) if elements else x.clone()
+        actual = aiv.decode_fp8_qdq(x, False)
+        assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
+        assert torch.all(words[:32] == 12345) and torch.all(words[-32:] == 12345)
+
+
+@pytest.mark.parametrize("anchor", [0.0, 2**-24, 2**-6, 1.0, 448.0, 2**15, 2**64, 2**120, float("inf"), float("nan")])
+@torch.inference_mode()
+def test_all_words_with_group_scale_anchor(anchor):
+    words = torch.arange(65536, dtype=torch.int32).short().reshape(-1, 32)
+    anchor_word = torch.tensor(anchor, dtype=torch.bfloat16).view(torch.int16)
+    for column in (0, 31):
+        raw = words.clone()
+        raw[:, column] = anchor_word
+        x = raw.view(torch.bfloat16).npu().reshape(128, 512)
+        with patch.object(envs, "VLLM_BATCH_INVARIANT", True):
+            expected = ops.fp8_quant_dequant(x)
+        actual = aiv.decode_fp8_qdq(x, False)
+        torch.testing.assert_close(actual.view(torch.int16), expected.view(torch.int16), rtol=0, atol=0)
 
 
 @pytest.mark.parametrize(
-    "shape,tiles,groups",
+    "shape",
     [
-        ((24, 2, 4096), 96, 64),
-        ((48, 2, 4096), 192, 64),
-        ((24, 1, 4096), 48, 64),
-        ((48, 1, 4096), 96, 64),
-        ((24, 512), 48, 8),
-        ((48, 512), 48, 16),
+        (24, 2, 4096),
+        (48, 2, 4096),
+        (24, 1, 4096),
+        (48, 1, 4096),
+        (24, 512),
+        (48, 512),
     ],
 )
 @pytest.mark.parametrize("inplace", [False, True])
-def test_actual_single_pass_replay(shape, tiles, groups, inplace):
+def test_actual_native_replay(shape, inplace):
     n = math.prod(shape)
     # Create versioned storage before entering inference mode. The aligned nonzero
     # offset and two guards exercise DMA addressing and the existing copy_ contract.
     words = torch.full((n + 64,), 12345, dtype=torch.int16, device="npu")
     x = words[32:-32].view(torch.bfloat16).reshape(shape)
-    launches = KernelLaunches(aiv._kernel)
-    with torch.inference_mode(), patch.object(aiv, "_kernel", launches):
+    with torch.inference_mode():
         version = x._version
         with patch.object(ops, "_decode_fp8_qdq", side_effect=AssertionError("expected the single-pass path")):
             warm = ops.fp8_quant_dequant(x, inplace=inplace)
@@ -66,10 +89,6 @@ def test_actual_single_pass_replay(shape, tiles, groups, inplace):
             with torch.npu.graph(graph, capture_error_mode="thread_local", auto_dispatch_capture=True):
                 out = ops.fp8_quant_dequant(x, inplace=inplace)
         assert (out is x) == inplace and (out.data_ptr() == x.data_ptr()) == inplace
-        assert [c[:-1] for c in launches.calls] == [((48,), tiles, groups, torch.bfloat16, torch.bfloat16, inplace)] * 2
-        ir = launches.calls[0][-1].asm["ttir"]
-        assert ir.count("tt.load ") == ir.count("tt.store ") == 1
-        assert "!tt.ptr<bf16>" in ir and "arith.addf" in ir and "arith.subf" in ir and "arith.divf" not in ir
         seq = torch.arange(n, dtype=torch.int32, device="cpu")
         # For the two smaller KV inputs, shift the raw pattern through all 65536 words.
         patterns = [(seq + start).short() for start in range(0, 65536, n)]
@@ -120,7 +139,9 @@ def test_unsupported_single_pass_uses_q_or_reference(case):
             stack.enter_context(patch("vllm.triton_utils.HAS_TRITON", False))
         if case == "other_core_count":
             stack.enter_context(patch.object(aiv, "get_vectorcore_num", return_value=32))
-        stack.enter_context(patch.object(aiv, "_kernel", None))
+        stack.enter_context(
+            patch.object(torch.ops._C_ascend, "deepseek_v41_fp8_qdq", side_effect=AssertionError("native guard"))
+        )
         assert ops.fp8_quant_dequant(x, inplace=True) is x
     # Move to plain CPU before reinterpretation for physical blocked formats.
     assert torch.equal(x.cpu().view(torch.int16), expected.cpu().view(torch.int16))
