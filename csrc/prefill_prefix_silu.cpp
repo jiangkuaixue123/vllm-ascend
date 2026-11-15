@@ -19,11 +19,15 @@ at::Tensor prefill_prefix_silu(const at::Tensor& x, const at::Tensor& groups) {
     const c10_npu::OptionalNPUGuard guard(x.device());
     auto output = at::empty_like(x);
     auto stream = c10_npu::getCurrentNPUStream().stream();
+    auto x_ptr = x.data_ptr();
+    auto groups_ptr = groups.data_ptr();
+    auto out_ptr = output.data_ptr();
+    const uint32_t rows = x.size(0), width = x.size(1), count = groups.numel();
     at_npu::native::OpCommand cmd;
     cmd.Name("prefill_prefix_silu");
-    cmd.SetCustomHandler([x, groups, output, stream]() -> int {
-        prefill_prefix_silu_launch(stream, x.data_ptr(), groups.data_ptr(), output.data_ptr(),
-                                  x.size(0), x.size(1), groups.numel());
+    // The command pool retains handlers; tensor captures would retain entire activations.
+    cmd.SetCustomHandler([x_ptr, groups_ptr, out_ptr, rows, width, count, stream]() -> int {
+        prefill_prefix_silu_launch(stream, x_ptr, groups_ptr, out_ptr, rows, width, count);
         return 0;
     });
     cmd.Run();

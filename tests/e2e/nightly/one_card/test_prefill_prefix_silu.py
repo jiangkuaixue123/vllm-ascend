@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
+import gc
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -6,6 +8,28 @@ import torch_npu  # noqa: F401
 import vllm_ascend.vllm_ascend_C  # noqa: F401
 
 import vllm_ascend  # noqa: F401
+
+
+@torch.inference_mode()
+def test_prefix_silu_releases_temporary_storage():
+    groups = torch.zeros(24, dtype=torch.int64, device="npu")
+    groups[0] = 64
+
+    def execute():
+        x = torch.empty((1024, 2304), dtype=torch.float32, device="npu").fill_(0.5)
+        return torch.ops._C_ascend.prefill_prefix_silu(x, groups)
+
+    output = execute()
+    del output
+    torch.npu.synchronize()
+    gc.collect()
+    baseline = torch.npu.memory_allocated()
+    for _ in range(32):
+        output = execute()
+        del output
+    torch.npu.synchronize()
+    gc.collect()
+    assert torch.npu.memory_allocated() <= baseline + 4 * 1024 * 1024
 
 
 @pytest.mark.parametrize("limit", [0.0, 2.1, 10.0])
