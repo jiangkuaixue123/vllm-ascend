@@ -119,19 +119,27 @@ def _try_decode_fp8_aiv(x: torch.Tensor, inplace: bool):
     # unaligned cases on the existing Q implementation.
     if (
         x.device.type != "npu"
+        or x.dtype != torch.bfloat16
         or x.layout != torch.strided
+        or x.ndim not in (2, 3)
+        or x.shape[-1] not in (512, 4096)
+        or not 0 < x.numel() <= 2**32 - 1
+        or not x.is_contiguous()
         or x.is_neg()
+        or x.requires_grad
+        or not torch.is_inference_mode_enabled()
         or torch.compiler.is_compiling()
         or x.storage_offset() % _FP8_DECODE_GROUP_SIZE
         or x.data_ptr() % (_FP8_DECODE_GROUP_SIZE * x.element_size())
     ):
         return None
 
+    from vllm import envs
     from vllm.triton_utils import HAS_TRITON
 
     from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
-    if not HAS_TRITON or get_ascend_device_type() != AscendDeviceType.A3:
+    if envs.VLLM_BATCH_INVARIANT or not HAS_TRITON or get_ascend_device_type() != AscendDeviceType.A3:
         return None
 
     import torch_npu
@@ -177,7 +185,7 @@ def fp8_quant_dequant(x: torch.Tensor, block_size: int = 32, *, inplace: bool = 
     """
     shape = _group_shape(x, block_size)
     decode = _use_decode_fp8_qdq(x, block_size)
-    if decode:
+    if block_size == _FP8_DECODE_GROUP_SIZE:
         fused = _try_decode_fp8_aiv(x, inplace)
         if fused is not None:
             return fused
@@ -209,6 +217,12 @@ def fp4_quant_dequant(
     Neither rule may be replaced with BF16-only cache storage.
     """
     shape = _group_shape(x, block_size)
+    if x.device.type == "npu" and x.dtype == torch.bfloat16:
+        from vllm_ascend.ops.triton.deepseek_v41_fp4_qdq import fp4_qdq
+
+        fused = fp4_qdq(x, block_size, scale_format, inplace)
+        if fused is not None:
+            return fused
     grouped = x.float().reshape(shape)
     amax = grouped.abs().amax(dim=-1, keepdim=True)
     if scale_format == "e8m0":
