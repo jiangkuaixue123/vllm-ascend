@@ -511,6 +511,7 @@ class DeepseekV41DSparkForCausalLM(nn.Module):
         self.mtp[-1].markov_head = DSparkMarkov(config)
         self.mtp[-1].confidence_head = DSparkConfidence(config)
         self.logits_processor = LogitsProcessor(config.vocab_size)
+        self.mtp[-1].head._cache_weight_cast = self.logits_processor.head_dtype == torch.bfloat16
         self.model_path = Path(vllm_config.model_config.model)
 
     def embed_input_ids(self, input_ids):

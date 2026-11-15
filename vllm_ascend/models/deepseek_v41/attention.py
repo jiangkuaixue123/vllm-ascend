@@ -810,6 +810,7 @@ class DeepseekV41Runtime:
     decode_candidate_width: int = 0
     slot_arena: DecodeSlotArena | None = None
     prefill_workspace_bytes: int = 0
+    block_row_mask: torch.Tensor | None = None
 
     @classmethod
     def for_decode(cls, metadata: DeepseekV41Metadata):
@@ -1455,6 +1456,9 @@ class DeepseekV41Attention(nn.Module):
             )
         self.rotate(attended.unsqueeze(0), pos, inverse=True)
         output = self._project_output(attended, x.dtype)
+        if getattr(runtime, "block_row_mask", None) is not None:
+            # The target block's HC producer owns inactive rows through the next consumer.
+            return output
         return torch.where(local_md.active[:, None], output, 0)
 
     def forward(self, hidden_states, runtime):

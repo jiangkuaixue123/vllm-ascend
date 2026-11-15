@@ -68,6 +68,7 @@ from vllm_ascend.models.deepseek_v41.vision import embed_images, init_vision_mod
 from vllm_ascend.utils import enable_dsa_cp, enable_sp, shared_expert_dp_enabled
 
 MAX_DECODE_GRAPH_ROWS = 8
+_BLOCK_MASK_SHAPE = (4, 5120)
 
 
 def _decode_capture_sizes(compilation, query_width=1):
@@ -197,8 +198,13 @@ class DeepseekV41Block(nn.Module):
         logger.info("HC_NATIVE_RUNTIME_WITNESS %s", json.dumps(record, sort_keys=True, separators=(",", ":")))
 
     def post_residual(self, sublayer_output, residual, post, comb, runtime):
+        row_mask = getattr(runtime, "block_row_mask", None)
         if getattr(runtime, "decode", None) is not None:
-            output = hc_post_fused(sublayer_output, residual, post, comb)
+            output = (
+                hc_post_fused(sublayer_output, residual, post, comb)
+                if row_mask is None
+                else hc_post_fused(sublayer_output, residual, post, comb, row_mask=row_mask)
+            )
             if output is not None:
                 if getattr(self, "_hc_post_fused_witness_pending", False):
                     logger.info("HC_POST_FUSED_RUNTIME pid=%s rows=%s", os.getpid(), residual.shape[0])
@@ -208,7 +214,8 @@ class DeepseekV41Block(nn.Module):
             output = hc_prefill_post(sublayer_output, residual, post, comb)
             if output is not None:
                 return output
-        return hc_post(sublayer_output, residual, post, comb)
+        output = hc_post(sublayer_output, residual, post, comb)
+        return output if row_mask is None else torch.where(row_mask[:, None, None], output, 0)
 
     def forward(self, hidden_states, pre_mix, runtime, decode_mask=None, image_mask=None):
         if hidden_states.shape[0] == 0:
@@ -222,7 +229,12 @@ class DeepseekV41Block(nn.Module):
         ffn_input, ffn_pre, post, comb = self.pre_and_mixes(hidden_states, attn_pre, "ffn", runtime)
         ffn_input = self.ffn_norm(ffn_input)
         if getattr(runtime, "decode", None) is not None:
-            output = self.ffn.forward_decode(ffn_input, runtime.decode.active if decode_mask is None else decode_mask)
+            active = runtime.decode.active if decode_mask is None else decode_mask
+            output = (
+                self.ffn.forward_decode(ffn_input, active)
+                if getattr(runtime, "block_row_mask", None) is None
+                else self.ffn.forward_decode(ffn_input, active, mask_owned_by_block=True)
+            )
         elif image_mask is not None:
             output = self.ffn(ffn_input, image_mask=image_mask)
         else:
@@ -320,6 +332,7 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsMultiModal):
             prefix="head",
         )
         self.logits_processor = LogitsProcessor(config.vocab_size)
+        self.head._cache_weight_cast = self.logits_processor.head_dtype == torch.bfloat16
         self.model_path = Path(vllm_config.model_config.model)
         self.engram_store = None
         self.engram_hasher = None
@@ -591,6 +604,17 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsMultiModal):
         runtime = DeepseekV41Runtime.for_decode(metadata)
         local_active = sp_shard(runtime.decode.active) if self.sequence_parallel else runtime.decode.active
         hidden_states, pre_mix = self._start_hc(self.embed(input_ids))
+        if (
+            hidden_states.device.type == "npu"
+            and hidden_states.dtype == torch.bfloat16
+            and hidden_states.shape[-2:] == _BLOCK_MASK_SHAPE
+            and torch.is_inference_mode_enabled()
+        ):
+            hidden_states = torch.where(local_active[:, None, None], hidden_states, 0)
+            runtime.block_row_mask = local_active
+            logger.info_once(
+                "TARGET_BLOCK_ROW_MASK_RUNTIME pid=%d rows=%d", os.getpid(), hidden_states.shape[0], scope="process"
+            )
         auxiliary = []
         for layer_id, layer in enumerate(self.layers):
             if layer.engram is not None:
@@ -600,6 +624,8 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsMultiModal):
                     local_active,
                     sequence_parallel=self.sequence_parallel,
                 )
+                if runtime.block_row_mask is not None:
+                    hidden_states = torch.where(local_active[:, None, None], hidden_states, 0)
             self._capture_aux(auxiliary, layer_id, hidden_states, input_ids.shape[0])
             hidden_states, pre_mix = layer(hidden_states, pre_mix, runtime, local_active)
         output = self._finish_hc(hidden_states, pre_mix, input_ids.shape[0])

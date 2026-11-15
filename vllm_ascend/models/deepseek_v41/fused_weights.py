@@ -108,4 +108,7 @@ def load_indexed_v41_weights(model, weight_map, tp_rank, tp_size, read_parameter
         logger.info("V4.1 loaded indexed shard %s (%d local tensors)", shard, len(parts))
     if loaded != set(parameters):
         raise RuntimeError(f"Unloaded V4.1 parameters: {set(parameters) - loaded}")
+    for module in modules.values():
+        if getattr(module, "_cache_weight_cast", False) is True and hasattr(module, "_refresh_head_cast"):
+            module._refresh_head_cast()
     return loaded

@@ -16,12 +16,16 @@
 #
 
 
+import os
+
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from torch import nn
 from torch.nn.parameter import Parameter
 from vllm.distributed import divide
 from vllm.distributed.parallel_state import get_tp_group
+from vllm.logger import logger
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
@@ -299,6 +303,28 @@ class AscendParallelLMHead(ParallelLMHead):
             )
         else:
             self.register_parameter("bias", None)
+        self.register_buffer("_head_cast_weight", None, persistent=False)
+        self._head_cast_name = prefix
+        self.register_load_state_dict_post_hook(self._refresh_head_cast)
+
+    @torch.inference_mode()
+    def _refresh_head_cast(self, *_):
+        # shortcut: arbitrary parameter edits require this refresh before graph replay.
+        if self._head_cast_weight is None:
+            if (
+                getattr(self, "_cache_weight_cast", False)
+                and self.weight.device.type == "npu"
+                and self.weight.dtype == torch.float32
+            ):
+                # Prepare outside capture so graph replay cannot retain the cast.
+                self._head_cast_weight = self.weight.to(torch.bfloat16)
+        else:
+            self._head_cast_weight.copy_(self.weight)
+
+    def weight_loader(self, param, loaded_weight):
+        super().weight_loader(param, loaded_weight)
+        if param is self.weight:
+            self._refresh_head_cast()
 
 
 def lmhead_all_to_all(
@@ -356,6 +382,27 @@ class AscendLogitsProcessor(LogitsProcessor):
         hidden_states: torch.Tensor,
         embedding_bias: torch.Tensor | None,
     ) -> torch.Tensor:
+        if (
+            getattr(lm_head, "_cache_weight_cast", False)
+            and torch.is_inference_mode_enabled()
+            and hidden_states.device.type == "npu"
+            and hidden_states.dtype == torch.float32
+            and self.head_dtype == torch.bfloat16
+            and lm_head.weight.dtype == torch.float32
+            and lm_head.weight.device == hidden_states.device
+            and isinstance(lm_head.quant_method, UnquantizedEmbeddingMethod)
+        ):
+            cached = lm_head._head_cast_weight
+            if cached is None or cached.dtype != self.head_dtype or cached.device != lm_head.weight.device:
+                lm_head._head_cast_weight = lm_head.weight.to(self.head_dtype)
+            logger.info_once(
+                "HEAD_CAST_CACHE_RUNTIME pid=%d head=%s", os.getpid(), lm_head._head_cast_name, scope="process"
+            )
+            return F.linear(
+                hidden_states.to(self.head_dtype),
+                lm_head._head_cast_weight,
+                embedding_bias.to(self.head_dtype) if embedding_bias is not None else None,
+            )
         return super()._apply_head(lm_head, hidden_states, embedding_bias)
 
     def _get_logits(
