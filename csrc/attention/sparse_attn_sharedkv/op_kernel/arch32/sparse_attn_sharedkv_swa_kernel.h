@@ -381,6 +381,22 @@ __aicore__ inline uint32_t SparseAttnSharedkvSwa<SAST>::GetOriSparseActualSeqLen
         (qTokenOffset * constInfo.kvHeadNum + tempLoopInfo.n2Idx) * constInfo.oriSparseIndexWidth;
     uint32_t maxSparseLen = Min(static_cast<uint64_t>(constInfo.oriSparseIndexWidth),
                                 static_cast<uint64_t>(tempLoopInfo.actOriS2Size));
+    // Explicit slots bypass block-table addressing. The producer can publish
+    // their compact prefix length in an otherwise unused, same-shaped table.
+    if constexpr (KV_LAYOUT_T == SAS_LAYOUT::PA_ND && LAYOUT_T == SAS_LAYOUT::TND &&
+                  TEMPLATE_MODE == SWA_TEMPLATE) {
+        constexpr int32_t PREFILL_LENGTH_TAG = -0x563431;
+        if (constInfo.kvHeadNum == 1 && tempLoopInfo.actS1Size == 1 &&
+            tempLoopInfo.s1StartIdx == 0 && constInfo.oriMaxBlockNumPerBatch >= 2) {
+            uint64_t tableOffset = static_cast<uint64_t>(tempLoopInfo.bIdx) * constInfo.oriMaxBlockNumPerBatch;
+            if (oriBlockTableGm.GetValue(tableOffset) == PREFILL_LENGTH_TAG) {
+                int32_t length = oriBlockTableGm.GetValue(tableOffset + 1);
+                if (length >= 0 && static_cast<uint32_t>(length) <= maxSparseLen) {
+                    return static_cast<uint32_t>(length);
+                }
+            }
+        }
+    }
     uint32_t sparseLen = 0;
     for (; sparseLen < maxSparseLen; ++sparseLen) {
         if (oriSparseIndicesGm.GetValue(sparseIndexBaseOffset + sparseLen) < 0) {

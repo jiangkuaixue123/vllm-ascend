@@ -19,13 +19,15 @@ PAGE_SIZE = 16
 SPARSE_ALIGNMENT = 128
 MAX_SPARSE_WIDTH = 2048
 LATENT_DIM = 512
+# Private explicit-slot table extension; ordinary paged block IDs are nonnegative.
+PREFILL_LENGTH_TAG = -0x563431
 
 
 def aligned_length(length, alignment):
     return (length + alignment - 1) // alignment * alignment
 
 
-def physical_indices(indices, page_stride, kv_length, sparse_width):
+def physical_indices(indices, page_stride, kv_length, sparse_width, *, lengths=None):
     """Encode slots into the packed BF16 pages. Keep duplicates, shift holes to the tail."""
     batch, sequence, _ = indices.shape
     valid = (indices >= 0) & (indices < kv_length)
@@ -33,7 +35,12 @@ def physical_indices(indices, page_stride, kv_length, sparse_width):
     slots = torch.where(valid, indices.int() + offsets, -1)
     # A3 stops scanning a row at its first negative entry. Send every invalid
     # entry to a discarded scratch column; valid entries have unique destinations.
-    destinations = torch.where(valid, valid.int().cumsum(-1) - 1, sparse_width).long()
+    prefix = valid.int().cumsum(-1)
+    if lengths is not None:
+        lengths.copy_(prefix[..., -1].reshape(-1))
+    destinations = prefix - 1
+    del prefix
+    destinations = torch.where(valid, destinations, sparse_width).long()
     packed = torch.full((batch, sequence, sparse_width + 1), -1, dtype=torch.int32, device=indices.device)
     packed.scatter_(-1, destinations, slots)
     return packed[..., :sparse_width].reshape(batch * sequence, 1, sparse_width).contiguous()
@@ -56,6 +63,7 @@ class PrefillAttentionInputs:
     topk: torch.Tensor | None = None
     geometry: tuple | None = None
     slots: torch.Tensor | None = None
+    slot_table: torch.Tensor | None = None
     workspace: torch.Tensor | None = None
     workspace_geometry: tuple | None = None
     compressed: torch.Tensor | None = None
@@ -80,7 +88,19 @@ class PrefillAttentionInputs:
             indices = prefill_indices(positions, window_size, seq_len, first, raw_length, topk)
             length = raw_length + compressed_length
             width = aligned_length(indices.shape[-1], SPARSE_ALIGNMENT)
-            self.slots = physical_indices(indices, aligned_length(length, PAGE_SIZE), length, width)
+            self.slot_table = torch.zeros(
+                (positions.numel(), width // PAGE_SIZE),
+                dtype=torch.int32,
+                device=topk.device,
+            )
+            self.slot_table[:, 0].fill_(PREFILL_LENGTH_TAG)
+            self.slots = physical_indices(
+                indices,
+                aligned_length(length, PAGE_SIZE),
+                length,
+                width,
+                lengths=self.slot_table[:, 1],
+            )
             self.topk, self.geometry = topk, geometry
         return self.slots
 
@@ -212,7 +232,7 @@ class DeepseekV41NativeAttention:
             return selected
         return self._native(q, kv, sink, slots, scale, "DSA target indexed decode", None, True, physical_slots=True)
 
-    def prefill_with_physical_slots(self, q, kv, sink, slots, scale, *, padded_kv=None):
+    def prefill_with_physical_slots(self, q, kv, sink, slots, scale, *, padded_kv=None, slot_table=None):
         """Real contiguous prefill rows, each proven by the caller to have a raw SWA key."""
         return self._native(
             q,
@@ -224,6 +244,7 @@ class DeepseekV41NativeAttention:
             None,
             physical_slots=True,
             padded_kv=padded_kv,
+            slot_table=slot_table,
             mask_empty_rows=False,
         )
 
@@ -240,6 +261,7 @@ class DeepseekV41NativeAttention:
         *,
         physical_slots=False,
         padded_kv=None,
+        slot_table=None,
         mask_empty_rows=True,
     ):
         batch, sequence, heads, dim = q.shape
@@ -290,6 +312,17 @@ class DeepseekV41NativeAttention:
                 metadata, table, common = self.plan(
                     q.device, heads, batch * sequence, 1, sparse_width, sparse_width, sparse_width - 1
                 )
+            if slot_table is not None:
+                if (
+                    not physical_slots
+                    or uniform_decode
+                    or slot_table.shape != table.shape
+                    or slot_table.dtype != torch.int32
+                    or slot_table.device != q.device
+                    or not slot_table.is_contiguous()
+                ):
+                    raise ValueError("V4.1 prepared slot table must match the eager physical-slot plan")
+                table = slot_table
         result = torch.ops._C_ascend.npu_sparse_attn_sharedkv(
             q.reshape(-1, heads, dim).contiguous(),
             ori_kv=pages,

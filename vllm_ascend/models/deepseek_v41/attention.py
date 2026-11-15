@@ -1556,6 +1556,7 @@ class DeepseekV41Attention(nn.Module):
                     native_slots,
                     self.dim**-0.5,
                     padded_kv=padded_kv,
+                    slot_table=inputs.slot_table,
                 )[0]
             else:
                 indices = prefill_indices(

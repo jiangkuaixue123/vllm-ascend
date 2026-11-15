@@ -55,6 +55,15 @@
 
 ## 约束说明
 
+### V4.1 显式槽位的长度扩展
+
+V4.1 eager prefill 可以在原形状的 `ori_block_table` 每行前两列写入
+`[-0x563431, compact_length]`。仅 PA_ND/TND、SWA 显式物理槽位、单 KV head、
+每序列一个 query 时识别此扩展；该路径不使用 block table 寻址。长度必须与同次
+压实的索引前缀一致，并位于 `[0, ori_sparse_indices.shape[-1]]`。其余表项仍为零。
+未标记的表、非法 tag/长度及其它布局继续扫描首个负槽位。此扩展不改变表形状、
+算子参数或数值计算；普通 SWA、decode 和 draft 继续使用原表。
+
 - 该接口支持推理场景下使用。
 - 该接口支持aclgraph模式。
 - 该接口当前支持三种计算场景：场景一，仅传入`ori_kv`时为Sliding Window Attention计算；场景二，传入`ori_kv`及`cmp_kv`时为Sliding Window Attention + Compressed Attention计算；场景三，传入`ori_kv`、`cmp_kv`及`cmp_sparse_indices`时为Sliding Window Attention + Sparse Compressed Attention计算。

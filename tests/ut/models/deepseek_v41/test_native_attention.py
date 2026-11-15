@@ -72,9 +72,9 @@ def test_prefill_slots_follow_source_identity_and_geometry(monkeypatch):
     compact = native.physical_indices
     calls = []
 
-    def counted(*args):
+    def counted(*args, **kwargs):
         calls.append(1)
-        return compact(*args)
+        return compact(*args, **kwargs)
 
     monkeypatch.setattr(native, "physical_indices", counted)
 
@@ -123,6 +123,89 @@ def test_prefill_workspace_refreshes_raw_and_compressed_and_bounds_residency():
     assert caches[0].workspace_bytes == 0 and caches[0].compressed is None
 
 
+def test_compact_lengths_and_slots_share_the_same_generation():
+    logical = torch.tensor([[[4, -1, 0, 4, 99], [-1, -1, -1, -1, -1], [2, 1, -1, 0, 3]]])
+    table = torch.zeros((3, 8), dtype=torch.int32)
+    table[:, 0] = native.PREFILL_LENGTH_TAG
+    slots = native.physical_indices(logical, 16, 5, 128, lengths=table[:, 1])
+    assert table[:, 1].tolist() == [3, 0, 4]
+    assert torch.equal((slots[:, 0] >= 0).sum(-1), table[:, 1])
+    assert torch.count_nonzero(table[:, 2:]) == 0
+
+
+@pytest.mark.parametrize("width", [128, 512, 640, 2048])
+@torch.inference_mode()
+def test_native_prepared_prefix_contract_on_npu(width):
+    if importlib.util.find_spec("torch_npu") is None:
+        pytest.skip("Requires Ascend A3")
+    importlib.import_module("torch_npu")
+    if not torch.npu.is_available():
+        pytest.skip("Requires Ascend A3")
+    runner = native.DeepseekV41NativeAttention()
+    q, kv, sink = (t.npu() for t in inputs(1, 6, width + 1, 64))
+    ids = torch.arange(width, device=q.device).expand(1, 6, -1)
+    slots = native.physical_indices(ids, native.aligned_length(width + 1, 16), width + 1, width)
+    table = torch.zeros((6, width // 16), dtype=torch.int32, device=q.device)
+    table[:, 0] = native.PREFILL_LENGTH_TAG
+    counts = torch.tensor([0, 1, 2, 4, 7, width], device=q.device, dtype=torch.int32)
+    table[:, 1].copy_(counts)
+    short = torch.where(torch.arange(width, device=q.device)[None, None] < counts[None, :, None], ids, -1)
+    expected = runner(q, kv, sink, short, 512**-0.5, mode="declared prefix reference")
+    actual = runner._native(
+        q,
+        kv,
+        sink,
+        slots,
+        512**-0.5,
+        "prepared prefix witness",
+        None,
+        physical_slots=True,
+        slot_table=table,
+    )
+    assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
+    assert torch.count_nonzero(actual[:, 0]) == 0  # Positive slots with declared length zero prove native dispatch.
+    full = runner(q, kv, sink, ids, 512**-0.5, mode="unmarked table reference")
+    for invalid_tag, invalid_count in [
+        (native.PREFILL_LENGTH_TAG + 1, 1),
+        (native.PREFILL_LENGTH_TAG, -1),
+        (native.PREFILL_LENGTH_TAG, width + 1),
+    ]:
+        table[:, 0] = invalid_tag
+        table[:, 1] = invalid_count
+        actual = runner._native(
+            q,
+            kv,
+            sink,
+            slots,
+            512**-0.5,
+            "fallback table",
+            None,
+            physical_slots=True,
+            slot_table=table,
+        )
+        assert torch.equal(actual.view(torch.int16), full.view(torch.int16))
+    if width == 128:
+        metadata, old_table, common = runner._plan(q.device, 64, 1, 6, width, width, width - 1)
+        multi_query_table = old_table.clone()
+        multi_query_table[:, 0] = native.PREFILL_LENGTH_TAG
+        multi_query_table[:, 1] = 1
+        padded = native.F.pad(kv, (0, 0, 0, native.aligned_length(width + 1, 16) - width - 1))
+
+        def multi_query(block_table):
+            return torch.ops._C_ascend.npu_sparse_attn_sharedkv(
+                q.reshape(-1, 64, 512),
+                ori_kv=padded.view(-1, 16, 1, 512),
+                ori_sparse_indices=slots,
+                ori_block_table=block_table,
+                sinks=sink,
+                metadata=metadata,
+                softmax_scale=512**-0.5,
+                **common,
+            )[0]
+
+        assert torch.equal(multi_query(old_table).view(torch.int16), multi_query(multi_query_table).view(torch.int16))
+
+
 def test_prepared_prefill_uses_logical_length_and_existing_pages(backend, monkeypatch):
     runner, _, calls = backend
     q, kv, sink = inputs(1, 3, 13)
@@ -138,9 +221,18 @@ def test_prepared_prefill_uses_logical_length_and_existing_pages(backend, monkey
         raise AssertionError("Prepared pages must not be copied/padded again")
 
     monkeypatch.setattr(native.F, "pad", no_padding)
-    actual = runner.prefill_with_physical_slots(q, pages[:, :13], sink, slots, 0.125, padded_kv=pages)
+    actual = runner.prefill_with_physical_slots(
+        q,
+        pages[:, :13],
+        sink,
+        slots,
+        0.125,
+        padded_kv=pages,
+        slot_table=prepared.slot_table,
+    )
     assert torch.equal(actual, expected)
     assert calls[-1]["ori_kv"].data_ptr() == pages.data_ptr()
+    assert calls[-1]["ori_block_table"] is prepared.slot_table
     with pytest.raises(ValueError, match="aligned contiguous"):
         runner.prefill_with_physical_slots(q, pages[:, :13], sink, slots, 0.125, padded_kv=pages[:, :13])
 
@@ -173,12 +265,18 @@ def test_prefill_native_pages_and_consumer_reuse_on_npu(rows, raw_length, compre
         expected = runner(q, joint, sink, logical, 512**-0.5, mode="retained prefill")
         pages = prepared.update_workspace(raw, compressed, 32 * 1024 * 1024)
         actual = runner.prefill_with_physical_slots(
-            q, pages[:, : joint.shape[1]], sink, slots, 512**-0.5, padded_kv=pages
+            q,
+            pages[:, : joint.shape[1]],
+            sink,
+            slots,
+            512**-0.5,
+            padded_kv=pages,
+            slot_table=prepared.slot_table,
         )
         assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
         assert torch.equal(pages[:, : joint.shape[1]], joint)
     # Budget fallback still reuses slots and the original native padding path.
-    actual = runner.prefill_with_physical_slots(q, joint, sink, slots, 512**-0.5)
+    actual = runner.prefill_with_physical_slots(q, joint, sink, slots, 512**-0.5, slot_table=prepared.slot_table)
     assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
 
 
