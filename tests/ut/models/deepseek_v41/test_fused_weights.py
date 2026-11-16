@@ -158,3 +158,14 @@ def test_quant_dispatch_resolves_named_v41_experts(root):
     desc[prefix + ".0.w3.weight"] = "FLOAT"
     with pytest.raises(ValueError):
         get_quant_type_for_layer(desc, prefix, "moe", mapping)
+
+
+@pytest.mark.parametrize("model_type", ["deepseek_v41", "deepseek_v41_text"])
+def test_shared_merged_quant_dispatch_requires_equal_source_types(model_type):
+    prefix = "layers.3.ffn.shared_experts"
+    desc = {f"{prefix}.{name}.weight": "W8A8_DYNAMIC" for name in ("w1", "w3")}
+    mapping = get_packed_modules_mapping(model_type)
+    assert get_quant_type_for_layer(desc, prefix + ".gate_up_proj", "linear", mapping) == "W8A8_DYNAMIC"
+    desc[prefix + ".w3.weight"] = "FLOAT"
+    with pytest.raises(ValueError):
+        get_quant_type_for_layer(desc, prefix + ".gate_up_proj", "linear", mapping)

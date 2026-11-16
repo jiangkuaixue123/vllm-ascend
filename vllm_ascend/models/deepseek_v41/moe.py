@@ -26,6 +26,7 @@ from vllm.distributed import (
 from vllm.logger import logger
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
+    MergedColumnParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
 )
@@ -304,12 +305,35 @@ class DeepseekV41MoEExpert(nn.Module):
         common = dict(bias=False, quant_config=quant_config, return_bias=False)
         up_options = {} if sharded else {"disable_tp": True}
         down_options = {"input_is_parallel": True, "reduce_results": False} if sharded else {"disable_tp": True}
-        self.w1 = up_class(hidden, intermediate, prefix=f"{prefix}.w1", **common, **up_options)
+        description = getattr(quant_config, "quant_description", {})
+        self._merged_shared_gate_up = (
+            shared
+            and config.n_routed_experts == 384
+            and all(description.get(f"{prefix}.{name}.weight") == "W8A8_DYNAMIC" for name in ("w1", "w3"))
+        )
+        if self._merged_shared_gate_up:
+            self.gate_up_proj = MergedColumnParallelLinear(
+                hidden,
+                [intermediate, intermediate],
+                prefix=f"{prefix}.gate_up_proj",
+                disable_tp=not sharded,
+                **common,
+            )
+        else:
+            self.w1 = up_class(hidden, intermediate, prefix=f"{prefix}.w1", **common, **up_options)
+            self.w3 = up_class(hidden, intermediate, prefix=f"{prefix}.w3", **common, **up_options)
         self.w2 = down_class(intermediate, hidden, prefix=f"{prefix}.w2", **common, **down_options)
-        self.w3 = up_class(hidden, intermediate, prefix=f"{prefix}.w3", **common, **up_options)
 
     def forward(self, hidden_states: torch.Tensor, routing_weights: torch.Tensor | None = None) -> torch.Tensor:
-        activation = clipped_swiglu(self.w1(hidden_states), self.w3(hidden_states), self.swiglu_limit)
+        if self._merged_shared_gate_up:
+            from vllm_ascend.ops.triton.deepseek_v41_shared_activation import shared_gate_up_activation
+
+            gate_up = self.gate_up_proj(hidden_states)
+            activation = shared_gate_up_activation(gate_up, self.swiglu_limit) if routing_weights is None else None
+            if activation is None:
+                activation = clipped_swiglu(*gate_up.chunk(2, dim=-1), self.swiglu_limit)
+        else:
+            activation = clipped_swiglu(self.w1(hidden_states), self.w3(hidden_states), self.swiglu_limit)
         if routing_weights is not None:
             activation = activation * routing_weights
         output = self.w2(activation.to(hidden_states.dtype))

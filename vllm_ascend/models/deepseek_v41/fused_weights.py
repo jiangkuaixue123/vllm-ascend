@@ -10,6 +10,7 @@ import torch
 from safetensors import safe_open
 from vllm.logger import logger
 from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+from vllm.model_executor.layers.linear import MergedColumnParallelLinear
 
 
 @dataclass(frozen=True)
@@ -39,6 +40,10 @@ def _list_parts(parameters, modules):
     expert_ids = {key: _owned_experts(owner) for key, owner in owners.items()}
     for destination in parameters:
         path, _, field = destination.rpartition(".")
+        if path.endswith(".shared_experts.gate_up_proj") and isinstance(modules[path], MergedColumnParallelLinear):
+            for proj in ("w1", "w3"):
+                yield IndexedPart(f"{path.rpartition('.')[0]}.{proj}.{field}", destination, proj)
+            continue
         owner = owners.get(path)
         packed, _, suffix = field.partition("_")
         if owner is None or packed not in ("w13", "w2") or suffix not in ("weight", "weight_scale", "weight_offset"):
@@ -101,6 +106,16 @@ def load_indexed_v41_weights(model, weight_map, tp_rank, tp_size, read_parameter
                 param = parameters[part.destination]
                 if part.expert_id >= 0:
                     _load_expert_tensor(reader, part, param, model.config)
+                elif part.projection in ("w1", "w3"):
+                    module = modules[part.destination.rpartition(".")[0]]
+                    projection_index = 0 if part.projection == "w1" else 1
+                    source = reader.get_tensor(part.source)
+                    expected = (module.output_sizes[projection_index], *param.shape[1:])
+                    is_weight = part.source.endswith(".weight")
+                    wrong_dtype = source.dtype != param.dtype if is_weight else not source.is_floating_point()
+                    if tuple(source.shape) != expected or wrong_dtype:
+                        raise ValueError(f"Invalid V4.1 shared projection tensor: {part.source}")
+                    param.weight_loader(param, source, projection_index)
                 else:
                     module = modules[part.destination.rpartition(".")[0]]
                     read_parameter_slice(reader, part.source, param, module, tp_rank, tp_size)
