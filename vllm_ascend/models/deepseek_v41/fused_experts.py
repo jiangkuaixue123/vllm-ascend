@@ -36,7 +36,9 @@ from vllm_ascend.ops.triton.deepseek_v41_prefill_experts import (
     prefill_combine_output,
     prefill_dispatched_scales,
     prefill_fusion_available,
+    prefill_native_requant_available,
     prefill_route_activation,
+    prefill_route_quantized_activation,
     prefill_zero_ep_padding,
 )
 from vllm_ascend.quantization.method_adapters import AscendFusedMoEMethod
@@ -46,6 +48,7 @@ from vllm_ascend.quantization.quant_type import QuantType
 # including remote routes. Bound its local workspace independently of DP and EP.
 MAX_EAGER_ROUTED_TOKENS = 1024
 MAX_FUSED_PREFILL_ROUTED_TOKENS = 4096
+MAX_NATIVE_PREFILL_ROUTED_TOKENS = 4096
 
 
 def dispatched_scales(row_ids, route_weights, owned, num_rows):
@@ -271,12 +274,13 @@ class DeepseekV41AllGatherComm(AllGatherCommImpl):
         inputs = fused_experts_input
         rows = inputs.hidden_states.shape[0]
         # Larger batches rely on the fused chain's smaller live intermediates.
-        chunk_size = (
-            MAX_FUSED_PREFILL_ROUTED_TOKENS
-            if prefill_fusion_available(inputs.hidden_states)
-            else MAX_EAGER_ROUTED_TOKENS
-        )
-        if rows <= chunk_size or (
+        fused_prefill = prefill_fusion_available(inputs.hidden_states)
+        chunk_size = MAX_EAGER_ROUTED_TOKENS
+        if fused_prefill:
+            chunk_size = MAX_FUSED_PREFILL_ROUTED_TOKENS
+            if inputs.quant.quant_type == QuantType.W8A8 and prefill_native_requant_available(inputs.hidden_states):
+                chunk_size = MAX_NATIVE_PREFILL_ROUTED_TOKENS
+        if rows <= min(chunk_size, MAX_FUSED_PREFILL_ROUTED_TOKENS) or (
             is_forward_context_available() and get_forward_context().cudagraph_runtime_mode == CUDAGraphMode.FULL
         ):
             return super().fused_experts(inputs)
@@ -351,7 +355,22 @@ class DeepseekV41AllGatherComm(AllGatherCommImpl):
         # Match the checkpoint's individual expert GEMMs: BF16 gate/up output,
         # FP32 nonlinear activation and route factor, then BF16 input to W2.
         fused_prefill = prefill_fusion_available(inputs.hidden_states)
-        if fused_prefill:
+        scale = None
+        requantized = (
+            prefill_route_quantized_activation(
+                gate_up,
+                inputs.topk_scales,
+                inputs.swiglu_limit,
+                inputs.group_list if inputs.group_list_type == 1 else None,
+            )
+            if fused_prefill and quantized
+            else None
+        )
+        if requantized is not None:
+            activation, scale = requantized
+            del gate_up
+            logger.info_once("V41_PREFILL_NATIVE_REQUANT_RUNTIME rows=%d", activation.shape[0], scope="process")
+        elif fused_prefill:
             activation = prefill_route_activation(
                 gate_up,
                 inputs.topk_scales,
@@ -362,8 +381,7 @@ class DeepseekV41AllGatherComm(AllGatherCommImpl):
         else:
             gate, up = gate_up.chunk(2, dim=-1)
             activation = (clipped_swiglu(gate, up, inputs.swiglu_limit) * factor).to(torch.bfloat16)
-        scale = None
-        if quantized:
+        if quantized and requantized is None:
             activation, scale = torch_npu.npu_dynamic_quant(activation, dst_type=torch.int8)
         before_gmm2 = torch.npu.current_stream().record_event()
         output = _grouped_projection(

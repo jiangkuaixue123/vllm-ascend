@@ -422,12 +422,24 @@ def test_w8a8_grouped_capture_replay_on_npu(monkeypatch, top_k, chunked):
 
 
 @pytest.mark.parametrize(
-    "rows,placement", [(8192, "balanced"), (4097, "local"), (4097, "remote"), (8652, "compact"), (16648, "compact")]
+    "rows,placement",
+    [
+        (8192, "balanced"),
+        (8193, "balanced"),
+        (8193, "local"),
+        (8193, "remote"),
+        (4097, "local"),
+        (4097, "remote"),
+        (8652, "compact"),
+        (16648, "compact"),
+    ],
 )
 def test_prefill_chain_and_batch_match_original_target_width_on_npu(monkeypatch, rows, placement):
     if not torch.npu.is_available():
         pytest.skip("Ascend NPU is required")
-    from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ
+    from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ, enable_custom_op
+
+    enable_custom_op()
 
     hidden, intermediate, experts, local, top_k = 5120, 2304, 384, 24, 6
     gen = torch.Generator().manual_seed(317)
@@ -510,7 +522,19 @@ def test_prefill_chain_and_batch_match_original_target_width_on_npu(monkeypatch,
         torch.npu.synchronize()
         torch.npu.reset_peak_memory_stats()
         resident = torch.npu.memory_allocated()
+        requantized_rows = []
+        original_requant = fused.prefill_route_quantized_activation
+
+        def record_requant(*args, **kwargs):
+            output = original_requant(*args, **kwargs)
+            if output is not None:
+                requantized_rows.append(args[0].shape[0])
+            return output
+
+        monkeypatch.setattr(fused, "prefill_route_quantized_activation", record_requant)
         result = comm.fused_experts(inputs)
+        if fused.prefill_native_requant_available(inputs.hidden_states):
+            assert requantized_rows, "The full W2 consumer must execute the native requant path"
         assert all(
             event is not None
             for event in (result.before_dispatch_evt, result.before_gmm2_evt, result.before_combine_evt)

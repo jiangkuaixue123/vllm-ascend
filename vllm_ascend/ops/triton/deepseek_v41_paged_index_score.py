@@ -9,12 +9,68 @@ from vllm.logger import logger
 from vllm.triton_utils import tl, triton
 
 from vllm_ascend.ops.triton.triton_utils import get_aicore_num
+from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
 _TILE_KEYS = 64
 _BLOCK_SIZE = 128
 _INDEX_HEADS = 32
 _INDEX_DIM = 128
 _QUERY_GROUP = 3
+
+
+def _use_rectangular_index_field(field):
+    return (
+        field.device.type == "npu"
+        and field.shape[0] > 0
+        and field.stride(0) % 16 == 0
+        and field.data_ptr() % 32 == 0
+        and get_ascend_device_type() == AscendDeviceType.A3
+    )
+
+
+@triton.jit
+def _index_live_count(lengths, active, row, RATIO: tl.constexpr, CAPACITY: tl.constexpr):
+    length = tl.load(lengths + row).to(tl.int32)
+    return tl.where(tl.load(active + row) != 0, tl.minimum(tl.maximum(length, 0) // RATIO, CAPACITY), 0)
+
+
+@triton.jit
+def _read_rectangular_index_page(
+    keys,
+    page,
+    start,
+    count,
+    source_length,
+    live_source,
+    PHYSICAL_ROWS: tl.constexpr,
+    ROW_STRIDE: tl.constexpr,
+    RATIO: tl.constexpr,
+    N: tl.constexpr,
+    D: tl.constexpr,
+    PAGE: tl.constexpr,
+    CHECK_SOURCE: tl.constexpr,
+):
+    tl.static_assert(N * RATIO <= PAGE)
+    first = (start * RATIO) % PAGE + RATIO - 1
+    physical = tl.maximum(PHYSICAL_ROWS - (page * PAGE + first), 0)
+    rows = tl.minimum(N, tl.minimum(count - start, (physical + RATIO - 1) // RATIO))
+    rows = tl.where(page >= 0, tl.maximum(rows, 0), 0).to(tl.int32)
+    if CHECK_SOURCE:
+        remaining = tl.maximum(source_length - ((start + 1) * RATIO - 1), 0)
+        rows = tl.where(live_source, tl.minimum(rows, (remaining + RATIO - 1) // RATIO), 0)
+    result = tl.full((N, D), 0, tl.bfloat16)
+    if rows > 0:
+        safe_page = tl.minimum(tl.maximum(page, 0), (PHYSICAL_ROWS - 1) // PAGE)
+        block = tl.make_block_ptr(
+            keys + (safe_page * PAGE + first) * ROW_STRIDE,
+            (rows, D),
+            (RATIO * ROW_STRIDE, 1),
+            (0, 0),
+            (N, D),
+            (1, 0),
+        )
+        result = tl.load(block, boundary_check=(0,), padding_option="zero")
+    return result
 
 
 @triton.jit
@@ -38,6 +94,7 @@ def _paged_index_score(
     H: tl.constexpr,
     N: tl.constexpr,
     PAGE: tl.constexpr,
+    RECTANGULAR: tl.constexpr,
 ):
     pid = tl.program_id(0)
     row = pid // LANES
@@ -48,6 +105,8 @@ def _paged_index_score(
     live_source = tl.load(source_active + row) != 0
     heads = tl.arange(0, H)
     dims = tl.arange(0, D)
+    queries = tl.load(q + row * H * D + heads[:, None] * D + dims[None, :])
+    w = tl.load(weights + row * H + heads)
     # No Cube/field-read iterations for an idle row or for its padded 16K suffix.
     for start in range(lane * N, count, LANES * N):
         ids = start + tl.arange(0, N)
@@ -55,12 +114,27 @@ def _paged_index_score(
         # A 64-key tile at ratio 1 or 2 is entirely inside one logical page
         # of 128 tokens. It therefore has a single physical page mapping.
         page = tl.load(source_table + row * TABLE_STRIDE + (start * RATIO) // PAGE).to(tl.int64)
-        slots = page * PAGE + ends % PAGE
-        valid = live_source & (ends < source_length) & (slots >= 0) & (slots < PHYSICAL_ROWS) & (ids < count)
-        addresses = tl.where(valid, slots, 0) * ROW_STRIDE
-        k = tl.load(keys + addresses[:, None] + dims[None, :], mask=valid[:, None], other=0)
-        queries = tl.load(q + row * H * D + heads[:, None] * D + dims[None, :])
-        w = tl.load(weights + row * H + heads)
+        if RECTANGULAR:
+            k = _read_rectangular_index_page(
+                keys,
+                page,
+                start,
+                count,
+                source_length,
+                live_source,
+                PHYSICAL_ROWS,
+                ROW_STRIDE,
+                RATIO,
+                N,
+                D,
+                PAGE,
+                True,
+            )
+        else:
+            slots = page * PAGE + ends % PAGE
+            valid = live_source & (ends < source_length) & (slots >= 0) & (slots < PHYSICAL_ROWS) & (ids < count)
+            addresses = tl.where(valid, slots, 0) * ROW_STRIDE
+            k = tl.load(keys + addresses[:, None] + dims[None, :], mask=valid[:, None], other=0)
         dots = tl.dot(queries, tl.trans(k), out_dtype=tl.float32)
         # C rounds the BF16 einsum result, then rounds the product of two BF16
         # operands before its head reduction; both conversion points are necessary.
@@ -92,16 +166,16 @@ def _grouped_paged_index_score(
     PAGE: tl.constexpr,
     GROUP: tl.constexpr,
     PADDED_GROUP: tl.constexpr,
+    RECTANGULAR: tl.constexpr,
 ):
     pid = tl.program_id(0)
     first_row = (pid // LANES) * GROUP
     lane = pid % LANES
-    count = 0
-    for query in tl.static_range(GROUP):
-        length = tl.load(query_lens + first_row + query).to(tl.int32)
-        active = tl.load(query_active + first_row + query) != 0
-        live = tl.where(active, tl.minimum(tl.maximum(length, 0) // RATIO, CAPACITY), 0)
-        count = tl.maximum(count, live)
+    tl.static_assert(GROUP == 3)
+    live0 = _index_live_count(query_lens, query_active, first_row, RATIO, CAPACITY)
+    live1 = _index_live_count(query_lens, query_active, first_row + 1, RATIO, CAPACITY)
+    live2 = _index_live_count(query_lens, query_active, first_row + 2, RATIO, CAPACITY)
+    count = tl.maximum(tl.maximum(live0, live1), live2)
     heads = tl.arange(0, PADDED_GROUP * H)
     dims = tl.arange(0, D)
     queries = tl.load(
@@ -114,10 +188,27 @@ def _grouped_paged_index_score(
         ids = start + tl.arange(0, N)
         ends = (ids + 1) * RATIO - 1
         page = tl.load(source_table + first_row * TABLE_STRIDE + (start * RATIO) // PAGE).to(tl.int64)
-        slots = page * PAGE + ends % PAGE
-        valid = (slots >= 0) & (slots < PHYSICAL_ROWS) & (ids < count)
-        addresses = tl.where(valid, slots, 0) * ROW_STRIDE
-        k = tl.load(keys + addresses[:, None] + dims[None, :], mask=valid[:, None], other=0)
+        if RECTANGULAR:
+            k = _read_rectangular_index_page(
+                keys,
+                page,
+                start,
+                count,
+                0,
+                True,
+                PHYSICAL_ROWS,
+                ROW_STRIDE,
+                RATIO,
+                N,
+                D,
+                PAGE,
+                False,
+            )
+        else:
+            slots = page * PAGE + ends % PAGE
+            valid = (slots >= 0) & (slots < PHYSICAL_ROWS) & (ids < count)
+            addresses = tl.where(valid, slots, 0) * ROW_STRIDE
+            k = tl.load(keys + addresses[:, None] + dims[None, :], mask=valid[:, None], other=0)
         dots = tl.dot(queries, tl.trans(k), out_dtype=tl.float32)
         rounded = dots.to(tl.bfloat16).to(tl.float32)
         relu = tl.where(rounded < 0.0, 0.0, rounded)
@@ -126,9 +217,12 @@ def _grouped_paged_index_score(
         # Keep bounds scalar and write only real query rows on A3.
         for query in tl.static_range(GROUP):
             row_scores = tl.gather(scores, tl.full((1, N), query, tl.int32), axis=0).reshape(N)
-            length = tl.load(query_lens + first_row + query).to(tl.int32)
-            active = tl.load(query_active + first_row + query) != 0
-            live = tl.where(active, tl.minimum(tl.maximum(length, 0) // RATIO, CAPACITY), 0)
+            if query == 0:
+                live = live0
+            elif query == 1:
+                live = live1
+            else:
+                live = live2
             tl.store(output + (first_row + query) * CAPACITY + ids, row_scores, mask=ids < live)
 
 
@@ -198,6 +292,9 @@ def paged_index_scores(q, field, weights, source_md, query_md, ratio, block_size
     # The original full-size score matrix and all masked -inf values are maintained
     # even if a replay has fewer active rows or keys than its preceding replay.
     grouped = supports_grouped_index_scores(q, source_md, query_md)
+    rectangular = _use_rectangular_index_field(field)
+    if rectangular:
+        logger.info_once("INDEX_RECTANGULAR_PAGE_RUNTIME rows=%d", rows, scope="process")
     output = torch.full((rows, capacity), -torch.inf, dtype=q.dtype, device=q.device)
     if rows and capacity:
         if grouped:
@@ -224,6 +321,7 @@ def paged_index_scores(q, field, weights, source_md, query_md, ratio, block_size
                 PAGE=block_size,
                 GROUP=group,
                 PADDED_GROUP=triton.next_power_of_2(group),
+                RECTANGULAR=rectangular,
             )
             logger.info_once(
                 "INDEX_QUERY_PACK_RUNTIME pid=%d rows=%d group=%d", os.getpid(), rows, group, scope="process"
@@ -250,5 +348,6 @@ def paged_index_scores(q, field, weights, source_md, query_md, ratio, block_size
             H=heads,
             N=_TILE_KEYS,
             PAGE=block_size,
+            RECTANGULAR=rectangular,
         )
     return output

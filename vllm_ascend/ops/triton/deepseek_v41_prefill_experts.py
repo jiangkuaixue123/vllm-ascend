@@ -28,6 +28,43 @@ def prefill_fusion_available(states):
     )
 
 
+def prefill_native_requant_available(states):
+    if not prefill_fusion_available(states) or states.dtype != torch.int8:
+        return False
+    from torch_npu import get_npu_format
+
+    return hasattr(torch.ops._C_ascend, "prefill_prefix_route_quant") and get_npu_format(states) == 2
+
+
+def prefill_route_quantized_activation(gate_up, factor, limit, groups):
+    if (
+        groups is None
+        or gate_up.device.type != "npu"
+        or gate_up.dtype != torch.bfloat16
+        or gate_up.ndim != 2
+        or gate_up.shape[1] != 4608
+        or not 0 < gate_up.shape[0] <= 49152
+        or factor.shape != (gate_up.shape[0],)
+        or factor.dtype != torch.float32
+        or groups.ndim != 1
+        or groups.numel() > 24
+        or groups.dtype != torch.int64
+        or not torch.is_inference_mode_enabled()
+        or get_ascend_device_type() != AscendDeviceType.A3
+        or not hasattr(torch.ops._C_ascend, "prefill_prefix_route_quant")
+        or any(
+            t.device != gate_up.device or not t.is_contiguous() or t.is_neg() or t.is_conj()
+            for t in (gate_up, factor, groups)
+        )
+    ):
+        return None
+    from torch_npu import get_npu_format
+
+    if any(get_npu_format(t) != 2 for t in (gate_up, factor, groups)):
+        return None
+    return torch.ops._C_ascend.prefill_prefix_route_quant(gate_up, factor, groups, limit)
+
+
 if HAS_TRITON and not envs.VLLM_BATCH_INVARIANT:
     from vllm.triton_utils import tl, triton
 
@@ -274,6 +311,29 @@ if HAS_TRITON and not envs.VLLM_BATCH_INVARIANT:
             raise ValueError("Prefill EP destinations must be a contiguous int32 row map")
         if rows == 0:
             return output
+        if (
+            prefill_fusion_available(states)
+            and hidden == 5120
+            and top_k == 6
+            and rows <= 8192
+            and expanded <= 49152
+            and output.shape[0] <= 32768
+            and states.dtype == torch.bfloat16
+            and factor.dtype == torch.float32
+            and row_ids.dtype == torch.int32
+            and owned.dtype == torch.float32
+            and hasattr(torch.ops._C_ascend, "prefill_ordered_combine")
+        ):
+            from torch_npu import get_npu_format
+
+            tensors = (states, factor, row_ids, owned, output) + (() if output_rows is None else (output_rows,))
+            if all(
+                t.is_contiguous() and not t.is_neg() and not t.is_conj() and get_npu_format(t) == 2 for t in tensors
+            ):
+                torch.ops._C_ascend.prefill_ordered_combine(
+                    states, factor, row_ids.view(rows, top_k), owned, output, output_rows
+                )
+                return output
         _prefill_combine[(rows, triton.cdiv(hidden, _COMBINE_COLS))](
             states,
             factor,

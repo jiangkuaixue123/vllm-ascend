@@ -217,3 +217,56 @@ def test_paged_decode_dispatch_matches_reference(tensor_device, rows, tp):
         assert fused.call_count == 5 * int(tensor_device == "npu")
     for found, wanted in zip(actual, expected):
         assert torch.equal(found, wanted)
+
+
+@pytest.mark.skipif(not HAS_TRITON, reason="Requires Ascend Triton")
+@pytest.mark.parametrize("aligned,ratio", [(True, 1), (True, 2), (False, 1), (False, 2)])
+@torch.inference_mode()
+def test_paged_index_partial_physical_page_and_alignment_replay(aligned, ratio):
+    from vllm_ascend.ops.triton.deepseek_v41_paged_index_score import _use_rectangular_index_field
+
+    if get_ascend_device_type() != AscendDeviceType.A3:
+        pytest.skip("A3 only")
+    torch.npu.set_device(0)
+    init_device_properties_triton()
+    assert enable_custom_op()
+    stride, offset = (160, 16) if aligned else (129, 1)
+    field = torch.empty(257, stride, device="npu", dtype=torch.bfloat16)[:, offset : offset + 128]
+    field.copy_(fp4_quant_dequant(torch.randn(257, 128, device="npu", dtype=torch.bfloat16), 32))
+    q = fp4_quant_dequant(torch.randn(3, 32, 128, device="npu", dtype=torch.bfloat16), 32)
+    weights = torch.randn(3, 32, device="npu", dtype=torch.bfloat16)
+    table = torch.tensor([[0, 1, 2, 3]] * 3, device="npu", dtype=torch.int32)
+    src = SimpleNamespace(
+        active=torch.tensor([True, False, True], device="npu"),
+        seq_lens=torch.tensor([1, 120, 512], device="npu"),
+        block_table_tensor=table,
+        max_model_len=512,
+    )
+    dst = SimpleNamespace(
+        active=torch.ones(3, device="npu", dtype=torch.bool),
+        seq_lens=torch.tensor([1, 127, 512], device="npu"),
+        max_model_len=512,
+    )
+    assert _use_rectangular_index_field(field) == aligned
+    assert supports_paged_index_scores(q, field, weights, src, dst, ratio, 128)
+    capacity = 512 // ratio
+    cols = torch.arange(capacity, device="npu")[None, :]
+    ends = ((cols + 1) * ratio - 1).expand(3, -1)
+    cache = SimpleNamespace(block_size=128, field=lambda *args: field)
+    paged_index_scores(q, field, weights, src, dst, ratio, 128)
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph):
+        result = paged_index_scores(q, field, weights, src, dst, ratio, 128)
+    for step in range(3):
+        pages = torch.tensor([[0, 1, 2, 3]] * 3, dtype=torch.int32).roll(step, 1)
+        if step == 1:
+            pages[:, 1] = -1
+        table.copy_(pages)
+        field.neg_()
+        weights.neg_()
+        keys = DeepseekV41Cache.decode_read(cache, src, ends, 1, 512, 128)
+        dots = torch.einsum("bhd,btd->bht", q, keys)
+        expected = (dots.relu_() * weights.unsqueeze(-1)).sum(1)
+        expected.masked_fill_(~dst.active[:, None] | (cols >= dst.seq_lens[:, None] // ratio), -torch.inf)
+        graph.replay()
+        assert torch.equal(result.view(torch.int16), expected.view(torch.int16)), (aligned, ratio, step)
