@@ -177,10 +177,25 @@ __aicore__ inline void DataCopyPABySlots(LocalTensor<T> &dstTensor,  // l1
                                          const PAShape &shape,
                                          const Position &startPos,
                                          uint64_t sparseIndexBaseOffset,
-                                         uint32_t sparseIndexStart)
+                                         uint32_t sparseIndexStart,
+                                         bool flatRuns = false)
 {
     uint32_t blockElementCnt = 32 / sizeof(T);
     uint32_t row = 0;
+    // Private flat, single-head prefill layout: 24 slot bits and 7 run-length bits.
+    if (flatRuns) {
+        while (row < shape.copyRowNum) {
+            int32_t word = sparseIndicesGm.GetValue(sparseIndexBaseOffset + sparseIndexStart + row);
+            uint32_t slot = word < 0 ? 0 : static_cast<uint32_t>(word) & 0xffffffU;
+            uint32_t run = word < 0 ? 1 : (static_cast<uint32_t>(word) >> 24) + 1;
+            run = Min(run, shape.copyRowNum - row);
+            LocalTensor<T> dst = dstTensor[row * blockElementCnt];
+            GlobalTensor<T> src = srcTensor[static_cast<uint64_t>(slot) * shape.headDim + startPos.dIdx];
+            DataCopyGmNDToL1<T>(dst, src, run, shape.copyRowNumAlign, shape.actHeadDim, shape.headDim);
+            row += run;
+        }
+        return;
+    }
     int32_t nextSlot = shape.copyRowNum ? sparseIndicesGm.GetValue(sparseIndexBaseOffset + sparseIndexStart) : 0;
     while (row < shape.copyRowNum) {
         int32_t slotId = nextSlot;
@@ -249,6 +264,7 @@ struct RunInfo {
     uint32_t tndCoreStartKVSplitPos = 0;
     bool isBmm2Output = false;
     bool isValid = false;
+    bool oriSlotRuns = false;
 
     static constexpr uint32_t n2Idx = 0;
     uint64_t actS1Size = 1;

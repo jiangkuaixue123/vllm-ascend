@@ -31,12 +31,13 @@ from vllm_ascend.ops.fused_moe.routed_experts import (
     AscendUnquantizedFusedMoEMethod,
 )
 from vllm_ascend.ops.fused_moe.token_dispatcher import TokenDispatcherWithAllGather
-from vllm_ascend.ops.register_custom_ops import ep_pad_and_reduce_scatter
+from vllm_ascend.ops.register_custom_ops import _get_ep_token_layout, ep_pad_and_reduce_scatter
 from vllm_ascend.ops.triton.deepseek_v41_prefill_experts import (
     prefill_combine_output,
     prefill_dispatched_scales,
     prefill_fusion_available,
     prefill_route_activation,
+    prefill_zero_ep_padding,
 )
 from vllm_ascend.quantization.method_adapters import AscendFusedMoEMethod
 from vllm_ascend.quantization.quant_type import QuantType
@@ -66,6 +67,38 @@ class DeepseekV41PrefillCombineMetadata(MoEAllGatherCombineMetadata):
     route_scales: torch.Tensor
 
 
+def prefill_ep_return_layout(states):
+    """Cache logical-to-physical destinations within one immutable eager forward."""
+    if not prefill_fusion_available(states) or not is_forward_context_available():
+        return None
+    context = get_forward_context()
+    if (
+        context.cudagraph_runtime_mode != CUDAGraphMode.NONE
+        or getattr(context, "is_draft_model", True)
+        or getattr(context, "in_profile_run", True)
+        or getattr(context, "ep_actual_local_sizes", None) is None
+    ):
+        return None
+    group = get_ep_group()
+    if group.world_size != 16:
+        return None
+    layout = _get_ep_token_layout(context.dp_metadata, group)
+    if layout is None:
+        return None
+    sizes, capacity = layout
+    if not 0 < capacity <= 2048:
+        return None
+    if states.shape[0] != sum(sizes):
+        raise ValueError("Prefill expert rows disagree with the EP return layout")
+    key = (tuple(sizes), capacity, states.device)
+    cached = getattr(context, "v41_ep_return_rows", None)
+    if cached is None or cached[0] != key:
+        rows = torch.cat([torch.arange(size, dtype=torch.int32) + rank * capacity for rank, size in enumerate(sizes)])
+        cached = (key, rows.to(states.device), torch.tensor(sizes, dtype=torch.int32, device=states.device))
+        context.v41_ep_return_rows = cached
+    return cached[1], len(sizes) * capacity, cached[2]
+
+
 class DeepseekV41Dispatcher(TokenDispatcherWithAllGather):
     def token_dispatch(self, token_dispatch_input):
         output = super().token_dispatch(token_dispatch_input)
@@ -90,7 +123,7 @@ class DeepseekV41Dispatcher(TokenDispatcherWithAllGather):
             meta = replace(meta, topk_weights=owned.float())
         return replace(output, topk_scales=scales, combine_metadata=meta)
 
-    def token_combine(self, hidden_states, combine_metadata, bias=None, *, out=None):
+    def token_combine(self, hidden_states, combine_metadata, bias=None, *, out=None, output_rows=None):
         if isinstance(combine_metadata, DeepseekV41PrefillCombineMetadata):
             output = prefill_combine_output(
                 hidden_states,
@@ -98,9 +131,14 @@ class DeepseekV41Dispatcher(TokenDispatcherWithAllGather):
                 combine_metadata.expanded_row_idx,
                 combine_metadata.topk_weights,
                 out=out,
+                output_rows=output_rows,
             )
-            return output.view(combine_metadata.restore_shape)
+            return output if output_rows is not None else output.view(combine_metadata.restore_shape)
         result = super().token_combine(hidden_states, combine_metadata, bias)
+        if output_rows is not None:
+            # A final chunk below the fused threshold still owns unique destinations.
+            out.index_copy_(0, output_rows.long(), result)
+            return out
         if out is not None:
             out.copy_(result)
             return out
@@ -174,6 +212,20 @@ class DeepseekV41PrepareAndFinalize(PrepareAndFinalizeWithAllGather):
         # Their multimodal config wrapper does not change the output row owner.
         if self.moe_config.pcp_size != 1:
             raise ValueError("V4.1 text grouped experts require PCP1")
+        context = get_forward_context()
+        cached = getattr(context, "v41_ep_return_rows", None)
+        if cached is not None and hidden_states.shape[0] == len(cached[0][0]) * cached[0][1]:
+            sizes, capacity, device = cached[0]
+            group = get_ep_group()
+            if _get_ep_token_layout(context.dp_metadata, group) != (list(sizes), capacity):
+                raise ValueError("EP return destinations changed during the eager forward")
+            if (
+                hidden_states.dtype != torch.float32
+                or hidden_states.device != device
+                or not hidden_states.is_contiguous()
+            ):
+                raise ValueError("Direct EP output must preserve the contiguous FP32 reduction input")
+            return group.reduce_scatter(hidden_states, 0)[: sizes[group.rank_in_group]]
         return ep_pad_and_reduce_scatter(hidden_states, get_forward_context().dp_metadata)
 
 
@@ -188,7 +240,7 @@ class DeepseekV41AllGatherComm(AllGatherCommImpl):
             num_local_experts=self.moe_config.num_local_experts,
         )
 
-    def _prefill_chunk_into(self, inputs, destination):
+    def _prefill_chunk_into(self, inputs, destination, output_rows=None):
         """Keep chunk results in their final buffer without a second FP32 copy."""
         assert _EXTRA_CTX.moe_comm_method is not None, "Missing communication context"
         before_dispatch = torch.npu.current_stream().record_event()
@@ -200,7 +252,12 @@ class DeepseekV41AllGatherComm(AllGatherCommImpl):
         )
         values, before_gmm2 = self._apply_mlp(mlp_input)
         before_combine = torch.npu.current_stream().record_event()
-        result = self.token_dispatcher.token_combine(values, dispatched.combine_metadata, out=destination)
+        if output_rows is None:
+            result = self.token_dispatcher.token_combine(values, dispatched.combine_metadata, out=destination)
+        else:
+            result = self.token_dispatcher.token_combine(
+                values, dispatched.combine_metadata, out=destination, output_rows=output_rows
+            )
         return FusedExpertsResult(
             routed_out=result,
             before_dispatch_evt=before_dispatch,
@@ -227,7 +284,19 @@ class DeepseekV41AllGatherComm(AllGatherCommImpl):
         # prepare() has already gathered the rows and selected their routes.
         # Each chunk runs only local dispatch, grouped GEMMs and unpermute.
         # finalize() receives one complete output in the original gather order.
-        routed_out = inputs.hidden_states.new_empty(inputs.hidden_states.shape, dtype=torch.float32)
+        return_layout = prefill_ep_return_layout(inputs.hidden_states)
+        if return_layout is None:
+            routed_out = inputs.hidden_states.new_empty(inputs.hidden_states.shape, dtype=torch.float32)
+        else:
+            destinations, physical_rows, sizes = return_layout
+            # Every useful row is uniquely written by combine before ReduceScatter.
+            routed_out = inputs.hidden_states.new_empty(
+                (physical_rows, inputs.hidden_states.shape[1]), dtype=torch.float32
+            )
+            prefill_zero_ep_padding(routed_out, sizes, physical_rows // 16)
+            logger.info_once(
+                "V41_EP_RETURN_DIRECT_RUNTIME rows=%d physical_rows=%d", rows, physical_rows, scope="process"
+            )
         counts = inputs.topk_ids.new_zeros((self.moe_config.num_local_experts,), dtype=torch.int64)
         for start in range(0, rows, chunk_size):
             part = slice(start, start + chunk_size)
@@ -244,7 +313,11 @@ class DeepseekV41AllGatherComm(AllGatherCommImpl):
                 ),
             )
             if prefill_fusion_available(inputs.hidden_states):
-                result = self._prefill_chunk_into(chunk, routed_out[part])
+                result = (
+                    self._prefill_chunk_into(chunk, routed_out[part])
+                    if return_layout is None
+                    else self._prefill_chunk_into(chunk, routed_out, destinations[part])
+                )
             else:
                 result = super().fused_experts(chunk)
                 routed_out[part].copy_(result.routed_out)

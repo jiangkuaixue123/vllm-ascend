@@ -9,6 +9,7 @@ from functools import lru_cache
 import torch
 import torch.nn.functional as F
 from vllm.logger import logger
+from vllm.triton_utils import HAS_TRITON
 
 from vllm_ascend.models.common.ops.selected_fia import try_selected_fia
 from vllm_ascend.utils import enable_custom_op
@@ -21,6 +22,9 @@ MAX_SPARSE_WIDTH = 2048
 LATENT_DIM = 512
 # Private explicit-slot table extension; ordinary paged block IDs are nonnegative.
 PREFILL_LENGTH_TAG = -0x563431
+
+if HAS_TRITON:
+    from vllm_ascend.ops.triton.deepseek_v41_prefill_slots import encode_prefill_runs
 
 
 def aligned_length(length, alignment):
@@ -72,7 +76,19 @@ class PrefillAttentionInputs:
     def workspace_bytes(self):
         return 0 if self.workspace is None else self.workspace.numel() * self.workspace.element_size()
 
-    def prepare_slots(self, topk, positions, query_start, seq_len, first, raw_length, compressed_length, window_size):
+    def prepare_slots(
+        self,
+        topk,
+        positions,
+        query_start,
+        seq_len,
+        first,
+        raw_length,
+        compressed_length,
+        window_size,
+        *,
+        encode_runs=False,
+    ):
         geometry = (
             query_start,
             positions.numel(),
@@ -83,6 +99,7 @@ class PrefillAttentionInputs:
             window_size,
             topk.shape,
             topk.device,
+            encode_runs,
         )
         if self.slots is None or self.topk is not topk or self.geometry != geometry:
             indices = prefill_indices(positions, window_size, seq_len, first, raw_length, topk)
@@ -101,6 +118,8 @@ class PrefillAttentionInputs:
                 width,
                 lengths=self.slot_table[:, 1],
             )
+            if encode_runs and HAS_TRITON:
+                self.slots = encode_prefill_runs(self.slots, self.slot_table, length)
             self.topk, self.geometry = topk, geometry
         return self.slots
 

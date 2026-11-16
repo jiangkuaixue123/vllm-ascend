@@ -583,6 +583,33 @@ class DeepseekV41Cache(nn.Module, AttentionLayerBase):
             value = torch.where(valid[row : row + 1, None], values[row : row + 1], old)
             page.index_copy_(0, slot, value)
 
+    def decode_write_quantized(self, md, values, bank, offset, enabled, quantization="fp8"):
+        if quantization == "fp8":
+            values = fp8_quant_dequant(values, 32)
+        elif quantization in ("fp4_e4m3", "fp4_e8m0"):
+            e4m3 = quantization == "fp4_e4m3"
+            values = fp4_quant_dequant(values, 16 if e4m3 else 32, scale_format="e4m3" if e4m3 else "e8m0")
+        else:
+            raise ValueError("Unknown V4.1 cache quantization")
+        if (
+            values.device.type == "npu"
+            and isinstance(md, DeepseekV41DecodeMetadata)
+            and md.query_width == 6
+            and md.grouped_row_start == 0
+            and not envs.VLLM_BATCH_INVARIANT
+            and is_forward_context_available()
+            and (context := get_forward_context()).cudagraph_runtime_mode == CUDAGraphMode.FULL
+            and getattr(context, "is_draft_model", True) is False
+        ):
+            from vllm_ascend.ops.triton.deepseek_v41_context_store import store_quantized_cache_rows
+
+            page = self.field(bank, offset, values.shape[-1])
+            if store_quantized_cache_rows is not None and store_quantized_cache_rows(
+                page, md.slot_mapping, md.active, enabled, values
+            ):
+                return
+        self.decode_write(md, values, bank, offset, enabled)
+
 
 class DeepseekV41RMSNorm(nn.Module):
     def __init__(self, dim, eps):
@@ -660,6 +687,23 @@ def topk_columns(scores, k):
     # Retain all strictly higher scores; fill only the tied part by column.
     tied = torch.where(scores == cutoff, columns, scores.shape[-1])
     first = tied.topk(k, dim=-1, largest=False).values
+    if (
+        HAS_TRITON
+        and not envs.VLLM_BATCH_INVARIANT
+        and _use_float32_tie_columns(scores, k)
+        and 32 <= scores.shape[0] <= 128
+        and get_ascend_device_type() == AscendDeviceType.A3
+        and is_forward_context_available()
+        and (context := get_forward_context()).cudagraph_runtime_mode == CUDAGraphMode.NONE
+        and not getattr(context, "is_draft_model", True)
+        and not getattr(context, "in_profile_run", True)
+    ):
+        from vllm_ascend.ops.triton.deepseek_v41_index_ties import finalize_prefill_ties
+
+        finalized = finalize_prefill_ties(top.values, top.indices, first)
+        if finalized is not None:
+            logger.info_once("PREFILL_CUTOFF_CONSUMER_RUNTIME rows=%d", scores.shape[0], scope="process")
+            return finalized
     at_cutoff = top.values == cutoff
     ordinal = at_cutoff.long().cumsum(-1) - 1
     return torch.where(at_cutoff, first.gather(-1, ordinal.clamp_min(0)).long(), top.indices)
@@ -1130,10 +1174,8 @@ class DeepseekV41Attention(nn.Module):
         keys = self.indexer.k_norm(self.indexer.wk(latent))
         self.rotate(keys.unsqueeze(0), group_start)
         self.rotate(latent.unsqueeze(0), group_start)
-        keys = fp4_quant_dequant(keys, 32, scale_format="e8m0")
-        latent = fp4_quant_dequant(latent, 16, scale_format="e4m3")
-        self.cache.decode_write(md, latent, 0, dim, complete)
-        self.cache.decode_write(md, keys, 1, dim, complete)
+        self.cache.decode_write_quantized(md, latent, 0, dim, complete, "fp4_e4m3")
+        self.cache.decode_write_quantized(md, keys, 1, dim, complete, "fp4_e8m0")
         runtime.source_cache = self.cache
         runtime.source_decode = md
         if (arena := getattr(runtime, "slot_arena", None)) is not None:
@@ -1429,7 +1471,7 @@ class DeepseekV41Attention(nn.Module):
         else:
             raw = self.kv_norm(self.wkv(gathered)[0])
         self.rotate(raw.unsqueeze(0), full_pos)
-        self.cache.decode_write(full_md, fp8_quant_dequant(raw, 32), 0, 0, full_md.active)
+        self.cache.decode_write_quantized(full_md, raw, 0, 0, full_md.active)
         extra = 0
         if self.ratio:
             self._decode_compressed(gathered, full_pos, full_md, runtime)
@@ -1567,6 +1609,7 @@ class DeepseekV41Attention(nn.Module):
                     kv.shape[0],
                     shared.compressed.shape[0],
                     self.config.sliding_window,
+                    encode_runs=True,
                 )
                 previous_bytes = inputs.workspace_bytes
                 padded_kv = inputs.update_workspace(

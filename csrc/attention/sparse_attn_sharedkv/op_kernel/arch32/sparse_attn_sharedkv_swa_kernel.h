@@ -45,6 +45,7 @@ struct SwaTempLoopInfo {
     int32_t actCmpS2Size = 0;
 
     bool curActSeqLenIsZero = false;
+    bool oriSlotRuns = false;
 
     uint32_t tndCoreStartKVSplitPos = 0;
     bool tndIsS2SplitCore = false;
@@ -372,6 +373,7 @@ __aicore__ inline int32_t SparseAttnSharedkvSwa<SAST>::GetActualSeqLenKV(uint32_
 template <typename SAST>
 __aicore__ inline uint32_t SparseAttnSharedkvSwa<SAST>::GetOriSparseActualSeqLen()
 {
+    tempLoopInfo.oriSlotRuns = false;
     if (!constInfo.hasOriSparseIndices || constInfo.oriSparseIndexWidth == 0 ||
         tempLoopInfo.actOriS2Size <= 0) {
         return 0;
@@ -386,12 +388,17 @@ __aicore__ inline uint32_t SparseAttnSharedkvSwa<SAST>::GetOriSparseActualSeqLen
     if constexpr (KV_LAYOUT_T == SAS_LAYOUT::PA_ND && LAYOUT_T == SAS_LAYOUT::TND &&
                   TEMPLATE_MODE == SWA_TEMPLATE) {
         constexpr int32_t PREFILL_LENGTH_TAG = -0x563431;
+        constexpr int32_t PREFILL_RUNS_TAG = -0x563432;
         if (constInfo.kvHeadNum == 1 && tempLoopInfo.actS1Size == 1 &&
             tempLoopInfo.s1StartIdx == 0 && constInfo.oriMaxBlockNumPerBatch >= 2) {
             uint64_t tableOffset = static_cast<uint64_t>(tempLoopInfo.bIdx) * constInfo.oriMaxBlockNumPerBatch;
-            if (oriBlockTableGm.GetValue(tableOffset) == PREFILL_LENGTH_TAG) {
+            int32_t tag = oriBlockTableGm.GetValue(tableOffset);
+            bool flatRuns = tag == PREFILL_RUNS_TAG && constInfo.headDim == 512 &&
+                            constInfo.oriKvStride == constInfo.paOriBlockSize * constInfo.headDim;
+            if (tag == PREFILL_LENGTH_TAG || flatRuns) {
                 int32_t length = oriBlockTableGm.GetValue(tableOffset + 1);
                 if (length >= 0 && static_cast<uint32_t>(length) <= maxSparseLen) {
+                    tempLoopInfo.oriSlotRuns = flatRuns;
                     return static_cast<uint32_t>(length);
                 }
             }
@@ -574,6 +581,7 @@ __aicore__ inline void SparseAttnSharedkvSwa<SAST>::CalcParams(uint32_t loop, ui
     info.tndCoreStartKVSplitPos = tempLoopInfo.tndCoreStartKVSplitPos;
     info.isBmm2Output = false;
     info.actS1Size = tempLoopInfo.actS1Size;
+    info.oriSlotRuns = tempLoopInfo.oriSlotRuns;
 
     // M方向的尾块
     info.actMBaseSize = tempLoopInfo.mBasicSizeTail;

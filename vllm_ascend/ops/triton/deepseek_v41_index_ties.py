@@ -12,6 +12,35 @@ _SELECTED_COLUMNS = 512
 
 
 @triton.jit
+def _finalize_prefill_ties(selected, indices, first, output, K: tl.constexpr):
+    row = tl.program_id(0)
+    lanes = tl.arange(0, K)
+    values = tl.load(selected + row * K + lanes).to(tl.float32)
+    cutoff = tl.load(selected + row * K + K - 1).to(tl.float32)
+    tied = values == cutoff
+    # Sorted TopK puts finite cutoff ties in its final suffix; NaN ties are all false.
+    ordinal = lanes - (K - tl.sum(tied.to(tl.int32), 0))
+    choices = tl.load(first + row * K + lanes)
+    replacement = tl.gather(choices, tl.maximum(ordinal, 0), axis=0).to(tl.int64)
+    original = tl.load(indices + row * K + lanes)
+    tl.store(output + row * K + lanes, tl.where(tied, replacement, original))
+
+
+def finalize_prefill_ties(selected, indices, first):
+    if (
+        selected.shape != indices.shape
+        or selected.shape != first.shape
+        or selected.ndim != 2
+        or selected.shape[1] != _SELECTED_COLUMNS
+        or not all(x.is_contiguous() for x in (selected, indices, first))
+    ):
+        return None
+    output = torch.empty_like(indices)
+    _finalize_prefill_ties[(selected.shape[0],)](selected, indices, first, output, K=_SELECTED_COLUMNS)
+    return output
+
+
+@triton.jit
 def _count_ties(
     scores, selected, counts, WIDTH: tl.constexpr, K: tl.constexpr, TILES: tl.constexpr, TILE: tl.constexpr
 ):

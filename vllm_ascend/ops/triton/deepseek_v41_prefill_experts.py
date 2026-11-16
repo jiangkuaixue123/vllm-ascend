@@ -36,6 +36,28 @@ if HAS_TRITON and not envs.VLLM_BATCH_INVARIANT:
         init_device_properties_triton,
     )
 
+    @triton.jit
+    def _zero_ep_padding(output, sizes, CAPACITY: tl.constexpr, H: tl.constexpr, B: tl.constexpr):
+        rank = tl.program_id(0)
+        live = tl.load(sizes + rank)
+        for start in range(live * H + tl.program_id(1) * B, CAPACITY * H, tl.num_programs(1) * B):
+            offset = start + tl.arange(0, B)
+            tl.store(output + rank * CAPACITY * H + offset, 0.0, offset < CAPACITY * H)
+
+    def prefill_zero_ep_padding(output, sizes, capacity):
+        if (
+            output.dtype != torch.float32
+            or not output.is_contiguous()
+            or sizes.dtype != torch.int32
+            or not sizes.is_contiguous()
+            or sizes.device != output.device
+            or sizes.shape != (16,)
+            or output.shape != (16 * capacity, 5120)
+            or not 0 < capacity <= 2048
+        ):
+            raise ValueError("Direct EP padding requires the bounded FP32 return layout")
+        _zero_ep_padding[(16, 8)](output, sizes, CAPACITY=capacity, H=5120, B=8192)
+
     @triton.jit(do_not_specialize=["N", "EXPANDED"])
     def _prefill_route_metadata(
         row_ids,
@@ -157,11 +179,13 @@ if HAS_TRITON and not envs.VLLM_BATCH_INVARIANT:
         row_ids,
         owned,
         output,
+        output_rows,
         M,
         EXPANDED,
         H: tl.constexpr,
         K: tl.constexpr,
         C: tl.constexpr,
+        MAPPED: tl.constexpr,
     ):
         row = tl.program_id(0)
         cols = tl.program_id(1) * C + tl.arange(0, C)
@@ -185,7 +209,8 @@ if HAS_TRITON and not envs.VLLM_BATCH_INVARIANT:
                 total = tl.where(active, value, 0.0)
             else:
                 total = tl.where(active, total + value, total)
-        tl.store(output + row * H + cols, total, valid)
+        destination = tl.load(output_rows + row, row < M, 0) if MAPPED else row
+        tl.store(output + destination * H + cols, total, valid)
 
     def prefill_route_activation(gate_up, factor, limit, groups=None):
         rows, width = gate_up.shape
@@ -228,17 +253,25 @@ if HAS_TRITON and not envs.VLLM_BATCH_INVARIANT:
         )
         return output
 
-    def prefill_combine_output(states, factor, row_ids, owned, out=None):
+    def prefill_combine_output(states, factor, row_ids, owned, out=None, output_rows=None):
         rows, top_k = owned.shape
         expanded, hidden = states.shape
         output = torch.empty((rows, hidden), dtype=torch.float32, device=states.device) if out is None else out
         if (
-            output.shape != (rows, hidden)
+            (output.shape != (rows, hidden) if output_rows is None else output.ndim != 2 or output.shape[1] != hidden)
             or output.dtype != torch.float32
             or output.device != states.device
             or not output.is_contiguous()
         ):
             raise ValueError("Prefill combine output must be a contiguous FP32 token matrix")
+        if output_rows is not None and (
+            out is None
+            or output_rows.shape != (rows,)
+            or output_rows.device != states.device
+            or output_rows.dtype != torch.int32
+            or not output_rows.is_contiguous()
+        ):
+            raise ValueError("Prefill EP destinations must be a contiguous int32 row map")
         if rows == 0:
             return output
         _prefill_combine[(rows, triton.cdiv(hidden, _COMBINE_COLS))](
@@ -247,11 +280,13 @@ if HAS_TRITON and not envs.VLLM_BATCH_INVARIANT:
             row_ids,
             owned,
             output,
+            row_ids if output_rows is None else output_rows,
             M=rows,
             EXPANDED=expanded,
             H=hidden,
             K=top_k,
             C=_COMBINE_COLS,
+            MAPPED=output_rows is not None,
             enable_fp_fusion=False,
         )
         return output
@@ -260,3 +295,4 @@ else:
     prefill_dispatched_scales = None
     prefill_route_activation = None
     prefill_combine_output = None
+    prefill_zero_ep_padding = None

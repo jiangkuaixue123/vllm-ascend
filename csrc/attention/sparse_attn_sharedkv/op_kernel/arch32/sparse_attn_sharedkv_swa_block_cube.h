@@ -140,6 +140,9 @@ private:
         return idxMap[mIdx % 2] + k1Idx;
     }
 
+    __aicore__ inline void ComputeMm1FullWidth(const RunInfo &info, const MSplitInfo mSplitInfo);
+    __aicore__ inline void ComputeMm2FullWidth(const RunInfo &info, const MSplitInfo mSplitInfo);
+    __aicore__ inline void LoadDataMm2B(LocalTensor<KV_T> &dst, LocalTensor<KV_T> &src, uint32_t rows);
     __aicore__ inline void CopyGmToL1(LocalTensor<KV_T> &l1Tensor, GlobalTensor<KV_T> &gmSrcTensor, uint32_t srcN,
                                       uint32_t srcD, uint32_t srcDstride);
     __aicore__ inline void CopyInMm1AToL1(LocalTensor<KV_T> &aL1Tensor, const RunInfo &info, uint32_t mSeqIdx,
@@ -331,9 +334,78 @@ __aicore__ inline void SWACubeBlock<SAST>::CopyInMm2AToL1(LocalTensor<KV_T> &aL1
 }
 
 template <typename SAST>
+__aicore__ inline void SWACubeBlock<SAST>::ComputeMm1FullWidth(const RunInfo &info, const MSplitInfo mSplitInfo)
+{
+    const uint32_t ka = GetQPL1RealIdx(qpL1BufIter, 0);
+    LocalTensor<KV_T> aL1 = l1QPTensor[ka * L1_BLOCK_OFFSET];
+    WaitFlag<HardEvent::MTE1_MTE2>(mte21QPIds[ka]);
+    CopyInMm1AToL1(aL1, info, mSplitInfo.nBufferStartM, 64, 512, 0);
+    SetFlag<HardEvent::MTE2_MTE1>(mte21QPIds[ka]);
+    WaitFlag<HardEvent::MTE2_MTE1>(mte21QPIds[ka]);
+    const uint32_t size = info.actualSingleProcessSInnerSize;
+    const uint32_t tiles = CeilDiv(size, N_SPLIT_SIZE);
+    for (uint32_t tile = 0; tile < tiles; ++tile) {
+        uint32_t rows = Min(N_SPLIT_SIZE, size - tile * N_SPLIT_SIZE);
+        uint32_t aligned = SASAlign(rows, 16U);
+        WaitFlag<HardEvent::MTE1_MTE2>(mte21KVIds[0]);
+        WaitFlag<HardEvent::MTE1_MTE2>(mte21KVIds[1]);
+        PAShape shape = {static_cast<uint32_t>(constInfo.paOriBlockSize), 1, 512, constInfo.oriKvStride,
+                         constInfo.oriMaxBlockNumPerBatch, 512, rows, aligned};
+        Position pos = {info.bIdx, 0, 0, 0, 0};
+        uint64_t base = info.qTokenOffset * constInfo.oriSparseIndexWidth;
+        uint32_t start = info.s2Idx * constInfo.s2BaseSize + tile * N_SPLIT_SIZE;
+        DataCopyPABySlots<KV_T>(l1KVTensor, oriKvGm, oriSparseIndicesGm, shape, pos, base, start, true);
+        SetFlag<HardEvent::MTE2_MTE1>(mte21KVIds[0]);
+        WaitFlag<HardEvent::MTE2_MTE1>(mte21KVIds[0]);
+        LocalTensor<MM_OUT_T> cL0 = cL0TensorPingPong[(cL0BufIter % 2) * (L0C_PP_SIZE / sizeof(MM_OUT_T))];
+        for (uint32_t k = 0; k < 4; ++k) {
+            uint32_t ab = abL0BufIter % 2;
+            WaitFlag<HardEvent::M_MTE1>(Mte1MmABEventId(ab));
+            LocalTensor<KV_T> aL0 = aL0TensorPingPong[ab * (L0A_PP_SIZE / sizeof(KV_T))];
+            LocalTensor<KV_T> bL0 = bL0TensorPingPong[ab * (L0B_PP_SIZE / sizeof(KV_T))];
+            LoadDataMm1A(aL0, aL1, k, 128, 64, 128);
+            LoadDataMm1B(bL0, l1KVTensor, k, 128, 128, aligned);
+            SetFlag<HardEvent::MTE1_M>(Mte1MmABEventId(ab));
+            WaitFlag<HardEvent::MTE1_M>(Mte1MmABEventId(ab));
+            MmadParams params;
+            params.m = 64;
+            params.n = aligned;
+            params.k = 128;
+            params.cmatrixInitVal = k == 0;
+            params.cmatrixSource = false;
+            params.unitFlag = k == 3 ? 0b11 : 0b10;
+            Mmad(cL0, aL0, bL0, params);
+            if ((params.m / 16) * (params.n / 16) < 10) {
+                PipeBarrier<PIPE_M>();
+            }
+            SetFlag<HardEvent::M_MTE1>(Mte1MmABEventId(ab));
+            ++abL0BufIter;
+        }
+        FixpipeParamsV220 params;
+        params.nSize = aligned;
+        params.mSize = params.srcStride = 64;
+        params.dstStride = info.actualSingleProcessSInnerSizeAlign;
+        params.ndNum = 1;
+        params.unitFlag = 0b11;
+        uint64_t offset = (info.loop % constInfo.preLoadNum) * constInfo.mmResUbSize + tile * N_SPLIT_SIZE +
+                          mSplitInfo.nBufferStartM * info.actualSingleProcessSInnerSizeAlign;
+        Fixpipe(mm1ResGm[offset], cL0, params);
+        SetFlag<HardEvent::MTE1_MTE2>(mte21KVIds[0]);
+        SetFlag<HardEvent::MTE1_MTE2>(mte21KVIds[1]);
+        ++cL0BufIter;
+    }
+    SetFlag<HardEvent::MTE1_MTE2>(mte21QPIds[ka]);
+    ++qpL1BufIter;
+}
+
+template <typename SAST>
 __aicore__ inline void SWACubeBlock<SAST>::ComputeMm1(const RunInfo &info, const MSplitInfo mSplitInfo)
 {
     uint32_t mSize = mSplitInfo.nBufferDealM;
+    if (info.oriSlotRuns && info.isOri && mSize == 64) {
+        ComputeMm1FullWidth(info, mSplitInfo);
+        return;
+    }
     uint32_t mL1Size = M_SPLIT_SIZE;
     uint32_t mL1SizeAlign = SASAlign(M_SPLIT_SIZE, 16);
     uint32_t mL1Loops = CeilDiv(mSize, M_SPLIT_SIZE);
@@ -366,7 +438,6 @@ __aicore__ inline void SWACubeBlock<SAST>::ComputeMm1(const RunInfo &info, const
             kvL1BufIter++;
             uint32_t kb = kvL1BufIter % 3;
             WaitFlag<HardEvent::MTE1_MTE2>(mte21KVIds[kb]);
-            // 从k当中取当前的块
             bL1Tensor = l1KVTensor[kb * L1_BLOCK_OFFSET];
             uint32_t curSeqIdx = info.s2BatchOffset + nL1 * N_SPLIT_SIZE;
             uint32_t copyFinishRowCnt = 0;
@@ -397,7 +468,7 @@ __aicore__ inline void SWACubeBlock<SAST>::ComputeMm1(const RunInfo &info, const
                             (info.qTokenOffset * constInfo.kvHeadNum + info.n2Idx) * constInfo.oriSparseIndexWidth;
                         uint32_t sparseIndexStart = info.s2Idx * constInfo.s2BaseSize + nL1 * N_SPLIT_SIZE;
                         DataCopyPABySlots<KV_T>(bL1Tensor, oriKvGm, oriSparseIndicesGm, shape, startPos,
-                                                sparseIndexBaseOffset, sparseIndexStart);
+                                                sparseIndexBaseOffset, sparseIndexStart, info.oriSlotRuns);
                     } else {
                         while (copyFinishRowCnt < nL1Size) {
                         // 由于ori_left的存在， 即使第一块搬运也可能并非是pa_block的零点位
@@ -635,7 +706,7 @@ __aicore__ inline void SWACubeBlock<SAST>::ComputeMm1(const RunInfo &info, const
                 }
             }
 
-            SetFlag<HardEvent::MTE1_MTE2>(mte21KVIds[kb]); // 反向同步, 表示L1已经被mte1消费完
+            SetFlag<HardEvent::MTE1_MTE2>(mte21KVIds[kb]);
         }
         if (mL1Loops == 1) {
             cL0BufIter++;
@@ -646,8 +717,107 @@ __aicore__ inline void SWACubeBlock<SAST>::ComputeMm1(const RunInfo &info, const
 
 
 template <typename SAST>
+__aicore__ inline void SWACubeBlock<SAST>::LoadDataMm2B(LocalTensor<KV_T> &dst, LocalTensor<KV_T> &src,
+                                                     uint32_t rows)
+{
+    LoadData3DParamsV2<KV_T> params;
+    params.l1H = rows / 16;
+    params.l1W = 16;
+    params.padList[0] = params.padList[1] = params.padList[2] = 0;
+    params.padList[3] = 255;
+    params.mExtension = rows;
+    params.kExtension = N_SPLIT_SIZE;
+    params.mStartPt = params.kStartPt = 0;
+    params.strideW = params.strideH = 1;
+    params.filterW = params.filterH = 1;
+    params.filterSizeW = params.filterSizeH = false;
+    params.dilationFilterW = params.dilationFilterH = 1;
+    params.enTranspose = 1;
+    params.fMatrixCtrl = 0;
+    params.channelSize = N_SPLIT_SIZE;
+    LoadData<KV_T, LOAD3DV2_CONFIG>(dst, src, params);
+}
+
+template <typename SAST>
+__aicore__ inline void SWACubeBlock<SAST>::ComputeMm2FullWidth(const RunInfo &info, const MSplitInfo mSplitInfo)
+{
+    const uint32_t kSize = info.actualSingleProcessSInnerSize;
+    const uint32_t kL1Loops = CeilDiv(kSize, K_L1_SPLIT_SIZE);
+    const uint64_t base = info.qTokenOffset * constInfo.oriSparseIndexWidth;
+    const uint32_t ka = GetQPL1RealIdx(qpL1BufIter, 0);
+    LocalTensor<KV_T> aL1 = l1QPTensor[ka * L1_BLOCK_OFFSET];
+    WaitFlag<HardEvent::MTE1_MTE2>(mte21QPIds[ka]);
+    CopyInMm2AToL1(aL1, info, mSplitInfo.nBufferStartM, 64, kSize, 0);
+    SetFlag<HardEvent::MTE2_MTE1>(mte21QPIds[ka]);
+    WaitFlag<HardEvent::MTE2_MTE1>(mte21QPIds[ka]);
+    constexpr uint32_t cTileElements = 64 * N_SPLIT_SIZE;
+    static_assert(4 * cTileElements * sizeof(MM_OUT_T) == 2 * L0C_PP_SIZE);
+    // All four output tiles share one D512 transfer; each keeps the original K128 order.
+    for (uint32_t k1 = 0; k1 < kL1Loops; ++k1) {
+        uint32_t kL1Size = Min(K_L1_SPLIT_SIZE, kSize - k1 * K_L1_SPLIT_SIZE);
+        uint32_t kL0Loops = CeilDiv(kL1Size, K_L0_SPLIT_SIZE);
+        for (uint32_t k0 = 0; k0 < kL0Loops; ++k0) {
+            uint32_t rows = Min(K_L0_SPLIT_SIZE, kL1Size - k0 * K_L0_SPLIT_SIZE);
+            uint32_t rowsAlign = SASAlign(rows, 16U);
+            WaitFlag<HardEvent::MTE1_MTE2>(mte21KVIds[0]);
+            WaitFlag<HardEvent::MTE1_MTE2>(mte21KVIds[1]);
+            PAShape shape = {static_cast<uint32_t>(constInfo.paOriBlockSize), 1, 512, constInfo.oriKvStride,
+                             constInfo.oriMaxBlockNumPerBatch, 512, rows, rowsAlign};
+            Position pos = {info.bIdx, 0, 0, 0, 0};
+            uint32_t start = info.s2Idx * constInfo.s2BaseSize + k1 * 256 + k0 * 128;
+            DataCopyPABySlots<KV_T>(l1KVTensor, oriKvGm, oriSparseIndicesGm, shape, pos, base, start, true);
+            SetFlag<HardEvent::MTE2_MTE1>(mte21KVIds[0]);
+            WaitFlag<HardEvent::MTE2_MTE1>(mte21KVIds[0]);
+            for (uint32_t quarter = 0; quarter < 4; ++quarter) {
+                uint32_t ab = abL0BufIter % 2;
+                WaitFlag<HardEvent::M_MTE1>(Mte1MmABEventId(ab));
+                LocalTensor<KV_T> aL0 = aL0TensorPingPong[ab * (L0A_PP_SIZE / sizeof(KV_T))];
+                LocalTensor<KV_T> bL0 = bL0TensorPingPong[ab * (L0B_PP_SIZE / sizeof(KV_T))];
+                LoadDataMm1A(aL0, aL1, k1 * 2 + k0, K_L0_SPLIT_SIZE, 64, rowsAlign);
+                LocalTensor<KV_T> bQuarter = l1KVTensor[quarter * rowsAlign * N_SPLIT_SIZE];
+                LoadDataMm2B(bL0, bQuarter, rowsAlign);
+                SetFlag<HardEvent::MTE1_M>(Mte1MmABEventId(ab));
+                WaitFlag<HardEvent::MTE1_M>(Mte1MmABEventId(ab));
+                LocalTensor<MM_OUT_T> cL0 = cL0TensorPingPong[quarter * cTileElements];
+                MmadParams params;
+                params.m = 64;
+                params.n = N_SPLIT_SIZE;
+                params.k = rows;
+                params.cmatrixInitVal = k1 == 0 && k0 == 0;
+                params.cmatrixSource = false;
+                params.unitFlag = k1 + 1 == kL1Loops && k0 + 1 == kL0Loops ? 0b11 : 0b10;
+                Mmad(cL0, aL0, bL0, params);
+                SetFlag<HardEvent::M_MTE1>(Mte1MmABEventId(ab));
+                ++abL0BufIter;
+            }
+            SetFlag<HardEvent::MTE1_MTE2>(mte21KVIds[0]);
+            SetFlag<HardEvent::MTE1_MTE2>(mte21KVIds[1]);
+        }
+    }
+    SetFlag<HardEvent::MTE1_MTE2>(mte21QPIds[ka]);
+    for (uint32_t quarter = 0; quarter < 4; ++quarter) {
+        LocalTensor<MM_OUT_T> cL0 = cL0TensorPingPong[quarter * cTileElements];
+        FixpipeParamsV220 params;
+        params.nSize = N_SPLIT_SIZE;
+        params.mSize = params.srcStride = 64;
+        params.dstStride = 512;
+        params.ndNum = 1;
+        params.unitFlag = 0b11;
+        uint64_t offset = (info.loop % constInfo.preLoadNum) * constInfo.bmm2ResUbSize +
+                          mSplitInfo.nBufferStartM * 512 + quarter * N_SPLIT_SIZE;
+        Fixpipe(mm2ResGm[offset], cL0, params);
+    }
+    cL0BufIter += 4;
+    ++qpL1BufIter;
+}
+
+template <typename SAST>
 __aicore__ inline void SWACubeBlock<SAST>::ComputeMm2(const RunInfo &info, const MSplitInfo mSplitInfo)
 {
+    if (info.oriSlotRuns && info.isOri && mSplitInfo.nBufferDealM == 64) {
+        ComputeMm2FullWidth(info, mSplitInfo);
+        return;
+    }
     uint32_t mSize = mSplitInfo.nBufferDealM;
     uint32_t mSizeAlign = (mSize + 16 - 1) / 16;
     uint32_t mL1Loops = (mSize + M_SPLIT_SIZE - 1) / M_SPLIT_SIZE;
@@ -728,7 +898,7 @@ __aicore__ inline void SWACubeBlock<SAST>::ComputeMm2(const RunInfo &info, const
                                 (info.qTokenOffset * constInfo.kvHeadNum + info.n2Idx) * constInfo.oriSparseIndexWidth;
                             uint32_t sparseIndexStart = info.s2Idx * constInfo.s2BaseSize + kL1 * K_L0_SPLIT_SIZE;
                             DataCopyPABySlots<KV_T>(subvTensor, oriKvGm, oriSparseIndicesGm, shape, startPos,
-                                                    sparseIndexBaseOffset, sparseIndexStart);
+                                                    sparseIndexBaseOffset, sparseIndexStart, info.oriSlotRuns);
                         } else {
                             while (copyFinishRowCnt < kL0Size) {
                             copyRowCnt = constInfo.paOriBlockSize - curS2Offset % constInfo.paOriBlockSize;
