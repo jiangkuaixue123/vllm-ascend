@@ -342,6 +342,9 @@ def test_idle_block_still_calls_moe_without_entering_attention_or_hc():
     result, next_pre = block(hidden, pre, DeepseekV41Runtime([]))
     assert calls == [torch.Size([0, 4])]
     assert result is hidden and next_pre is pre
+    result, next_pre, prepared = block(hidden, pre, DeepseekV41Runtime([]), next_block=SimpleNamespace(engram=None))
+    assert result is hidden and next_pre is pre and prepared is None
+    assert calls == [torch.Size([0, 4]), torch.Size([0, 4])]
 
 
 def test_engram_query_unrotation_uses_transpose_and_returns_fp32():

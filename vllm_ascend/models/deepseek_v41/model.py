@@ -218,16 +218,24 @@ class DeepseekV41Block(nn.Module):
         output = hc_post(sublayer_output, residual, post, comb)
         return output if row_mask is None else torch.where(row_mask[:, None, None], output, 0)
 
-    def forward(self, hidden_states, pre_mix, runtime, decode_mask=None, image_mask=None):
+    def forward(
+        self, hidden_states, pre_mix, runtime, decode_mask=None, image_mask=None, *, prepared_attn=None, next_block=None
+    ):
         if getattr(runtime, "decode", None) is not None:
             runtime.attention_output_mask = None
         if hidden_states.shape[0] == 0:
             # Other DP replicas can be active. Participate in every expert
             # collective while avoiding empty NPU GEMMs and TP reductions.
             self.ffn(hidden_states.new_empty((0, self.config.hidden_size)))
-            return hidden_states, pre_mix
-        attn_input, attn_pre, post, comb = self.pre_and_mixes(hidden_states, pre_mix, "attn", runtime)
-        attended = self.attn(self.attn_norm(attn_input), runtime)
+            result = hidden_states, pre_mix
+            return result if next_block is None else (*result, None)
+        if prepared_attn is None:
+            attn_input, attn_pre, post, comb = self.pre_and_mixes(hidden_states, pre_mix, "attn", runtime)
+            attn_input = self.attn_norm(attn_input)
+        else:
+            attn_input, attn_pre, post, comb, squares = prepared_attn
+            attn_input = self.attn_norm(attn_input, squares)
+        attended = self.attn(attn_input, runtime)
         boundary = None
         if getattr(runtime, "decode", None) is not None:
             boundary = hc_post_pre_delayed(
@@ -270,7 +278,28 @@ class DeepseekV41Block(nn.Module):
             output = self.ffn(ffn_input, image_mask=image_mask)
         else:
             output = self.ffn(ffn_input)
-        return self.post_residual(output, hidden_states, post, comb, runtime), ffn_pre
+        if next_block is not None and next_block.engram is None and getattr(runtime, "decode", None) is not None:
+            following = hc_post_pre_delayed(
+                hidden_states,
+                next_block.hc_attn_fn,
+                next_block.hc_attn_scale,
+                next_block.hc_attn_base,
+                ffn_pre,
+                output,
+                post,
+                comb,
+                getattr(runtime, "block_row_mask", None),
+                getattr(runtime, "attention_output_mask", None),
+                next_block.config.rms_norm_eps,
+                next_block.config.hc_eps,
+                next_block.config.hc_sinkhorn_iters,
+            )
+            if following is not None:
+                runtime.attention_output_mask = None
+                residual, mixed, next_pre, next_post, next_comb, squares = following
+                return residual, ffn_pre, (mixed, next_pre, next_post, next_comb, squares)
+        result = self.post_residual(output, hidden_states, post, comb, runtime), ffn_pre
+        return result if next_block is None else (*result, None)
 
 
 def read_parameter_slice(reader, key, parameter, module, tp_rank, tp_size):
@@ -647,6 +676,7 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsMultiModal):
                 "TARGET_BLOCK_ROW_MASK_RUNTIME pid=%d rows=%d", os.getpid(), hidden_states.shape[0], scope="process"
             )
         auxiliary = []
+        prepared_attn = None
         for layer_id, layer in enumerate(self.layers):
             if layer.engram is not None:
                 hidden_states = layer.engram.forward_decode(
@@ -658,7 +688,27 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsMultiModal):
                 if runtime.block_row_mask is not None:
                     hidden_states = torch.where(local_active[:, None, None], hidden_states, 0)
             self._capture_aux(auxiliary, layer_id, hidden_states, input_ids.shape[0])
-            hidden_states, pre_mix = layer(hidden_states, pre_mix, runtime, local_active)
+            next_block = None
+            if runtime.block_row_mask is not None and layer_id + 1 < len(self.layers):
+                following = self.layers[layer_id + 1]
+                if following.engram is None:
+                    next_block = following
+            if prepared_attn is None and next_block is None:
+                hidden_states, pre_mix = layer(hidden_states, pre_mix, runtime, local_active)
+            else:
+                result = layer(
+                    hidden_states,
+                    pre_mix,
+                    runtime,
+                    local_active,
+                    prepared_attn=prepared_attn,
+                    next_block=next_block,
+                )
+                if next_block is None:
+                    hidden_states, pre_mix = result
+                    prepared_attn = None
+                else:
+                    hidden_states, pre_mix, prepared_attn = result
         output = self._finish_hc(hidden_states, pre_mix, input_ids.shape[0])
         active = runtime.decode.active[:, None]
         output = torch.where(active, output, 0)
