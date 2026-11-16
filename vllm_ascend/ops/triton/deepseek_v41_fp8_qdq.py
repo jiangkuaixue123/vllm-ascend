@@ -24,13 +24,12 @@ def decode_fp8_qdq(x: torch.Tensor, inplace: bool):
     return out
 
 
-def supports_prefill_projection_input(x: torch.Tensor, tp: int):
+def _supports_projection_input(x: torch.Tensor, tp: int):
     if (
         x.device.type != "npu"
         or x.dtype != torch.bfloat16
         or x.layout != torch.strided
         or x.ndim != 3
-        or x.shape[0] <= 256
         or x.shape[1:] != (64, 512)
         or tp not in (4, 8)
         or not x.is_contiguous()
@@ -41,7 +40,8 @@ def supports_prefill_projection_input(x: torch.Tensor, tp: int):
         or envs.VLLM_BATCH_INVARIANT
         or x.storage_offset() % _GROUP_SIZE
         or get_ascend_device_type() != AscendDeviceType.A3
-        or int(torch_npu.get_npu_format(x)) != int(torch_npu.Format.ND)
+        # Native FIA returns dense NCHW storage even for this three-axis view.
+        or int(torch_npu.get_npu_format(x)) not in (int(torch_npu.Format.ND), int(torch_npu.Format.NCHW))
     ):
         return False
     init_device_properties_triton()
@@ -49,9 +49,13 @@ def supports_prefill_projection_input(x: torch.Tensor, tp: int):
     return cores == _QUALIFIED_VECTOR_CORES and enable_custom_op()
 
 
+def supports_prefill_projection_input(x: torch.Tensor, tp: int):
+    return _supports_projection_input(x, tp) and x.shape[0] > 256
+
+
 def pack_prefill_projection_input(x: torch.Tensor, tp: int):
     """Quantize complete per-head groups while writing the BF16 all-to-all send layout."""
-    if not supports_prefill_projection_input(x, tp):
+    if not _supports_projection_input(x, tp) or not (x.shape[0] > 256 or x.shape[0] in (3, 6, 12)):
         return None
     rows, heads, width = x.shape
     out = torch.empty((tp * rows, heads // tp, width), dtype=x.dtype, device=x.device)
