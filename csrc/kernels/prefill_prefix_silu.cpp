@@ -53,6 +53,7 @@ private:
     AscendC::GlobalTensor<float> input_, output_;
 };
 
+template <bool ROUTED = true>
 class PrefixRouteQuant {
 public:
     __aicore__ inline void Run(GM_ADDR x, GM_ADDR factor, GM_ADDR groups, GM_ADDR out,
@@ -61,7 +62,7 @@ public:
         AscendC::GlobalTensor<int64_t> counts;
         counts.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t*>(groups));
         AscendC::GlobalTensor<float> factors, outputScales;
-        factors.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(factor));
+        if constexpr (ROUTED) factors.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(factor));
         outputScales.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(scales));
         AscendC::GlobalTensor<bfloat16_t> input;
         input.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t*>(x));
@@ -118,13 +119,15 @@ public:
             AscendC::Div(gate, gate, tmp, width);
             AscendC::PipeBarrier<PIPE_V>();
             AscendC::Mul(gate, gate, up, width);
-            auto scalar = meta_.Get<float>()[48];
-            AscendC::DataCopyPad(scalar, factors[row], {1, sizeof(float), 0, 0, 0}, {});
-            AscendC::SetFlag<AscendC::HardEvent::MTE2_S>(EVENT_ID0);
-            AscendC::WaitFlag<AscendC::HardEvent::MTE2_S>(EVENT_ID0);
-            const float route = scalar.GetValue(0);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Muls(gate, gate, route, width);
+            if constexpr (ROUTED) {
+                auto scalar = meta_.Get<float>()[48];
+                AscendC::DataCopyPad(scalar, factors[row], {1, sizeof(float), 0, 0, 0}, {});
+                AscendC::SetFlag<AscendC::HardEvent::MTE2_S>(EVENT_ID0);
+                AscendC::WaitFlag<AscendC::HardEvent::MTE2_S>(EVENT_ID0);
+                const float route = scalar.GetValue(0);
+                AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Muls(gate, gate, route, width);
+            }
             AscendC::PipeBarrier<PIPE_V>();
             // W2 quantization consumes the original BF16 activation, not its FP32 producer.
             AscendC::Cast(rounded, gate, AscendC::RoundMode::CAST_RINT, width);
@@ -255,7 +258,7 @@ void prefill_prefix_silu_launch(void* stream, void* x, void* groups, void* out,
 extern "C" __global__ __aicore__ void prefill_prefix_route_quant_kernel(
     GM_ADDR x, GM_ADDR factor, GM_ADDR groups, GM_ADDR out, GM_ADDR scales,
     uint32_t rows, uint32_t width, uint32_t count, float limit) {
-    PrefixRouteQuant op;
+    PrefixRouteQuant<true> op;
     op.Run(x, factor, groups, out, scales, rows, width, count, limit);
 }
 
@@ -265,6 +268,17 @@ void prefill_prefix_route_quant_launch(void* stream, void* x, void* factor, void
     prefill_prefix_route_quant_kernel<<<48, nullptr, stream>>>(
         static_cast<uint8_t*>(x), static_cast<uint8_t*>(factor), static_cast<uint8_t*>(groups),
         static_cast<uint8_t*>(out), static_cast<uint8_t*>(scales), rows, width, count, limit);
+}
+
+extern "C" __global__ __aicore__ void shared_gate_up_quant_kernel(
+    GM_ADDR x, GM_ADDR out, GM_ADDR scales, uint32_t rows) {
+    PrefixRouteQuant<false> op;
+    op.Run(x, nullptr, nullptr, out, scales, rows, 2304, 0, 10.0f);
+}
+
+void shared_gate_up_quant_launch(void* stream, void* x, void* out, void* scales, uint32_t rows) {
+    shared_gate_up_quant_kernel<<<rows, nullptr, stream>>>(
+        static_cast<uint8_t*>(x), static_cast<uint8_t*>(out), static_cast<uint8_t*>(scales), rows);
 }
 
 extern "C" __global__ __aicore__ void prefill_ordered_combine_kernel(

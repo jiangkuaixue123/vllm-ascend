@@ -16,9 +16,10 @@ from vllm_ascend.models.deepseek_v41.core import clipped_swiglu
 from vllm_ascend.models.deepseek_v41.fused_weights import load_indexed_v41_weights
 from vllm_ascend.models.deepseek_v41.model import read_parameter_slice
 from vllm_ascend.models.deepseek_v41.moe import DeepseekV41MoEExpert
-from vllm_ascend.ops.triton.deepseek_v41_shared_activation import shared_gate_up_activation
+from vllm_ascend.ops.triton.deepseek_v41_shared_activation import shared_gate_up_activation, shared_quantized_output
 from vllm_ascend.quantization.method_adapters import AscendLinearMethod
 from vllm_ascend.quantization.methods.w8a8.w8a8_dynamic import AscendW8A8DynamicLinearMethod
+from vllm_ascend.utils import enable_custom_op
 
 
 def exact(actual, expected):
@@ -70,6 +71,7 @@ class NativeQuantConfig:
 
 
 def make_expert(path, merged, *, replicated=True):
+    assert enable_custom_op()
     config = DeepseekV41TextConfig()
     model = nn.Module()
     model.model_path, model.config = path, config
@@ -121,6 +123,10 @@ def test_real_checkpoint_and_down_projection(experts, rows):
     exact(pair[0], old.w1(x))
     exact(pair[1], old.w3(x))
     exact(new(x), old(x))
+    if rows <= 12:
+        fused = shared_quantized_output(new.gate_up_proj(x), new.w2, 10.0)
+        assert fused is not None
+        exact(fused, old(x))
     factors = torch.full((rows, 1), 0.3, dtype=torch.float32, device="npu")
     exact(new(x, factors), old(x, factors))
     if rows > 12:

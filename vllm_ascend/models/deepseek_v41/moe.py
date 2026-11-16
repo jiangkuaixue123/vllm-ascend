@@ -38,6 +38,7 @@ from vllm_ascend.models.deepseek_v41.core import (
     clipped_swiglu,
     route_sqrtsoftplus,
 )
+from vllm_ascend.ops.triton.deepseek_v41_moe_output import moe_output
 
 
 def local_expert_ids(num_experts: int, ep_size: int, ep_rank: int) -> range:
@@ -325,18 +326,26 @@ class DeepseekV41MoEExpert(nn.Module):
         self.w2 = down_class(intermediate, hidden, prefix=f"{prefix}.w2", **common, **down_options)
 
     def forward(self, hidden_states: torch.Tensor, routing_weights: torch.Tensor | None = None) -> torch.Tensor:
+        output = None
         if self._merged_shared_gate_up:
-            from vllm_ascend.ops.triton.deepseek_v41_shared_activation import shared_gate_up_activation
+            from vllm_ascend.ops.triton.deepseek_v41_shared_activation import (
+                shared_gate_up_activation,
+                shared_quantized_output,
+            )
 
             gate_up = self.gate_up_proj(hidden_states)
-            activation = shared_gate_up_activation(gate_up, self.swiglu_limit) if routing_weights is None else None
-            if activation is None:
-                activation = clipped_swiglu(*gate_up.chunk(2, dim=-1), self.swiglu_limit)
+            if routing_weights is None:
+                output = shared_quantized_output(gate_up, self.w2, self.swiglu_limit)
+            if output is None:
+                activation = shared_gate_up_activation(gate_up, self.swiglu_limit) if routing_weights is None else None
+                if activation is None:
+                    activation = clipped_swiglu(*gate_up.chunk(2, dim=-1), self.swiglu_limit)
         else:
             activation = clipped_swiglu(self.w1(hidden_states), self.w3(hidden_states), self.swiglu_limit)
-        if routing_weights is not None:
-            activation = activation * routing_weights
-        output = self.w2(activation.to(hidden_states.dtype))
+        if output is None:
+            if routing_weights is not None:
+                activation = activation * routing_weights
+            output = self.w2(activation.to(hidden_states.dtype))
         if self.reduce_shared:
             output = tensor_model_parallel_all_reduce(output.float())
         return output.to(hidden_states.dtype)
@@ -497,7 +506,13 @@ class DeepseekV41MoE(nn.Module):
         valid = token_mask.unsqueeze(-1)
         # The target block establishes zero input rows and masks its HC residual output.
         states = hidden_states if mask_owned_by_block else torch.where(valid, hidden_states, 0.0)
-        output = self._routed_output(states, decode=True) + self._shared_output(states).float()
+        routed = self._routed_output(states, decode=True)
+        shared = self._shared_output(states)
+        if getattr(self, "n_routed_experts", 0) == 384:
+            merged = moe_output(routed, shared, None if mask_owned_by_block else token_mask, states.dtype)
+            if merged is not None:
+                return merged
+        output = routed + shared.float()
         if mask_owned_by_block:
             return output.to(states.dtype)
         return torch.where(valid, output.to(states.dtype), 0.0)

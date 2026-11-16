@@ -2,6 +2,7 @@
 #ifdef VLLM_ENABLE_ATB_AND_DIRECT_KERNELS
 #include <ATen/ATen.h>
 #include <cmath>
+#include <cstdint>
 #include <tuple>
 #include <torch/library.h>
 #include <torch_npu/csrc/core/npu/NPUStream.h>
@@ -12,11 +13,40 @@
 void prefill_prefix_silu_launch(void*, void*, void*, void*, uint32_t, uint32_t, uint32_t);
 void prefill_prefix_route_quant_launch(void*, void*, void*, void*, void*, void*, uint32_t,
                                      uint32_t, uint32_t, float);
+void shared_gate_up_quant_launch(void*, void*, void*, void*, uint32_t);
 
 void prefill_ordered_combine_launch(void*, void*, void*, void*, void*, void*, void*,
                                     uint32_t, uint32_t, uint32_t);
 
 namespace {
+std::tuple<at::Tensor, at::Tensor> shared_gate_up_quant_meta(const at::Tensor& x) {
+    return {at::empty({x.size(0), 2304}, x.options().dtype(at::kChar)),
+            at::empty({x.size(0)}, x.options().dtype(at::kFloat))};
+}
+
+std::tuple<at::Tensor, at::Tensor> shared_gate_up_quant(const at::Tensor& x) {
+    TORCH_CHECK(x.device().type() == c10::DeviceType::PrivateUse1 && x.dim() == 2
+                && (x.size(0) == 3 || x.size(0) == 6 || x.size(0) == 12) && x.size(1) == 4608
+                && x.scalar_type() == at::kBFloat16 && x.is_contiguous() && !x.is_neg() && !x.is_conj(),
+                "Shared gate/up expects local plain BF16 [3/6/12,4608]");
+    auto format = vllm_ascend::NPUBridge::GetNpuStorageImplDesc(x).npu_format_;
+    TORCH_CHECK((format == 0 || format == 2) && reinterpret_cast<uintptr_t>(x.data_ptr()) % 32 == 0,
+                "Shared gate/up requires aligned contiguous base storage");
+    const c10_npu::OptionalNPUGuard guard(x.device());
+    auto [output, scales] = shared_gate_up_quant_meta(x);
+    auto stream = c10_npu::getCurrentNPUStream().stream();
+    void* input = x.data_ptr(); void* out = output.data_ptr(); void* scale = scales.data_ptr();
+    const uint32_t rows = x.size(0);
+    at_npu::native::OpCommand cmd;
+    cmd.Name("shared_gate_up_quant");
+    cmd.SetCustomHandler([stream, input, out, scale, rows]() -> int {
+        shared_gate_up_quant_launch(stream, input, out, scale, rows);
+        return 0;
+    });
+    cmd.Run();
+    return {output, scales};
+}
+
 at::Tensor prefill_prefix_silu(const at::Tensor& x, const at::Tensor& groups) {
     TORCH_CHECK(x.dim() == 2 && x.scalar_type() == at::kFloat && x.is_contiguous(),
                 "Prefix SiLU expects a contiguous FP32 matrix");
@@ -125,16 +155,19 @@ void ordered_combine(const at::Tensor& x, const at::Tensor& factor, const at::Te
 }
 
 TORCH_LIBRARY_FRAGMENT(_C_ascend, m) {
+    m.def("shared_gate_up_quant(Tensor x) -> (Tensor, Tensor)");
     m.def("prefill_ordered_combine(Tensor x, Tensor factor, Tensor ids, Tensor owned, Tensor(a!) out, Tensor? destinations) -> ()");
     m.def("prefill_prefix_silu(Tensor x, Tensor groups) -> Tensor");
     m.def("prefill_prefix_route_quant(Tensor x, Tensor factor, Tensor groups, float limit) -> (Tensor, Tensor)");
 }
 TORCH_LIBRARY_IMPL(_C_ascend, PrivateUse1, m) {
+    m.impl("shared_gate_up_quant", &shared_gate_up_quant);
     m.impl("prefill_ordered_combine", &ordered_combine);
     m.impl("prefill_prefix_silu", &prefill_prefix_silu);
     m.impl("prefill_prefix_route_quant", &prefix_route_quant);
 }
 TORCH_LIBRARY_IMPL(_C_ascend, Meta, m) {
+    m.impl("shared_gate_up_quant", &shared_gate_up_quant_meta);
     m.impl("prefill_prefix_route_quant", &prefix_route_quant_meta);
 }
 #endif

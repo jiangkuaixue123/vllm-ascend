@@ -66,3 +66,45 @@ def shared_gate_up_activation(gate_up, limit):
     activated = F.silu(gate)
     _shared_product[grid](activated, up, output, hidden, 512, enable_fp_fusion=False)
     return output
+
+
+def shared_quantized_output(gate_up, down, limit):
+    if (
+        not torch.is_inference_mode_enabled()
+        or torch.compiler.is_compiling()
+        or envs.VLLM_BATCH_INVARIANT
+        or gate_up.device.type != "npu"
+        or gate_up.dtype != torch.bfloat16
+        or gate_up.shape not in ((3, 4608), (6, 4608), (12, 4608))
+        or not gate_up.is_contiguous()
+        or gate_up.is_neg()
+        or gate_up.is_conj()
+        or limit != 10.0
+        or not hasattr(torch.ops._C_ascend, "shared_gate_up_quant")
+        or get_ascend_device_type() != AscendDeviceType.A3
+    ):
+        return None
+    from vllm.model_executor.layers.linear import ReplicatedLinear
+
+    from vllm_ascend.quantization.methods.w8a8.w8a8_dynamic import AscendW8A8DynamicLinearMethod
+
+    scheme = getattr(getattr(down, "quant_method", None), "quant_method", None)
+    if (
+        not isinstance(down, ReplicatedLinear)
+        or not isinstance(scheme, AscendW8A8DynamicLinearMethod)
+        or scheme.act_quant_type != torch.int8
+        or down.input_size != 2304
+        or down.output_size != 5120
+        or down.bias is not None
+        or down.weight.dtype != torch.int8
+        or down.weight.device != gate_up.device
+    ):
+        return None
+    import torch_npu
+
+    if torch_npu.get_npu_format(gate_up) not in (0, 2) or gate_up.data_ptr() % 32:
+        return None
+    quantized, scales = torch.ops._C_ascend.shared_gate_up_quant(gate_up)
+    return torch_npu.npu_quant_matmul(
+        quantized, down.weight, down.weight_scale, pertoken_scale=scales, bias=None, output_dtype=gate_up.dtype
+    )
