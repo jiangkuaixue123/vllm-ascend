@@ -22,7 +22,7 @@
 
 namespace HcPre {
 using namespace AscendC;
-template <typename T, bool strictFp32 = false>
+template <typename T, bool strictFp32 = false, bool boundary = false>
 class HcPreMembaseKSplitCorePart1 {
 public:
     __aicore__ inline HcPreMembaseKSplitCorePart1()
@@ -69,6 +69,79 @@ public:
 
         // OutQue
         pipe->InitBuffer(mmInQue, NUM_TWO, xQueNum * sizeof(float));
+    }
+
+    __aicore__ inline void InitBoundary(GM_ADDR sublayer, GM_ADDR previousPost,
+        GM_ADDR previousComb, GM_ADDR rowMask, GM_ADDR inputMask, GM_ADDR residual)
+    {
+        sublayerGm.SetGlobalBuffer((__gm__ T *)sublayer);
+        previousPostGm.SetGlobalBuffer((__gm__ float *)previousPost);
+        previousCombGm.SetGlobalBuffer((__gm__ float *)previousComb);
+        rowMaskGm.SetGlobalBuffer((__gm__ bool *)rowMask);
+        inputMaskGm.SetGlobalBuffer((__gm__ bool *)inputMask);
+        residualGm.SetGlobalBuffer((__gm__ T *)residual);
+        if ASCEND_IS_AIV {
+            pipe->InitBuffer(boundaryTmp, tilingData->cvLoopKSize * sizeof(float));
+            pipe->InitBuffer(boundaryOut, 1, tilingData->cvLoopKSize * sizeof(T));
+        }
+    }
+
+    __aicore__ inline void PrepareBoundary(LocalTensor<float> cast, uint64_t rowStart,
+        uint64_t rows, uint64_t kStart, uint64_t width)
+    {
+        const uint64_t stream = kStart / tilingData->d;
+        const uint64_t channel = kStart % tilingData->d;
+        auto tmp = boundaryTmp.Get<float>();
+        for (uint64_t row = 0; row < rows; ++row) {
+            const uint64_t token = rowStart + row;
+            auto result = cast[row * RoundUp<float>(width)];
+            if (rowMaskGm.GetValue(token)) {
+                for (uint64_t source = 0; source < 4; ++source) {
+                    auto input = xQue.template AllocTensor<T>();
+                    CopyIn(xGm[token * tilingData->k + source * tilingData->d + channel], input, 1, width);
+                    xQue.EnQue(input);
+                    input = xQue.template DeQue<T>();
+                    CastTwoDim(tmp, input, 1, width);
+                    xQue.FreeTensor(input);
+                    Muls(tmp, tmp, previousCombGm.GetValue(token * 16 + source * 4 + stream), width);
+                    PipeBarrier<PIPE_V>();
+                    if (source == 0) {
+                        Adds(result, tmp, 0.0f, width);
+                    } else {
+                        Add(result, result, tmp, width);
+                    }
+                    PipeBarrier<PIPE_V>();
+                }
+                // ReduceSum's positive-zero seed is retained before adding the sublayer.
+                Adds(result, result, 0.0f, width);
+                PipeBarrier<PIPE_V>();
+                if (inputMaskGm.GetValue(token)) {
+                    auto input = xQue.template AllocTensor<T>();
+                    CopyIn(sublayerGm[token * tilingData->d + channel], input, 1, width);
+                    xQue.EnQue(input);
+                    input = xQue.template DeQue<T>();
+                    CastTwoDim(tmp, input, 1, width);
+                    xQue.FreeTensor(input);
+                } else {
+                    Duplicate(tmp, 0.0f, width);
+                    PipeBarrier<PIPE_V>();
+                }
+                Muls(tmp, tmp, previousPostGm.GetValue(token * 4 + stream), width);
+                PipeBarrier<PIPE_V>();
+                Add(result, tmp, result, width);
+            } else {
+                Duplicate(result, 0.0f, width);
+            }
+            PipeBarrier<PIPE_V>();
+            auto rounded = boundaryOut.template AllocTensor<T>();
+            CastTwoDim(rounded, result, 1, width);
+            // The projection must read the same BF16 residual that its later consumer receives.
+            CastTwoDim(result, rounded, 1, width);
+            boundaryOut.EnQue(rounded);
+            rounded = boundaryOut.template DeQue<T>();
+            CopyOut(rounded, residualGm[token * tilingData->k + kStart], 1, width);
+            boundaryOut.FreeTensor(rounded);
+        }
     }
 
     __aicore__ inline void Process()
@@ -142,15 +215,21 @@ public:
                     int64_t curUbMfactorTail = mVectorLength - ((curUbLoops - 1) * tilingData->stage1MFactor);
                     for (int64_t i = 0; i < curUbLoops; ++i) {
                         int64_t curUbMFactor = (i != (curUbLoops - 1)) ? tilingData->stage1MFactor : curUbMfactorTail;
-                        xLocal = xQue.template AllocTensor<T>();
-                        int64_t curGlobalxOffset = (mVectorOffset + i * tilingData->stage1MFactor) *
-                        tilingData->k + kGmBaseOffset;
-                        CopyIn(xGm[curGlobalxOffset], xLocal, curUbMFactor, realKGmSize, tilingData->k - realKGmSize);
-                        xQue.template EnQue(xLocal);
-                        xLocal = xQue.template DeQue<T>();
                         xCastLocal = mmInQue.AllocTensor<float>();
-                        CastTwoDim(xCastLocal, xLocal, curUbMFactor, realKGmSize);
-                        xQue.template FreeTensor(xLocal);
+                        if constexpr (boundary) {
+                            PrepareBoundary(xCastLocal, mVectorOffset + i * tilingData->stage1MFactor,
+                                curUbMFactor, kGmBaseOffset, realKGmSize);
+                        } else {
+                            xLocal = xQue.template AllocTensor<T>();
+                            int64_t curGlobalxOffset = (mVectorOffset + i * tilingData->stage1MFactor) *
+                                tilingData->k + kGmBaseOffset;
+                            CopyIn(xGm[curGlobalxOffset], xLocal, curUbMFactor, realKGmSize,
+                                tilingData->k - realKGmSize);
+                            xQue.template EnQue(xLocal);
+                            xLocal = xQue.template DeQue<T>();
+                            CastTwoDim(xCastLocal, xLocal, curUbMFactor, realKGmSize);
+                            xQue.template FreeTensor(xLocal);
+                        }
                         mmInQue.template EnQue(xCastLocal);
                         xCastLocal = mmInQue.template DeQue<float>();
                         int64_t cutMmInOffset = cvLoopIdx_ % DOUBLE_BUFFER * xCastFp32BufSize_ +
@@ -177,6 +256,14 @@ public:
 private:
     TPipe *pipe;
     const HcPreTilingData *tilingData;
+    GlobalTensor<T> sublayerGm;
+    GlobalTensor<T> residualGm;
+    GlobalTensor<float> previousPostGm;
+    GlobalTensor<float> previousCombGm;
+    GlobalTensor<bool> rowMaskGm;
+    GlobalTensor<bool> inputMaskGm;
+    TBuf<QuePosition::VECCALC> boundaryTmp;
+    TQue<QuePosition::VECOUT, 1> boundaryOut;
     GlobalTensor<float> workspaceGm;
     GlobalTensor<float> xCastFp32WsGm;
     GlobalTensor<float> mmOutFp32WsGm;
@@ -205,7 +292,7 @@ private:
     uint64_t squareSumFp32BufSize_;
 };
 
-template <typename T, bool delayedPre = false>
+template <typename T, bool delayedPre = false, bool squareOutput = false>
 class HcPreMembaseKSplitCorePart2 {
 public:
     __aicore__ inline HcPreMembaseKSplitCorePart2()
@@ -299,7 +386,7 @@ public:
         GM_ADDR y, GM_ADDR post, GM_ADDR combFrag, GM_ADDR workspace,
         const HcPreTilingData *tilingDataPtr, TPipe *pipePtr,
         GM_ADDR previousPre = nullptr, GM_ADDR nextPre = nullptr,
-        GM_ADDR projection = nullptr, GM_ADDR rstd = nullptr)
+        GM_ADDR projection = nullptr, GM_ADDR rstd = nullptr, GM_ADDR squares = nullptr)
     {
         pipe = pipePtr;
         tilingData = tilingDataPtr;
@@ -312,6 +399,11 @@ public:
                 tilingData->stage2RowFactor * tilingData->hcMultAlign * sizeof(float));
             pipe->InitBuffer(diagnosticQue, 1,
                 tilingData->stage2RowFactor * tilingData->hcMult * tilingData->hcMultAlign * sizeof(float));
+        }
+        if constexpr (squareOutput) {
+            squaresGm.SetGlobalBuffer((__gm__ float *)squares);
+            pipe->InitBuffer(squaresQue, 1, tilingData->stage2RowFactor *
+                RoundUp<T>(tilingData->dFactor) * sizeof(float));
         }
         InitGlobalBuffers(x, hcScale, hcBase, y, post, combFrag, workspace);
         int64_t stage1UsedCoreNum = tilingData->cubeBlockDimK;
@@ -455,6 +547,17 @@ int64_t curBsIdxForAll = (stage2BlockIdx * tilingData->rowLoopOfFormerBlock +
                         rowOuterIdx * tilingData->stage2RowFactor * tilingData->d +
                         dLoopIdx * tilingData->dFactor],
                         curRowFactor, curDFactor, tilingData->d - curDFactor);
+                    if constexpr (squareOutput) {
+                        auto squared = squaresQue.AllocTensor<float>();
+                        CastTwoDim(squared, yLocal, curRowFactor, curDFactor);
+                        Mul(squared, squared, squared, curRowFactor * RoundUp<float>(curDFactor));
+                        squaresQue.EnQue(squared);
+                        squared = squaresQue.DeQue<float>();
+                        CopyOut(squared, squaresGm[outputRow * tilingData->d +
+                            dLoopIdx * tilingData->dFactor], curRowFactor, curDFactor,
+                            tilingData->d - curDFactor);
+                        squaresQue.FreeTensor(squared);
+                    }
                     yQue.template FreeTensor(yLocal);
                 }
                 if constexpr (delayedPre) {
@@ -614,6 +717,8 @@ private:
 
     TPipe *pipe;
     const HcPreTilingData *tilingData;
+    GlobalTensor<float> squaresGm;
+    TQue<QuePosition::VECOUT, 1> squaresQue;
     GlobalTensor<float> previousPreGm;
     GlobalTensor<float> nextPreGm;
     GlobalTensor<float> projectionGm;

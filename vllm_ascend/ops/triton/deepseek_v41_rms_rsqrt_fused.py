@@ -54,8 +54,9 @@ if HAS_TRITON and not envs.VLLM_BATCH_INVARIANT:
         )
         return squares
 
-    def rms_rsqrt_fused(hidden_states, weight, eps):
-        squares = square_fp32(hidden_states)
+    def rms_rsqrt_fused(hidden_states, weight, eps, squares=None):
+        if squares is None:
+            squares = square_fp32(hidden_states)
         # Preserve the original FP32 reduction shape and native reduction order.
         means = squares.mean(-1, keepdim=True)
         output = torch.empty_like(hidden_states)

@@ -618,8 +618,12 @@ class DeepseekV41RMSNorm(nn.Module):
         self.eps = eps
         self._fused_witness_pending = False
 
-    def forward(self, x):
-        fused = try_rms_rsqrt_fused(x, self.weight, self.eps)
+    def forward(self, x, squares=None):
+        fused = (
+            try_rms_rsqrt_fused(x, self.weight, self.eps)
+            if squares is None
+            else try_rms_rsqrt_fused(x, self.weight, self.eps, squares)
+        )
         if fused is not None:
             if self._fused_witness_pending:
                 logger.info("RMS_RSQRT_FUSED_RUNTIME pid=%s rows=%s", os.getpid(), x.shape[0])

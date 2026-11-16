@@ -20,13 +20,7 @@ _MIN_FP32_POSITIVE = 2.0**-149
 _MAX_FP32_FINITE = (2.0 - 2.0**-23) * 2.0**127
 
 
-def hc_pre_delayed(x, fn, scale, base, previous_pre, norm_eps, hc_eps, sinkhorn_iters):
-    """Return y/next_pre/post/comb on the qualified native path, otherwise None.
-
-    y uses the previous sublayer's FP32 gate and rounds to BF16 before the
-    caller invokes its existing RMSNorm module. The native call always also
-    materializes FP32 projection/rstd diagnostics; their cost is intentional.
-    """
+def _supports_delayed(x, fn, scale, base, previous_pre, norm_eps, hc_eps, sinkhorn_iters):
     if (
         x.device.type != "npu"
         or not torch.is_inference_mode_enabled()
@@ -50,15 +44,57 @@ def hc_pre_delayed(x, fn, scale, base, previous_pre, norm_eps, hc_eps, sinkhorn_
         or not math.isfinite(norm_eps)
         or not _MIN_FP32_POSITIVE <= norm_eps <= _MAX_FP32_FINITE
         or get_ascend_device_type() != AscendDeviceType.A3
-        or not hasattr(torch.ops._C_ascend, "npu_hc_pre_delayed")
     ):
-        return None
+        return False
     # Only NPU workers reaching the qualified path need torch-npu metadata.
     from torch_npu import get_npu_format
 
-    if any(get_npu_format(t) != _ND_FORMAT for t in (x, fn, scale, base, previous_pre)):
+    return all(get_npu_format(t) == _ND_FORMAT for t in (x, fn, scale, base, previous_pre))
+
+
+def hc_pre_delayed(x, fn, scale, base, previous_pre, norm_eps, hc_eps, sinkhorn_iters):
+    """Return the qualified native delayed gate path, otherwise None."""
+    if not hasattr(torch.ops._C_ascend, "npu_hc_pre_delayed") or not _supports_delayed(
+        x, fn, scale, base, previous_pre, norm_eps, hc_eps, sinkhorn_iters
+    ):
         return None
     y, next_pre, post, comb, _projection, _rstd = torch.ops._C_ascend.npu_hc_pre_delayed(
         x, fn, scale, base, previous_pre, norm_eps
     )
     return y, next_pre, post, comb
+
+
+def hc_post_pre_delayed(
+    x, fn, scale, base, previous_pre, sublayer, post, comb, row_mask, input_mask, norm_eps, hc_eps, sinkhorn_iters
+):
+    """Fuse the materialized attention residual and immediate FFN producer."""
+    if (
+        not hasattr(torch.ops._C_ascend, "npu_hc_post_pre_delayed")
+        or row_mask is None
+        or not _supports_delayed(x, fn, scale, base, previous_pre, norm_eps, hc_eps, sinkhorn_iters)
+        or sublayer.shape != (x.shape[0], _HIDDEN_SIZE)
+        or sublayer.dtype != torch.bfloat16
+        or post.shape != previous_pre.shape
+        or comb.shape != (x.shape[0], _HC_WIDTH, _HC_WIDTH)
+        or post.dtype != torch.float32
+        or comb.dtype != torch.float32
+    ):
+        return None
+    # A masked residual row is zero regardless of its sublayer input.
+    if input_mask is None:
+        input_mask = row_mask
+    if any(mask.shape != x.shape[:1] or mask.dtype != torch.bool for mask in (row_mask, input_mask)):
+        return None
+    from torch_npu import get_npu_format
+
+    if any(
+        t.device != x.device or not t.is_contiguous() or t.is_neg() or t.is_conj() or get_npu_format(t) != _ND_FORMAT
+        for t in (sublayer, post, comb, row_mask, input_mask)
+    ):
+        return None
+    residual, y, next_pre, next_post, next_comb, _projection, _rstd, squares = (
+        torch.ops._C_ascend.npu_hc_post_pre_delayed(
+            x, fn, scale, base, previous_pre, sublayer, post, comb, row_mask, input_mask, norm_eps
+        )
+    )
+    return residual, y, next_pre, next_post, next_comb, squares

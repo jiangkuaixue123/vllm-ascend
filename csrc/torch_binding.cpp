@@ -1410,6 +1410,45 @@ HcPreDelayedOutputs npu_hc_pre_delayed_npu(
     return outputs;
 }
 
+using HcBoundaryOutputs = std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor,
+    at::Tensor, at::Tensor, at::Tensor, at::Tensor>;
+HcBoundaryOutputs npu_hc_post_pre_delayed_npu(
+    const at::Tensor& x, const at::Tensor& fn, const at::Tensor& scale,
+    const at::Tensor& base, const at::Tensor& previous_pre, const at::Tensor& sublayer,
+    const at::Tensor& previous_post, const at::Tensor& previous_comb,
+    const at::Tensor& row_mask, const at::Tensor& input_mask, double norm_eps)
+{
+    check_hc_pre_delayed(x, fn, scale, base, previous_pre, norm_eps);
+    TORCH_CHECK(sublayer.sizes() == at::IntArrayRef({x.size(0), HC_DELAYED_HIDDEN}) &&
+        sublayer.scalar_type() == at::kBFloat16, "HC boundary sublayer must be BF16[T,5120].");
+    TORCH_CHECK(previous_post.sizes() == previous_pre.sizes() && previous_post.scalar_type() == at::kFloat,
+        "HC boundary previous_post must be FP32[T,4].");
+    TORCH_CHECK(previous_comb.sizes() == at::IntArrayRef({x.size(0), HC_DELAYED_WIDTH, HC_DELAYED_WIDTH}) &&
+        previous_comb.scalar_type() == at::kFloat, "HC boundary previous_comb must be FP32[T,4,4].");
+    for (const at::Tensor *mask : {&row_mask, &input_mask}) {
+        TORCH_CHECK(mask->dim() == 1 && mask->size(0) == x.size(0) && mask->scalar_type() == at::kBool,
+            "HC boundary masks must be bool[T].");
+    }
+    for (const at::Tensor *input : {&x, &fn, &scale, &base, &previous_pre, &sublayer,
+            &previous_post, &previous_comb, &row_mask, &input_mask}) {
+        TORCH_CHECK(input->device() == x.device() && input->is_contiguous() &&
+            !input->is_neg() && !input->is_conj(), "HC boundary inputs must share contiguous storage.");
+        TORCH_CHECK(NPUBridge::GetNpuStorageImplDesc(*input).npu_format_ == ACL_FORMAT_ND,
+            "HC boundary requires ND storage format.");
+    }
+    auto residual = at::empty_like(x);
+    auto outputs = make_hc_pre_delayed_outputs(x);
+    auto squares = at::empty_like(std::get<0>(outputs), x.options().dtype(at::kFloat));
+    constexpr int64_t iterations = 20;
+    constexpr double epsilon = 1e-6;
+    EXEC_NPU_CMD(aclnnHcPostPreDelayed, x, fn, scale, base, previous_pre, sublayer,
+        previous_post, previous_comb, row_mask, input_mask,
+        HC_DELAYED_WIDTH, iterations, epsilon, norm_eps, residual,
+        std::get<0>(outputs), std::get<1>(outputs), std::get<2>(outputs),
+        std::get<3>(outputs), std::get<4>(outputs), std::get<5>(outputs), squares);
+    return std::tuple_cat(std::make_tuple(residual), outputs, std::make_tuple(squares));
+}
+
 void inplace_partial_rotary_mul_npu(at::Tensor & x, const at::Tensor &r1, const at::Tensor &r2, c10::string_view rotary_mode, at::IntArrayRef partial_slice)
 {
     constexpr int BSND_DIM_NUM = 4;
@@ -2557,6 +2596,13 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "Tensor previous_pre, float norm_eps) -> "
         "(Tensor y, Tensor next_pre, Tensor post, Tensor comb, Tensor projection, Tensor rstd)");
     ops.impl("npu_hc_pre_delayed", torch::kPrivateUse1, &vllm_ascend::npu_hc_pre_delayed_npu);
+    ops.def("npu_hc_post_pre_delayed(Tensor x, Tensor fn, Tensor scale, Tensor base, "
+        "Tensor previous_pre, Tensor sublayer, Tensor previous_post, Tensor previous_comb, "
+        "Tensor row_mask, Tensor input_mask, float norm_eps) -> "
+        "(Tensor residual, Tensor y, Tensor next_pre, Tensor post, Tensor comb, "
+        "Tensor projection, Tensor rstd, Tensor squares)");
+    ops.impl("npu_hc_post_pre_delayed", torch::kPrivateUse1, &vllm_ascend::npu_hc_post_pre_delayed_npu);
+
 
     ops.def(
         "inplace_partial_rotary_mul("

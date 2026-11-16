@@ -13,7 +13,7 @@ _TEXT_EPS = 1e-20
 _ND_FORMAT = 2
 
 
-def try_rms_rsqrt_fused(hidden_states, weight, eps):
+def try_rms_rsqrt_fused(hidden_states, weight, eps, squares=None):
     """Return the fused result, or None when the reference path is required."""
     if (
         hidden_states.device.type != "npu"
@@ -36,8 +36,20 @@ def try_rms_rsqrt_fused(hidden_states, weight, eps):
 
     if any(get_npu_format(tensor) != _ND_FORMAT for tensor in (hidden_states, weight)):
         return None
+    if squares is not None and (
+        squares.shape != hidden_states.shape
+        or squares.dtype != torch.float32
+        or squares.device != hidden_states.device
+        or not squares.is_contiguous()
+        or squares.is_neg()
+        or squares.is_conj()
+        or get_npu_format(squares) != _ND_FORMAT
+    ):
+        return None
     from vllm_ascend.ops.triton.deepseek_v41_rms_rsqrt_fused import rms_rsqrt_fused
 
     if rms_rsqrt_fused is None:
         return None
-    return rms_rsqrt_fused(hidden_states, weight, eps)
+    if squares is None:
+        return rms_rsqrt_fused(hidden_states, weight, eps)
+    return rms_rsqrt_fused(hidden_states, weight, eps, squares)

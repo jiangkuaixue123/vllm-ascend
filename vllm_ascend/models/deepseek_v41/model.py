@@ -38,7 +38,7 @@ from vllm.model_executor.models.interfaces import SupportsMultiModal
 from vllm.model_executor.models.utils import _merge_multimodal_embeddings
 
 from vllm_ascend.models.common.ops.hc_post import hc_post_fused
-from vllm_ascend.models.common.ops.hc_pre import hc_pre_delayed
+from vllm_ascend.models.common.ops.hc_pre import hc_post_pre_delayed, hc_pre_delayed
 from vllm_ascend.models.common.ops.hc_prefill import hc_prefill_post, hc_prefill_prepare
 from vllm_ascend.models.common.ops.sequence_parallel import sp_all_gather, sp_shard
 from vllm_ascend.models.deepseek_v41.attention import (
@@ -228,9 +228,31 @@ class DeepseekV41Block(nn.Module):
             return hidden_states, pre_mix
         attn_input, attn_pre, post, comb = self.pre_and_mixes(hidden_states, pre_mix, "attn", runtime)
         attended = self.attn(self.attn_norm(attn_input), runtime)
-        hidden_states = self.post_residual(attended, hidden_states, post, comb, runtime)
-        ffn_input, ffn_pre, post, comb = self.pre_and_mixes(hidden_states, attn_pre, "ffn", runtime)
-        ffn_input = self.ffn_norm(ffn_input)
+        boundary = None
+        if getattr(runtime, "decode", None) is not None:
+            boundary = hc_post_pre_delayed(
+                hidden_states,
+                self.hc_ffn_fn,
+                self.hc_ffn_scale,
+                self.hc_ffn_base,
+                attn_pre,
+                attended,
+                post,
+                comb,
+                getattr(runtime, "block_row_mask", None),
+                getattr(runtime, "attention_output_mask", None),
+                self.config.rms_norm_eps,
+                self.config.hc_eps,
+                self.config.hc_sinkhorn_iters,
+            )
+        if boundary is None:
+            hidden_states = self.post_residual(attended, hidden_states, post, comb, runtime)
+            ffn_input, ffn_pre, post, comb = self.pre_and_mixes(hidden_states, attn_pre, "ffn", runtime)
+            ffn_input = self.ffn_norm(ffn_input)
+        else:
+            runtime.attention_output_mask = None
+            hidden_states, ffn_input, ffn_pre, post, comb, squares = boundary
+            ffn_input = self.ffn_norm(ffn_input, squares)
         if getattr(runtime, "decode", None) is not None:
             active = runtime.decode.active if decode_mask is None else decode_mask
             output = (

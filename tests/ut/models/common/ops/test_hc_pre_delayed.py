@@ -233,6 +233,7 @@ def block_methods(env):
     env.setdefault("hc_post_fused", lambda *args, **kwargs: None)
     env.setdefault("hc_prefill_prepare", lambda *args: None)
     env.setdefault("hc_prefill_post", lambda *args: None)
+    env.setdefault("hc_post_pre_delayed", lambda *args: None)
     path = ROOT / "vllm_ascend/models/deepseek_v41/model.py"
     tree = ast.parse(path.read_text())
     block = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "DeepseekV41Block")
@@ -247,7 +248,8 @@ def block_methods(env):
 
 
 @pytest.mark.parametrize("native_available", [False, True])
-def test_two_blocks_preserve_previous_pre_timing_and_norm_module_calls(native_available):
+@pytest.mark.parametrize("boundary_available", [False, True])
+def test_two_blocks_preserve_previous_pre_timing_and_norm_module_calls(native_available, boundary_available):
     events = []
     pre_inputs = []
     next_gates = []
@@ -273,7 +275,18 @@ def test_two_blocks_preserve_previous_pre_timing_and_norm_module_calls(native_av
         outputs.append(out)
         return out
 
-    cls = block_methods({"hc_pre_delayed": native, "hc_pre": reference_pre, "hc_post": post})
+    squares = object()
+
+    def boundary(x, fn, scale, base, previous, sublayer, gate, comb, *args):
+        if not boundary_available:
+            return None
+        pre_inputs.append(previous)
+        y, next_gate, next_post, next_comb = make_next(x, fn)
+        return post(sublayer, x, gate, comb), y, next_gate, next_post, next_comb, squares
+
+    cls = block_methods(
+        {"hc_pre_delayed": native, "hc_pre": reference_pre, "hc_post": post, "hc_post_pre_delayed": boundary}
+    )
     blocks = [cls(), cls()]
     for i, block in enumerate(blocks):
         block.config = SimpleNamespace(rms_norm_eps=1e-20, hc_eps=1e-6, hc_sinkhorn_iters=20)
@@ -282,13 +295,14 @@ def test_two_blocks_preserve_previous_pre_timing_and_norm_module_calls(native_av
             setattr(block, f"hc_{name}_scale", object())
             setattr(block, f"hc_{name}_base", object())
 
-        def norm(x, *, label):
+        def norm(x, *moments, label):
+            assert not moments or moments == (squares,)
             assert x.dtype == "bf16"
             events.append(label)
             return x
 
         block.attn_norm = lambda x, label=f"{i}.attn_norm": norm(x, label=label)
-        block.ffn_norm = lambda x, label=f"{i}.ffn_norm": norm(x, label=label)
+        block.ffn_norm = lambda x, *moments, label=f"{i}.ffn_norm": norm(x, *moments, label=label)
         block.attn = lambda x, runtime: x
         block.ffn = SimpleNamespace(forward_decode=lambda x, active: x)
         block.mixes = lambda x, name, b=block: make_next(x, getattr(b, f"hc_{name}_fn"))[1:]
