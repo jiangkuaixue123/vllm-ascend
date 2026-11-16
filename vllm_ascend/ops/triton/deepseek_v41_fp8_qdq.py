@@ -63,6 +63,28 @@ def pack_prefill_projection_input(x: torch.Tensor, tp: int):
     return out
 
 
+def pack_decode_rotary_projection_input(x, tp, cosine, sine):
+    if (
+        not _supports_projection_input(x, tp)
+        or x.shape[0] not in (3, 6, 12)
+        or not hasattr(torch.ops._C_ascend, "deepseek_v41_fp8_rotary_pack")
+        or any(
+            t.shape != (x.shape[0], 1, 1, 64)
+            or t.dtype != torch.float32
+            or t.device != x.device
+            or not t.is_contiguous()
+            or t.is_neg()
+            or t.is_conj()
+            or t.storage_offset() % 8
+            for t in (cosine, sine)
+        )
+    ):
+        return None
+    out = x.new_empty((tp * x.shape[0], 64 // tp, 512))
+    torch.ops._C_ascend.deepseek_v41_fp8_rotary_pack(x, cosine, sine, out, tp)
+    return out
+
+
 def pack_rotated_prefill_output(x, positions, frequencies, out, start, tp):
     """Write one request span directly into its final prequantized TP send rows."""
     rows = x.shape[0]

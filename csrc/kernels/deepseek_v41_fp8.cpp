@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "kernel_operator.h"
+#include "../attention/inplace_partial_rotary_mul/op_kernel/rotate_interleaved_common.h"
 
 using namespace AscendC;
 
@@ -34,7 +35,24 @@ public:
         pipe_.InitBuffer(mask_, ELEMENTS / 8);
     }
 
-    template<bool PACK>
+    __aicore__ inline void InitRotary(GM_ADDR cosine, GM_ADDR sine) {
+        cosine_.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(cosine));
+        sine_.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(sine));
+        pipe_.InitBuffer(phase_, 1, 128 * sizeof(float));
+        pipe_.InitBuffer(ropeOffsets_, 512 * sizeof(uint32_t));
+        auto indices = ropeOffsets_.Get<int32_t>();
+        for (uint32_t i = 0; i < 8; ++i) indices.SetValue(i, i ^ 1);
+        SetFlag<HardEvent::S_V>(EVENT_ID0);
+        WaitFlag<HardEvent::S_V>(EVENT_ID0);
+        for (uint32_t span = 8; span < 512; span *= 2) {
+            Adds(indices[span], indices, static_cast<int32_t>(span), span);
+            PipeBarrier<PIPE_V>();
+        }
+        Muls(indices, indices, int32_t(sizeof(float)), 512);
+        PipeBarrier<PIPE_V>();
+    }
+
+    template<bool PACK, bool ROTARY = false>
     __aicore__ inline void Process() {
         const uint32_t tiles = (n_ - 1) / tileElements_ + 1;
         if (GetBlockIdx() >= tiles) return;
@@ -54,6 +72,7 @@ public:
                                + head % headsPerRank) * 512;
             }
             auto result = output_.AllocTensor<bfloat16_t>();
+            if constexpr (ROTARY) RotateTail(input, tile / 8);
             Quantize(input, result, count);
             output_.EnQue(result);
             in_.FreeTensor(input);
@@ -64,6 +83,39 @@ public:
     }
 
 private:
+    __aicore__ inline void RotateTail(LocalTensor<bfloat16_t> input, uint32_t row) {
+        auto phase = phase_.AllocTensor<float>();
+        DataCopy(phase, cosine_[row * 64], 64);
+        DataCopy(phase[64], sine_[row * 64], 64);
+        phase_.EnQue(phase);
+        phase = phase_.DeQue<float>();
+        auto dense = words_.Get<uint16_t>();
+        auto value = value_.Get<float>();
+        auto rotated = work_.Get<float>();
+        // Eight heads share the same 64 FP32 phases; only their BF16 tail is gathered.
+        Copy(dense, input[448].ReinterpretCast<uint16_t>(), uint64_t(64), uint8_t(8), {1, 1, 4, 32});
+        PipeBarrier<PIPE_V>();
+        Cast(value, dense.ReinterpretCast<bfloat16_t>(), RoundMode::CAST_NONE, 512);
+        PipeBarrier<PIPE_V>();
+        const BinaryRepeatParams broadcast{1, 1, 1, 8, 8, 0};
+        Mul(rotated, value, phase, uint64_t(64), uint8_t(8), broadcast);
+        PipeBarrier<PIPE_V>();
+        Gather(value, value, ropeOffsets_.Get<uint32_t>(), 0, 512);
+        PipeBarrier<PIPE_V>();
+        Mul(value, value, phase[64], uint64_t(64), uint8_t(8), broadcast);
+        PipeBarrier<PIPE_V>();
+        // Inverse interleave changes the odd partner sign, after the FP32 product.
+        RotateInterleavedN::InterleavedInversion(value, 512, true);
+        PipeBarrier<PIPE_V>();
+        Add(rotated, rotated, value, 512);
+        PipeBarrier<PIPE_V>();
+        Cast(dense.ReinterpretCast<bfloat16_t>(), rotated, RoundMode::CAST_RINT, 512);
+        PipeBarrier<PIPE_V>();
+        Copy(input[448].ReinterpretCast<uint16_t>(), dense, uint64_t(64), uint8_t(8), {1, 1, 32, 4});
+        PipeBarrier<PIPE_V>();
+        phase_.FreeTensor(phase);
+    }
+
     template<bool PACK>
     __aicore__ inline void CopyIn(uint32_t tile) {
         const uint32_t source = tile * tileElements_;
@@ -274,6 +326,9 @@ private:
     TPipe pipe_;
     TQue<TPosition::VECIN, 1> in_;
     TQue<TPosition::VECOUT, 1> output_;
+    TQue<TPosition::VECIN, 1> phase_;
+    TBuf<TPosition::VECCALC> ropeOffsets_;
+    GlobalTensor<float> cosine_, sine_;
     TBuf<TPosition::VECCALC> value_, scale_, bias_, work_, words_, spare_;
     TBuf<TPosition::VECCALC> maxWord_, coeff_, compact_, compact2_, broadcast_, mask_;
     GlobalTensor<bfloat16_t> x_, tail_, out_;
@@ -311,4 +366,20 @@ void deepseek_v41_fp8_pack_launch(void* stream, void* x, void* tail, void* out,
     const uint32_t blocks = tiles < VECTOR_BLOCKS ? tiles : VECTOR_BLOCKS;
     deepseek_v41_fp8_pack_kernel<<<blocks, nullptr, stream>>>(static_cast<uint8_t*>(x), static_cast<uint8_t*>(tail),
         static_cast<uint8_t*>(out), n, totalRows, start, tp);
+}
+
+extern "C" __global__ __aicore__ void deepseek_v41_fp8_rotary_pack_kernel(
+    GM_ADDR x, GM_ADDR cosine, GM_ADDR sine, GM_ADDR out, uint32_t n, uint32_t rows, uint32_t tp) {
+    Qdq op;
+    op.Init(x, nullptr, out, n, rows, 0, tp, ELEMENTS);
+    op.InitRotary(cosine, sine);
+    op.Process<true, true>();
+}
+
+void deepseek_v41_fp8_rotary_pack_launch(void* stream, void* x, void* cosine, void* sine, void* out,
+                                        uint32_t n, uint32_t rows, uint32_t tp) {
+    const uint32_t tiles = (n - 1) / ELEMENTS + 1;
+    const uint32_t blocks = tiles < VECTOR_BLOCKS ? tiles : VECTOR_BLOCKS;
+    deepseek_v41_fp8_rotary_pack_kernel<<<blocks, nullptr, stream>>>(static_cast<uint8_t*>(x),
+        static_cast<uint8_t*>(cosine), static_cast<uint8_t*>(sine), static_cast<uint8_t*>(out), n, rows, tp);
 }

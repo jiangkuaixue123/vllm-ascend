@@ -65,6 +65,7 @@ from .native_attention import DeepseekV41NativeAttention, PrefillAttentionInputs
 
 if HAS_TRITON and not envs.VLLM_BATCH_INVARIANT:
     from vllm_ascend.ops.triton.deepseek_v41_fp8_qdq import (
+        pack_decode_rotary_projection_input,
         pack_prefill_projection_input,
         pack_rotated_prefill_output,
         supports_prefill_projection_input,
@@ -74,6 +75,7 @@ if HAS_TRITON and not envs.VLLM_BATCH_INVARIANT:
     from vllm_ascend.ops.triton.deepseek_v41_selected_kv import try_prepare_selected_kv
     from vllm_ascend.ops.triton.deepseek_v41_slot_arena import stage as stage_decode_arena
 else:
+    pack_decode_rotary_projection_input = None
     pack_prefill_projection_input = None
     supports_prefill_projection_input = None
     paged_index_scores = None
@@ -975,6 +977,14 @@ class DeepseekV41Attention(nn.Module):
             prefix=f"{prefix}.wkv",
         )
         self.kv_norm = DeepseekV41RMSNorm(self.dim, config.rms_norm_eps)
+        self._paired_rotary_enabled = (
+            self.dsa_cp
+            and tp in (4, 8)
+            and self.heads == 64
+            and self.dim == 512
+            and self.rope_dim == 64
+            and pack_decode_rotary_projection_input is not None
+        )
         self._query_overlap_stream = None
         if (
             self.dsa_cp
@@ -1022,8 +1032,18 @@ class DeepseekV41Attention(nn.Module):
             selected_width = min(config.sliding_window, capacity) + compressed
             self.cache.native_layout = (self.attention_kernel, self.heads, tp if self.dsa_cp else 1, selected_width)
 
-    def rotate(self, x, positions, inverse=False):
+    def _decode_rotary_factors(self, positions):
         phases = positions.float().unsqueeze(-1) * self.frequencies
+        phases = torch.stack((phases, phases), dim=-1).view(positions.shape[0], 1, 1, self.rope_dim)
+        return phases.cos(), phases.sin()
+
+    def rotate(self, x, positions, inverse=False, factors=None):
+        phases = positions.float().unsqueeze(-1) * self.frequencies if factors is None else None
+        native_phases = (
+            phases.shape == (x.shape[1], self.rope_dim // 2) and phases.dtype == torch.float32
+            if factors is None
+            else factors[0].shape == (x.shape[1], 1, 1, self.rope_dim)
+        )
         if (
             x.device.type == "npu"
             and x.dtype == torch.bfloat16
@@ -1032,8 +1052,7 @@ class DeepseekV41Attention(nn.Module):
             and x.numel() > 0
             and x.shape[-1] in _PARTIAL_ROPE_HEAD_DIMS
             and self.rope_dim == _PARTIAL_ROPE_DIM
-            and phases.shape == (x.shape[1], self.rope_dim // 2)
-            and phases.dtype == torch.float32
+            and native_phases
             and x.is_contiguous()
             and torch.is_inference_mode_enabled()
             and enable_custom_op()
@@ -1041,18 +1060,25 @@ class DeepseekV41Attention(nn.Module):
         ):
             # The interleaved kernel consumes one FP32 sine/cosine per channel.
             # Adjacent channels in a rotary pair use the same phase.
-            phases = torch.stack((phases, phases), dim=-1).view(x.shape[1], 1, 1, self.rope_dim)
-            sine = phases.sin()
+            if factors is None:
+                phases = torch.stack((phases, phases), dim=-1).view(x.shape[1], 1, 1, self.rope_dim)
+                cosine, sine = phases.cos(), phases.sin()
+            else:
+                cosine, sine = factors
             torch.ops._C_ascend.inplace_partial_rotary_mul(
                 x.view(x.shape[1], 1, -1, x.shape[-1]),
-                phases.cos(),
+                cosine,
                 -sine if inverse else sine,
                 rotary_mode="interleave",
                 partial_slice=[x.shape[-1] - self.rope_dim, x.shape[-1]],
             )
             logger.info_once("V4.1 stock partial rotary head_dim=%d inverse=%s", x.shape[-1], inverse, scope="process")
             return x
-        apply_rotary_emb_real(x[..., -self.rope_dim :], phases.cos(), phases.sin(), inverse=inverse)
+        if factors is None:
+            cosine, sine = phases.cos(), phases.sin()
+        else:
+            cosine, sine = (value.view(x.shape[1], self.rope_dim)[:, ::2] for value in factors)
+        apply_rotary_emb_real(x[..., -self.rope_dim :], cosine, sine, inverse=inverse)
         return x
 
     def _compressed(self, x, positions, metadata, request_idx, request, shared):
@@ -1454,9 +1480,13 @@ class DeepseekV41Attention(nn.Module):
             stream.wait_event(inputs_ready)
             qr = self.q_norm(self.wq_a(states)[0])
             q = self.wq_b(qr)[0].view(states.shape[0], self.heads, self.dim)
-            self.rotate(q.unsqueeze(0), pos)
+            factors = self._decode_rotary_factors(pos) if getattr(self, "_paired_rotary_enabled", False) else None
+            if factors is None:
+                self.rotate(q.unsqueeze(0), pos)
+            else:
+                self.rotate(q.unsqueeze(0), pos, factors=factors)
             complete = stream.record_event()
-        return qr, q, complete, full_pos
+        return qr, q, complete, full_pos, factors
 
     def _decode_forward(self, local_states, runtime):
         full_md = self.cache.metadata().decode
@@ -1468,11 +1498,16 @@ class DeepseekV41Attention(nn.Module):
         x, md = (local_states, local_md) if self.dsa_cp else (gathered, full_md)
         full_pos = (full_md.seq_lens - 1).clamp_min(0) if pending_query is None else pending_query[3]
         pos = full_pos[offset : offset + x.shape[0]] if self.dsa_cp else full_pos
+        factors = None
         if pending_query is None:
             qr = self.q_norm(self.wq_a(x)[0])
             q = self.wq_b(qr)[0].view(x.shape[0], self.heads, self.dim)
             raw = self.kv_norm(self.wkv(gathered)[0])
-            self.rotate(q.unsqueeze(0), pos)
+            if getattr(self, "_paired_rotary_enabled", False) and getattr(full_md, "query_width", None) == 6:
+                factors = self._decode_rotary_factors(pos)
+                self.rotate(q.unsqueeze(0), pos, factors=factors)
+            else:
+                self.rotate(q.unsqueeze(0), pos)
         else:
             raw = self.kv_norm(self.wkv(gathered)[0])
         self.rotate(raw.unsqueeze(0), full_pos)
@@ -1484,11 +1519,14 @@ class DeepseekV41Attention(nn.Module):
                 runtime.source_decode = md
         if pending_query is not None:
             # Cache preparation does not consume Q. Join at its first consumer.
-            qr, q, complete, _ = pending_query
+            qr, q, complete, _, factors = pending_query
             main = torch.npu.current_stream(local_states.device)
             main.wait_event(complete)
             qr.record_stream(main)
             q.record_stream(main)
+            if factors is not None:
+                for value in factors:
+                    value.record_stream(main)
             logger.info_once(
                 "TARGET_QUERY_OVERLAP_V2_RUNTIME pid=%d rows=%d layer=%d",
                 os.getpid(),
@@ -1529,8 +1567,15 @@ class DeepseekV41Attention(nn.Module):
                 f"ratio={self.ratio} refresh={int(refresh)}",
                 scope="process",
             )
-        self.rotate(attended.unsqueeze(0), pos, inverse=True)
-        output = self._project_output(attended, x.dtype)
+        packed = pack_decode_rotary_projection_input(attended, self.tp, *factors) if factors is not None else None
+        if packed is not None:
+            output = self._project_output(packed, x.dtype, prequantized=True)
+        else:
+            if factors is None:
+                self.rotate(attended.unsqueeze(0), pos, inverse=True)
+            else:
+                self.rotate(attended.unsqueeze(0), pos, inverse=True, factors=factors)
+            output = self._project_output(attended, x.dtype)
         if getattr(runtime, "block_row_mask", None) is not None:
             # The target block's HC producer owns inactive rows through the next consumer.
             return output
