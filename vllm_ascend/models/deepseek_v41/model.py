@@ -39,7 +39,7 @@ from vllm.model_executor.models.utils import _merge_multimodal_embeddings
 
 from vllm_ascend.models.common.ops.hc_post import hc_post_fused
 from vllm_ascend.models.common.ops.hc_pre import hc_post_pre_delayed, hc_pre_delayed
-from vllm_ascend.models.common.ops.hc_prefill import hc_prefill_post, hc_prefill_prepare
+from vllm_ascend.models.common.ops.hc_prefill import hc_prefill_post, hc_prefill_post_prepare, hc_prefill_prepare
 from vllm_ascend.models.common.ops.sequence_parallel import sp_all_gather, sp_shard
 from vllm_ascend.models.deepseek_v41.attention import (
     DeepseekV41Attention,
@@ -245,6 +245,12 @@ class DeepseekV41Block(nn.Module):
                 self.config.hc_eps,
                 self.config.hc_sinkhorn_iters,
             )
+        else:
+            prepared = hc_prefill_post_prepare(attended, hidden_states, post, comb, attn_pre)
+            if prepared is not None:
+                residual, mixed, states, squares = prepared
+                ffn_pre, post, comb = self.mixes(states, "ffn")
+                boundary = residual, mixed, ffn_pre, post, comb, squares
         if boundary is None:
             hidden_states = self.post_residual(attended, hidden_states, post, comb, runtime)
             ffn_input, ffn_pre, post, comb = self.pre_and_mixes(hidden_states, attn_pre, "ffn", runtime)

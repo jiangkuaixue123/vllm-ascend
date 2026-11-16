@@ -134,49 +134,53 @@ private:
         PipeBarrier<PIPE_V>();
         Maxs(compact, compact, int16_t(113), groups);
         PipeBarrier<PIPE_V>();
-        // In the finite normal E4M3 domain, power-of-two scaling only
-        // changes the exponent; rounding BF16's low four bits is exact.
-        Adds(compact2, compact, int16_t(-14), groups);
-        PipeBarrier<PIPE_V>();
-        ShiftLeft(compact2.ReinterpretCast<uint16_t>(), compact2.ReinterpretCast<uint16_t>(), uint16_t(7), groups);
-        PipeBarrier<PIPE_V>();
-        Cast(coeff, compact2, RoundMode::CAST_NONE, groups);
-        PipeBarrier<PIPE_V>();
-        Broadcast32(scale, coeff, groups);
-        CompareScalar(predicate, work, 0.0f, CMPMODE::EQ, compareCount);
-        PipeBarrier<PIPE_V>();
-        Select(work, predicate, scale, work, SELMODE::VSEL_TENSOR_TENSOR_MODE, compareCount);
-        PipeBarrier<PIPE_V>();
-        Sub(value, work, scale, compareCount);
-        PipeBarrier<PIPE_V>();
-        Duplicate(bias, 32639.0f, compareCount);
-        PipeBarrier<PIPE_V>();
-        Sub(bias, bias, work, compareCount);
-        PipeBarrier<PIPE_V>();
-        Min(value, value, bias, compareCount);
-        PipeBarrier<PIPE_V>();
-        const uint32_t repeats = compareCount / 64;
-        WholeReduceMin(coeff, value, 64, repeats, 1, 1, 8, ReduceOrder::ORDER_ONLY_VALUE);
-        PipeBarrier<PIPE_V>();
-        WholeReduceMin(coeff, coeff, repeats, 1, 1, 1, 8, ReduceOrder::ORDER_ONLY_VALUE);
-        SetFlag<HardEvent::V_S>(EVENT_ID0);
-        WaitFlag<HardEvent::V_S>(EVENT_ID0);
-        if (coeff.GetValue(0) >= 0.0f) {
-            ShiftRight(word, raw, uint16_t(4), n);
+        // The tile-wide guard pays off only when many bulk tiles share each core.
+        if ((n_ - 1) / tileElements_ + 1 > VECTOR_BLOCKS) {
+            // In the finite normal E4M3 domain, power-of-two scaling only
+            // changes the exponent; rounding BF16's low four bits is exact.
+            Adds(compact2, compact, int16_t(-14), groups);
             PipeBarrier<PIPE_V>();
-            ShiftLeft(word, word, uint16_t(15), n);
+            ShiftLeft(compact2.ReinterpretCast<uint16_t>(), compact2.ReinterpretCast<uint16_t>(), uint16_t(7), groups);
             PipeBarrier<PIPE_V>();
-            ShiftRight(word, word, uint16_t(15), n);
+            Cast(coeff, compact2, RoundMode::CAST_NONE, groups);
             PipeBarrier<PIPE_V>();
-            Adds(word.ReinterpretCast<int16_t>(), word.ReinterpretCast<int16_t>(), int16_t(7), n);
+            Broadcast32(scale, coeff, groups);
+            CompareScalar(predicate, work, 0.0f, CMPMODE::EQ, compareCount);
             PipeBarrier<PIPE_V>();
-            Add(word.ReinterpretCast<int16_t>(), raw.ReinterpretCast<int16_t>(), word.ReinterpretCast<int16_t>(), n);
+            Select(work, predicate, scale, work, SELMODE::VSEL_TENSOR_TENSOR_MODE, compareCount);
             PipeBarrier<PIPE_V>();
-            ShiftRight(word, word, uint16_t(4), n);
+            Sub(value, work, scale, compareCount);
             PipeBarrier<PIPE_V>();
-            ShiftLeft(output.ReinterpretCast<uint16_t>(), word, uint16_t(4), n);
+            Duplicate(bias, 32639.0f, compareCount);
             PipeBarrier<PIPE_V>();
-            return;
+            Sub(bias, bias, work, compareCount);
+            PipeBarrier<PIPE_V>();
+            Min(value, value, bias, compareCount);
+            PipeBarrier<PIPE_V>();
+            const uint32_t repeats = compareCount / 64;
+            WholeReduceMin(coeff, value, 64, repeats, 1, 1, 8, ReduceOrder::ORDER_ONLY_VALUE);
+            PipeBarrier<PIPE_V>();
+            WholeReduceMin(coeff, coeff, repeats, 1, 1, 1, 8, ReduceOrder::ORDER_ONLY_VALUE);
+            SetFlag<HardEvent::V_S>(EVENT_ID0);
+            WaitFlag<HardEvent::V_S>(EVENT_ID0);
+            if (coeff.GetValue(0) >= 0.0f) {
+                ShiftRight(word, raw, uint16_t(4), n);
+                PipeBarrier<PIPE_V>();
+                ShiftLeft(word, word, uint16_t(15), n);
+                PipeBarrier<PIPE_V>();
+                ShiftRight(word, word, uint16_t(15), n);
+                PipeBarrier<PIPE_V>();
+                Adds(word.ReinterpretCast<int16_t>(), word.ReinterpretCast<int16_t>(), int16_t(7), n);
+                PipeBarrier<PIPE_V>();
+                Add(word.ReinterpretCast<int16_t>(), raw.ReinterpretCast<int16_t>(), word.ReinterpretCast<int16_t>(), n);
+                PipeBarrier<PIPE_V>();
+                ShiftRight(word, word, uint16_t(4), n);
+                PipeBarrier<PIPE_V>();
+                ShiftLeft(output.ReinterpretCast<uint16_t>(), word, uint16_t(4), n);
+                PipeBarrier<PIPE_V>();
+                return;
+            }
+
         }
 
         Adds(compact2, compact, int16_t(-8), groups);

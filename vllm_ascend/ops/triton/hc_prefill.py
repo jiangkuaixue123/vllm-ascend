@@ -53,6 +53,41 @@ def _post(sub, residual, post, comb, out, rows, H: tl.constexpr, BLOCK: tl.const
             tl.store(out + offset + stream * H, (scaled + mixed).to(tl.bfloat16))
 
 
+@triton.jit(do_not_specialize=["rows"])
+def _post_prepare(
+    sub, residual, post, comb, pre, out, states, mixed, squares, rows, H: tl.constexpr, BLOCK: tl.constexpr
+):
+    for tile in range(tl.program_id(0), rows * (H // BLOCK), tl.num_programs(0)):
+        row = tile // (H // BLOCK)
+        col = tile % (H // BLOCK) * BLOCK + tl.arange(0, BLOCK)
+        offset = row * 4 * H + col
+        r0 = tl.load(residual + offset).to(tl.float32)
+        r1 = tl.load(residual + offset + H).to(tl.float32)
+        r2 = tl.load(residual + offset + 2 * H).to(tl.float32)
+        r3 = tl.load(residual + offset + 3 * H).to(tl.float32)
+        sub_value = tl.load(sub + row * H + col).to(tl.float32)
+        for stream in tl.static_range(4):
+            p0 = tl.load(comb + row * 16 + stream) * r0
+            p1 = tl.load(comb + row * 16 + 4 + stream) * r1
+            p2 = tl.load(comb + row * 16 + 8 + stream) * r2
+            p3 = tl.load(comb + row * 16 + 12 + stream) * r3
+            total = ((p0 + p1) + p2) + p3
+            total = tl.where(total == 0.0, 0.0, total)
+            rounded = (tl.load(post + row * 4 + stream) * sub_value + total).to(tl.bfloat16)
+            tl.store(out + offset + stream * H, rounded)
+            value = rounded.to(tl.float32)
+            tl.store(states + offset + stream * H, value)
+            weighted = tl.load(pre + row * 4 + stream) * value
+            if stream == 0:
+                combined = weighted
+            else:
+                combined = combined + weighted
+        combined = tl.where(combined == 0.0, 0.0, combined).to(tl.bfloat16)
+        tl.store(mixed + row * H + col, combined)
+        value = combined.to(tl.float32)
+        tl.store(squares + row * H + col, value * value)
+
+
 def prepare(x, pre):
     init_device_properties_triton()
     mixed = x.new_empty((x.shape[0], 5120))
@@ -68,3 +103,27 @@ def post(sub, residual, gates, comb):
         sub, residual, gates, comb, out, sub.shape[0], H=5120, BLOCK=1024, enable_fp_fusion=False
     )
     return out
+
+
+def post_prepare(sub, residual, gates, comb, pre):
+    init_device_properties_triton()
+    out = torch.empty_like(residual)
+    states = torch.empty_like(residual, dtype=torch.float32)
+    mixed = sub.new_empty(sub.shape)
+    squares = torch.empty_like(sub, dtype=torch.float32)
+    _post_prepare[(get_vectorcore_num(),)](
+        sub,
+        residual,
+        gates,
+        comb,
+        pre,
+        out,
+        states,
+        mixed,
+        squares,
+        sub.shape[0],
+        H=5120,
+        BLOCK=1024,
+        enable_fp_fusion=False,
+    )
+    return out, mixed, states, squares

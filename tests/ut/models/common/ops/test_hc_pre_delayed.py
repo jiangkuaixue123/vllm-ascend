@@ -233,6 +233,7 @@ def block_methods(env):
     env.setdefault("hc_post_fused", lambda *args, **kwargs: None)
     env.setdefault("hc_prefill_prepare", lambda *args: None)
     env.setdefault("hc_prefill_post", lambda *args: None)
+    env.setdefault("hc_prefill_post_prepare", lambda *args: None)
     env.setdefault("hc_post_pre_delayed", lambda *args: None)
     path = ROOT / "vllm_ascend/models/deepseek_v41/model.py"
     tree = ast.parse(path.read_text())
@@ -347,3 +348,28 @@ def test_prefill_and_draft_never_call_native_even_at_decode_shapes(rows, runtime
     block.mixes = lambda x, name: gates
     result = block.pre_and_mixes(TensorMetadata((rows, 4, 5120), "bf16"), object(), "attn", runtime)
     assert result == (marker, *gates)
+
+
+def test_prefill_boundary_reaches_fp32_mixes_and_existing_norm():
+    rows = 257
+    hidden = TensorMetadata((rows, 4, 5120), "bf16")
+    mixed = TensorMetadata((rows, 5120), "bf16")
+    states, squares, ffn_pre = object(), object(), object()
+    calls = []
+    cls = block_methods({"hc_prefill_post_prepare": lambda *args: (hidden, mixed, states, squares)})
+    block = cls()
+    block.pre_and_mixes = lambda *args: (mixed, object(), object(), object())
+    block.attn_norm = lambda x: x
+    block.attn = lambda x, runtime: x
+
+    def mixes(x, name):
+        assert x is states and name == "ffn"
+        return ffn_pre, object(), object()
+
+    block.mixes = mixes
+    block.ffn_norm = lambda x, value: calls.append((x, value)) or x
+    block.ffn = lambda x: x
+    block.post_residual = lambda output, residual, *args: residual
+    result = block.forward(hidden, object(), SimpleNamespace(decode=None))
+    assert result == (hidden, ffn_pre)
+    assert calls == [(mixed, squares)]

@@ -52,3 +52,20 @@ def hc_prefill_post(sub, residual, post, comb):
     from vllm_ascend.ops.triton.hc_prefill import post as post_kernel
 
     return post_kernel(sub, residual, post, comb)
+
+
+def hc_prefill_post_prepare(sub, residual, post, comb, previous_pre):
+    rows = residual.shape[0]
+    if (
+        sub.shape != (rows, 5120)
+        or sub.dtype != torch.bfloat16
+        or post.shape != (rows, 4)
+        or comb.shape != (rows, 4, 4)
+        or previous_pre.shape != (rows, 4)
+        or any(t.dtype != torch.float32 for t in (post, comb, previous_pre))
+        or not _supported(residual, sub, post, comb, previous_pre)
+    ):
+        return None
+    from vllm_ascend.ops.triton.hc_prefill import post_prepare
+
+    return post_prepare(sub, residual, post, comb, previous_pre)
