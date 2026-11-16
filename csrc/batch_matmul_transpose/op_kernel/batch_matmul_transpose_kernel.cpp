@@ -85,6 +85,34 @@ public:
         ping_flag = 1;
     }
 
+    __aicore__ __force_inline__ void InitV41(GM_ADDR a, GM_ADDR b, GM_ADDR c, uint32_t rows, uint32_t groups)
+    {
+        gm_a.SetGlobalBuffer(reinterpret_cast<__gm__ InDtype *>(a));
+        gm_b.SetGlobalBuffer(reinterpret_cast<__gm__ InDtype *>(b));
+        gm_c.SetGlobalBuffer(reinterpret_cast<__gm__ OutDtype *>(c));
+        batch_size = groups;
+        m = rows;
+        k = 4096;
+        n = 1024;
+        m0 = 32;
+        k0 = 512;
+        n0 = 64;
+        tdim.m = (m + m0 - 1) / m0;
+        tdim.k = k / k0;
+        tdim.n = n / n0;
+        core_loop = groups * tdim.m * tdim.n;
+        swizzle_cnt = 1;
+        en_shuffle_k = 0;
+        AsdopsBuffer<ArchType::ASCEND_V220> buf;
+        l1_base_a = buf.template GetBuffer<BufferType::ASCEND_CB, InDtype>(0);
+        l1_base_b = buf.template GetBuffer<BufferType::ASCEND_CB, InDtype>(m0 * k0 * sizeof(InDtype));
+        l0a_base = buf.template GetBuffer<BufferType::ASCEND_L0A, InDtype>(0);
+        l0b_base = buf.template GetBuffer<BufferType::ASCEND_L0B, InDtype>(0);
+        num_core = AscendC::GetBlockNum();
+        core_idx = AscendC::GetBlockIdx();
+        ping_flag = 1;
+    }
+
     __aicore__ __force_inline__ void GetBlockIdx(uint64_t index, MatCoord &tidx)
     {
         uint64_t in_batch_idx = index % (tdim.m * tdim.n);
@@ -822,4 +850,25 @@ extern void batch_matmul_transpose_impl(
         gm_tiling_data);
 }
 
+}
+extern "C" __global__ __aicore__ void deepseek_v41_wo_a_kernel(
+    GM_ADDR a, GM_ADDR b, GM_ADDR c, uint32_t rows, uint32_t groups)
+{
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIC_ONLY);
+    SetPadding<uint64_t>(0);
+    SetNdpara(1, 0, 0);
+    SetAtomicnone();
+    PpMatmulEinSum<0, false, true, __bf16, __bf16, DataFormat::ND> op;
+    op.InitV41(a, b, c, rows, groups);
+    op.Process();
+}
+
+namespace vllm_ascend {
+void deepseek_v41_wo_a_launch(void* stream, void* a, void* b, void* c, uint32_t rows, uint32_t groups)
+{
+    const uint32_t tiles = groups * ((rows + 31) / 32) * 16;
+    const uint32_t blocks = tiles < 24 ? tiles : 24;
+    deepseek_v41_wo_a_kernel<<<blocks, nullptr, stream>>>(
+        static_cast<uint8_t*>(a), static_cast<uint8_t*>(b), static_cast<uint8_t*>(c), rows, groups);
+}
 }

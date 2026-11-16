@@ -41,6 +41,7 @@ from vllm.v1.attention.backend import (
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 
 from vllm_ascend.models.common.ops.rms_rsqrt_fused import try_rms_rsqrt_fused
+from vllm_ascend.models.common.ops.v41_output_projection import try_v41_wo_a
 from vllm_ascend.ops.linear import AscendUnquantizedLinearMethod
 from vllm_ascend.quantization.method_adapters import AscendLinearMethod
 from vllm_ascend.quantization.methods.w8a8.w8a8_dynamic import AscendW8A8DynamicLinearMethod
@@ -1691,7 +1692,10 @@ class DeepseekV41Attention(nn.Module):
         if not quantized:
             output = _quantize_projection_input(output)
         projection = self.wo_a.weight.view(self.groups, self.config.o_lora_rank, -1)
-        output = torch.einsum("sgd,grd->sgr", output, projection).flatten(1)
+        projected = try_v41_wo_a(output, projection)
+        if projected is None:
+            projected = torch.einsum("sgd,grd->sgr", output, projection)
+        output = projected.flatten(1)
         if self.sequence_group is not None:
             # The input is already the local WO column slice. Keep the BF16
             # linear partial and perform precisely one FP32 TP reduce-scatter.
