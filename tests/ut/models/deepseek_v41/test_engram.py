@@ -697,3 +697,72 @@ def test_large_packet_keeps_permuted_unique_destinations():
     expected = torch.zeros_like(output)
     expected[torch.tensor(positions, device="npu")] = decode_int8_e8m0_rows(weights.npu(), scales.npu())
     assert torch.equal(output.cpu().view(torch.int16), expected.cpu().view(torch.int16))
+
+
+@pytest.mark.parametrize("count", [127, 128, 129, 512, 8192])
+@pytest.mark.parametrize("position", [0, 7])
+@pytest.mark.parametrize("masked", [False, True])
+def test_bulk_hash_matches_chunked_integer_reference(count, position, masked):
+    layout = EngramLayout.from_config(
+        layout_config(
+            engram_layer_ids=(1, 14),
+            engram_max_ngram_size=4,
+            engram_n_heads=8,
+            engram_vocab_size=16000000,
+            engram_num_embeddings=(1000000000, 1000000000),
+        )
+    )
+    hasher = EngramHasher(layout, tuple(range(257)), compressed_vocab_size=257, pad_token_id=0)
+    tokens = (torch.arange(count * 2, dtype=torch.long) % 257)[::2]
+    mask = [not masked or i % 17 != 0 for i in range(count)]
+    history = [3, 0, 255][-min(position, 3) :] if position else []
+    state = hasher.new_state(
+        history, position=position, history_mask=[False] + [True] * (len(history) - 1) if masked and history else None
+    )
+    reference = state.fork()
+    expected = []
+    for start in range(0, count, 127):
+        expected.append(
+            hasher.hash_tokens(
+                tokens[start : start + 127],
+                reference,
+                start_position=reference.position,
+                token_mask=mask[start : start + 127],
+            )
+        )
+    actual = hasher.hash_tokens(tokens, state, start_position=position, token_mask=mask)
+    assert actual.dtype == torch.int64 and actual.device.type == "cpu"
+    assert torch.equal(actual, torch.cat(expected))
+    assert state == reference
+    snapshot = tuple(state.tail)
+    actual.zero_()
+    assert state.tail == snapshot
+
+
+def test_bulk_hash_malformed_layout_keeps_reference_error_and_state():
+    layout = EngramLayout(3, (1,), (36,), (((5, 7), (11,)),), 2, 32)
+    hasher = EngramHasher(layout, (0, 1, 2, 3), compressed_vocab_size=4, pad_token_id=0)
+    state = hasher.new_state()
+    with pytest.raises(RuntimeError):
+        hasher.hash_tokens([1] * 128, state, start_position=0)
+    assert state.position == 0 and state.tail == ()
+
+
+@torch.inference_mode()
+def test_runtime_packet_rows_share_one_compiled_kernel():
+    if not torch.npu.is_available():
+        pytest.skip("NPU unavailable")
+    from vllm_ascend.ops.triton.deepseek_v41_engram_upload import _unpack_engram_rows, try_upload_engram_rows
+
+    observed = []
+    for count in (1, 2, 3, 5, 34, 35, 36, 37, 38, 71, 72, 73, 143, 144, 145, 4095, 4096):
+        weights = torch.arange(count * 256, dtype=torch.int32).to(torch.int8).reshape(count, 256)
+        scales = torch.full((count, 8), 127, dtype=torch.uint8)
+        output = torch.zeros(count + 2, 256, dtype=torch.bfloat16, device="npu")
+        assert try_upload_engram_rows(weights.numpy().tobytes(), scales.numpy().tobytes(), list(range(count)), output)
+        torch.npu.synchronize()
+        assert torch.equal(output[:count].cpu(), weights.bfloat16())
+        assert not output[count:].count_nonzero()
+        observed.append(sum(len(cache) for cache in _unpack_engram_rows.cache.values()))
+    assert len(set(observed)) == 1, observed
+    print("PACKET_RUNTIME_ROW_CACHE_STABLE", observed[0], flush=True)

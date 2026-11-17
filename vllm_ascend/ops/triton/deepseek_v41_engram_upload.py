@@ -11,14 +11,14 @@ from vllm_ascend.device.device_config import get_ascend_device_type
 from vllm_ascend.device.hardware import AscendDeviceType
 
 
-@triton.jit
-def _unpack_engram_rows(packet, positions, output, ROWS: tl.constexpr):
+@triton.jit(do_not_specialize=["rows"], do_not_specialize_on_alignment=["positions"])
+def _unpack_engram_rows(packet, positions, output, rows):
     columns = tl.arange(0, 256)
     for step in tl.static_range(4):
         row = tl.program_id(0) * 4 + step
-        if row < ROWS:
+        if row < rows:
             weight = tl.load(packet + row * 256 + columns).to(tl.int8, bitcast=True).to(tl.int32)
-            scale = tl.load(packet + ROWS * 256 + row * 8 + columns // 32).to(tl.int32)
+            scale = tl.load(packet + rows * 256 + row * 8 + columns // 32).to(tl.int32)
             magnitude = tl.abs(weight)
             shift = tl.full((256,), 0, tl.int32)
             for bit in tl.static_range(1, 8):

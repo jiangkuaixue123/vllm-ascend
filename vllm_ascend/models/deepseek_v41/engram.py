@@ -57,6 +57,7 @@ FP32_MAGNITUDE_MASK = 0x7FFFFFFF
 GATE_CLAMP_MIN = 1e-6
 MAX_HEADER_BYTES = 16 * 1024 * 1024
 DEFAULT_LOOKUP_CHUNK_ROWS = 4096
+MIN_BULK_HASH_TOKENS = 128
 MAX_DENSE_TENSOR_BYTES = 512 * 1024 * 1024
 STORAGE_TYPES = MappingProxyType(
     {
@@ -233,6 +234,12 @@ class EngramHasher:
                     offset += prime
             self.offsets.append(tuple(offsets))
         self.signature = self.token_map
+        self._vector_hashing = len(layout.primes) == len(layout.layer_ids) and all(
+            len(layer) == layout.max_ngram_size - 1
+            and all(len(group) == layout.n_heads and all(prime > 0 for prime in group) for group in layer)
+            and sum(sum(group) for group in layer) <= np.iinfo(np.int64).max
+            for layer in layout.primes
+        )
 
     @classmethod
     def from_tokenizer(
@@ -291,6 +298,23 @@ class EngramHasher:
             history_mask=text,
         )
 
+    def _hash_many(self, compressed, state):
+        lookback = self.layout.max_ngram_size - 1
+        sequence = np.asarray(
+            (DEAD_TOKEN,) * (lookback - len(state.tail)) + state.tail + tuple(compressed), dtype=np.int64
+        )
+        tokens = np.lib.stride_tricks.sliding_window_view(sequence, lookback + 1)[:, ::-1]
+        blocked = np.maximum.accumulate(tokens == DEAD_TOKEN, axis=1)
+        tokens = np.where(blocked, self.pad_id, tokens)
+        # The constructor bounds each nonnegative product below INT64_MAX.
+        products = tokens[:, None, :] * np.asarray(self.multipliers, dtype=np.int64)[None, :, :]
+        rolling = np.bitwise_xor.accumulate(products, axis=-1)[:, :, 1:, None]
+        hashes = np.remainder(rolling, np.asarray(self.layout.primes, dtype=np.int64)[None, :, :, :])
+        hashes += np.asarray(self.offsets, dtype=np.int64).reshape(
+            1, len(self.layout.layer_ids), lookback, self.layout.n_heads
+        )
+        return torch.from_numpy(hashes.reshape(len(compressed), len(self.layout.layer_ids), self.layout.hash_columns))
+
     def hash_tokens(
         self,
         token_ids: Sequence[int] | torch.Tensor,
@@ -309,33 +333,37 @@ class EngramHasher:
         ):
             raise ValueError("Request cursor/history does not match Engram hashing")
         compressed = self._compress(token_ids, token_mask)
-        rows = []
-        for index in range(len(compressed)):
-            position = state.position + index
-            tokens, blocked = [], False
-            for shift in range(self.layout.max_ngram_size):
-                source_position = position - shift
-                if source_position < 0:
-                    source = self.pad_id
-                    blocked = True
-                elif source_position < state.position:
-                    source = state.tail[source_position - state.position]
-                else:
-                    source = compressed[source_position - state.position]
-                blocked = blocked or source == DEAD_TOKEN
-                tokens.append(self.pad_id if blocked else source)
-            layers = []
-            for layer_index, multipliers in enumerate(self.multipliers):
-                products = [token * factor for token, factor in zip(tokens, multipliers)]
-                rolling, hashes = products[0], []
-                for size_index in range(lookback):
-                    rolling ^= products[size_index + 1]
-                    hashes.extend(rolling % prime for prime in self.layout.primes[layer_index][size_index])
-                layers.append([value + offset for value, offset in zip(hashes, self.offsets[layer_index])])
-            rows.append(layers)
-        result = torch.tensor(rows, dtype=torch.int64, device="cpu").reshape(
-            len(rows), len(self.layout.layer_ids), self.layout.hash_columns
-        )
+        if self._vector_hashing and len(compressed) >= MIN_BULK_HASH_TOKENS:
+            with torch.profiler.record_function("v41.engram.hash_tokens"):
+                result = self._hash_many(compressed, state)
+        else:
+            rows = []
+            for index in range(len(compressed)):
+                position = state.position + index
+                tokens, blocked = [], False
+                for shift in range(self.layout.max_ngram_size):
+                    source_position = position - shift
+                    if source_position < 0:
+                        source = self.pad_id
+                        blocked = True
+                    elif source_position < state.position:
+                        source = state.tail[source_position - state.position]
+                    else:
+                        source = compressed[source_position - state.position]
+                    blocked = blocked or source == DEAD_TOKEN
+                    tokens.append(self.pad_id if blocked else source)
+                layers = []
+                for layer_index, multipliers in enumerate(self.multipliers):
+                    products = [token * factor for token, factor in zip(tokens, multipliers)]
+                    rolling, hashes = products[0], []
+                    for size_index in range(lookback):
+                        rolling ^= products[size_index + 1]
+                        hashes.extend(rolling % prime for prime in self.layout.primes[layer_index][size_index])
+                    layers.append([value + offset for value, offset in zip(hashes, self.offsets[layer_index])])
+                rows.append(layers)
+            result = torch.tensor(rows, dtype=torch.int64, device="cpu").reshape(
+                len(rows), len(self.layout.layer_ids), self.layout.hash_columns
+            )
         state.tail = (state.tail + tuple(compressed))[-lookback:]
         state.position += len(compressed)
         state.vocabulary_signature = self.signature
