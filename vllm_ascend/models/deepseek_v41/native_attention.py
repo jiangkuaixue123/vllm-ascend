@@ -222,12 +222,38 @@ class DeepseekV41NativeAttention:
             table = torch.arange(batch * blocks_per_row, dtype=torch.int32, device=device).reshape(batch, -1)
         return metadata, table, common
 
-    def __call__(self, q, kv, sink, indices, scale, *, mode, swa_window=None, uniform_decode=False):
+    def __call__(
+        self,
+        q,
+        kv,
+        sink,
+        indices,
+        scale,
+        *,
+        mode,
+        swa_window=None,
+        uniform_decode=False,
+        physical_slots=False,
+        padded_kv=None,
+    ):
         if q.device.type == "cpu":
+            if physical_slots or padded_kv is not None:
+                raise ValueError("Prepared physical attention inputs require an NPU")
             return sparse_attn(q, kv, sink, indices, scale)
         if q.device.type != "npu" or not enable_custom_op():
             raise RuntimeError("V4.1 attention requires Ascend's npu_sparse_attn_sharedkv custom operator")
-        return self._native(q, kv, sink, indices, scale, mode, swa_window, uniform_decode)
+        return self._native(
+            q,
+            kv,
+            sink,
+            indices,
+            scale,
+            mode,
+            swa_window,
+            uniform_decode,
+            physical_slots=physical_slots,
+            padded_kv=padded_kv,
+        )
 
     def decode_with_physical_slots(self, q, kv, sink, slots, scale, *, mask_empty_rows=True):
         """Uniform target decode with absolute slots already packed in original logical order."""

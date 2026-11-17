@@ -537,7 +537,8 @@ def test_batch_row_read_accepts_zero_width_after_nonempty_payload(tmp_path):
         assert store.read_rows("rows", [2, 0, 2]) == b""
 
 
-def test_batched_upload_matches_native_device_for_all_int8_e8m0_codes(tmp_path):
+@torch.inference_mode()
+def test_batched_upload_matches_native_device_for_all_int8_e8m0_codes(tmp_path, monkeypatch):
     if not torch.npu.is_available():
         pytest.skip("NPU unavailable")
     weights = torch.arange(-128, 128, dtype=torch.int16).to(torch.int8).repeat(256, 1)
@@ -551,12 +552,24 @@ def test_batched_upload_matches_native_device_for_all_int8_e8m0_codes(tmp_path):
         },
     )
     write_index(tmp_path, {"table.weight": "all-codes.safetensors", "table.scale": "all-codes.safetensors"})
-    # One code per chunk exercises every finite CPU path and the NaN device path.
+    from vllm_ascend.ops.triton import deepseek_v41_engram_upload as upload
+
+    observed = []
+    native_upload = upload.try_upload_engram_rows
+
+    def record_upload(*args):
+        used = native_upload(*args)
+        observed.append(used)
+        return used
+
+    monkeypatch.setattr(upload, "try_upload_engram_rows", record_upload)
+    # One code per chunk also covers the native packet's single-row tail.
     with IndexedMmapStore(tmp_path, max_rows_per_read=1) as store:
         embedding = MmapEngramEmbedding(store, "table", tp_rank=0, tp_size=1, chunk_rows=1)
         actual = embedding(torch.arange(256), device="npu").cpu()
     different = actual.view(torch.int16) != expected.view(torch.int16)
     assert not different.any(), torch.nonzero(different)[:16].tolist()
+    assert len(observed) == 256 and all(observed)
 
 
 @pytest.mark.parametrize("tp,rank", [(1, 0), (4, 0), (4, 3), (8, 0), (8, 7)])
@@ -607,3 +620,80 @@ def test_mmap_decode_upload_refreshes_stable_graph_input(table_checkpoint, tp, r
             assert out.data_ptr() == address
             graph.replay()
             assert torch.equal(output.cpu().view(torch.int16), expected.view(torch.int16))
+
+
+@pytest.mark.parametrize("tp,rank", [(1, 0), (4, 0), (4, 3), (8, 0), (8, 7)])
+@pytest.mark.parametrize("bucket", [24, 48])
+@torch.inference_mode()
+def test_packet_mmap_upload_keeps_shards_holes_and_graph_buffers(tmp_path, tp, rank, bucket):
+    if not torch.npu.is_available():
+        pytest.skip("NPU unavailable")
+    weights = torch.arange(16 * 256, dtype=torch.int16).to(torch.int8).reshape(16, 256)
+    scales = torch.arange(16 * 8, dtype=torch.int16).to(torch.uint8).reshape(16, 8) + 65
+    scales[3].fill_(255)
+    scales[4].zero_()
+    write_shard(
+        tmp_path / "packet.safetensors",
+        {
+            "table.weight": ("I8", (16, 256), weights.numpy().tobytes()),
+            "table.scale": ("F8_E8M0", (16, 8), scales.numpy().tobytes()),
+        },
+    )
+    write_index(tmp_path, {"table.weight": "packet.safetensors", "table.scale": "packet.safetensors"})
+    table = decode_int8_e8m0_rows(weights.npu(), scales.npu()).cpu()
+
+    def unexpected_reduce(*args):
+        raise AssertionError("Staging local rows must not communicate")
+
+    with IndexedMmapStore(tmp_path, max_rows_per_read=3) as store:
+        embedding = MmapEngramEmbedding(store, "table", tp_rank=rank, tp_size=tp, chunk_rows=3)
+        module = DeepseekV41Engram(
+            embedding,
+            nn.Linear(64, 6, bias=False, dtype=torch.bfloat16),
+            torch.ones(2, 2),
+            torch.ones(2, 2),
+            eps=1e-6,
+            tp_reduce=unexpected_reduce,
+            rotation_contract="unrotated",
+        )
+        out = None
+        graph = None
+        for step in range(64):
+            count = step % 4
+            ids = ((torch.arange(count * 2) + step) % 16).reshape(count, 2)
+            slots = [bucket - 1, 0, bucket // 2][:count]
+            out = module.prepare_decode(ids, bucket_size=bucket, device="npu", slots=slots, out=out)
+            expected = torch.zeros(bucket, 2, 256, dtype=torch.bfloat16)
+            if count:
+                values = table[ids].clone()
+                local = (ids >= embedding.start_row) & (ids < embedding.end_row)
+                values[~local] = 0
+                expected[slots] = values
+            assert torch.equal(out.cpu().view(torch.int16), expected.view(torch.int16))
+            if graph is None:
+                address = out.data_ptr()
+                _ = out.clone()
+                torch.npu.synchronize()
+                graph = torch.npu.NPUGraph()
+                with torch.npu.graph(graph):
+                    output = out.clone()
+            assert out.data_ptr() == address
+            graph.replay()
+            torch.npu.synchronize()
+            assert torch.equal(output.cpu().view(torch.int16), expected.view(torch.int16))
+
+
+@torch.inference_mode()
+def test_large_packet_keeps_permuted_unique_destinations():
+    if not torch.npu.is_available():
+        pytest.skip("NPU unavailable")
+    from vllm_ascend.ops.triton.deepseek_v41_engram_upload import try_upload_engram_rows
+
+    weights = torch.arange(4096 * 256, dtype=torch.int32).to(torch.int8).reshape(4096, 256)
+    scales = torch.arange(4096 * 8, dtype=torch.int32).to(torch.uint8).reshape(4096, 8)
+    positions = list(range(8190, -1, -2))
+    output = torch.zeros(8192, 256, dtype=torch.bfloat16, device="npu")
+    assert try_upload_engram_rows(weights.numpy().tobytes(), scales.numpy().tobytes(), positions, output)
+    expected = torch.zeros_like(output)
+    expected[torch.tensor(positions, device="npu")] = decode_int8_e8m0_rows(weights.npu(), scales.npu())
+    assert torch.equal(output.cpu().view(torch.int16), expected.cpu().view(torch.int16))

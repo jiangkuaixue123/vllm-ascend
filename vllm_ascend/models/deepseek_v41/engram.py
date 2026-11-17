@@ -42,6 +42,7 @@ import torch
 from sympy import isprime
 from tokenizers import Regex, normalizers
 from torch import nn
+from vllm.triton_utils import HAS_TRITON
 
 from vllm_ascend.models.common.ops.sequence_parallel import sp_reduce_scatter
 
@@ -570,16 +571,22 @@ class MmapEngramEmbedding(nn.Module):
             torch.int64,
         ):
             raise ValueError("Mmap lookup needs explicit CPU hash IDs")
-        rows = _cpu_ids(indices.reshape(-1))
-        if any(not 0 <= row < self.num_embeddings for row in rows):
+        # Own one compact snapshot; avoid Python objects for every unowned row.
+        rows = indices.reshape(-1).numpy(force=True).copy()
+        if rows.size and (rows.min() < 0 or rows.max() >= self.num_embeddings):
             raise ValueError("Hash ID outside Engram table")
         output = torch.zeros((len(rows), self.embedding_dim), dtype=torch.bfloat16, device=device)
-        selected = [(index, row) for index, row in enumerate(rows) if self.start_row <= row < self.end_row]
+        selected = np.flatnonzero((rows >= self.start_row) & (rows < self.end_row))
         for start in range(0, len(selected), self.chunk_rows):
             chunk = selected[start : start + self.chunk_rows]
-            positions, row_ids = zip(*chunk)
+            positions, row_ids = chunk.tolist(), rows[chunk].tolist()
             weight_bytes = self.store.read_rows(self.prefix + ".weight", row_ids)
             scale_bytes = self.store.read_rows(self.prefix + ".scale", row_ids)
+            if HAS_TRITON and output.device.type == "npu" and torch.is_inference_mode_enabled():
+                from vllm_ascend.ops.triton.deepseek_v41_engram_upload import try_upload_engram_rows
+
+                if try_upload_engram_rows(weight_bytes, scale_bytes, positions, output):
+                    continue
             weights = torch.frombuffer(bytearray(weight_bytes), dtype=torch.int8).reshape(
                 len(chunk), self.embedding_dim
             )

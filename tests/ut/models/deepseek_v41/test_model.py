@@ -716,3 +716,44 @@ def test_embedding_merge_uses_scheduler_span_not_vocabulary_id(paged_hash_model)
     torch.testing.assert_close(merged[~mask], original[~mask])
     with pytest.raises(ValueError, match="span mask"):
         model.embed_input_ids(ids, [features])
+
+
+def test_packed_query_hash_groups_split_holes_and_reject_bad_positions(staged_hash_model, monkeypatch):
+    model = staged_hash_model
+    model._decode_capture_sizes = {6}
+    cache = model.layers[0].attn.cache
+    table = torch.tensor([[0, 1, 2, 3, 4, 5]], dtype=torch.int32)
+    positions = torch.arange(6)
+    slots = positions.clone()
+    active = torch.tensor([True, False, True, True, True, True])
+    slots[~active] = -1
+    decode = DeepseekV41DecodeMetadata(positions + 1, slots, table.expand(6, -1), active, 12, 6)
+    md = DeepseekV41Metadata([], table, slots, 5, decode)
+    cache.metadata = lambda: md
+    cache.field(1, cache.dim + cache.index_dim, 1).zero_()
+    tokens = torch.tensor([2, 99, 8, 9, 12, 3])
+    hasher = model.engram_hasher
+    lookback = hasher.layout.max_ngram_size - 1
+    expected = torch.cat(
+        [
+            hasher.hash_tokens([2], hasher.new_state(), start_position=0),
+            hasher.hash_tokens([8, 9, 12, 3], hasher.new_state([0] * min(2, lookback), position=2), start_position=2),
+        ]
+    )
+    original = hasher.hash_tokens
+    calls = []
+
+    def grouped(tokens, *args, **kwargs):
+        calls.append(len(tokens))
+        return original(tokens, *args, **kwargs)
+
+    monkeypatch.setattr(hasher, "hash_tokens", grouped)
+    assert model.prepare_decode_graph_inputs(tokens, positions) == 5
+    assert calls == [1, 4]
+    for layer in model.engram_layer_ids:
+        assert torch.equal(model._decode_engram_values[6, layer][active], expected[:, layer])
+    before = paged_cache.snapshot(cache)
+    positions[3] = 5
+    with pytest.raises(ValueError, match="cursor/history"):
+        model.prepare_decode_graph_inputs(tokens, positions)
+    torch.testing.assert_close(paged_cache.bits(cache), before)

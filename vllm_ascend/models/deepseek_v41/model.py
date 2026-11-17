@@ -606,19 +606,23 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsMultiModal):
                 past = torch.arange(pos - lookback, pos, device=input_ids.device)
                 histories[0] = cache.read(decode, 0, past, 1, history_column, 1).flatten().long().cpu().tolist()
             rows = []
-            previous = -2
-            for row in live:
-                _, pos, token, _ = header[row][:4]
+            first = 0
+            while first < len(live):
+                row = live[first]
+                end = first + 1
+                while end < len(live) and live[end] == live[end - 1] + 1 and live[end] % decode.query_width != 0:
+                    end += 1
+                group = live[first:end]
+                pos = header[row][1]
+                if any(header[value][1] != pos + offset for offset, value in enumerate(group)):
+                    raise ValueError("Request cursor/history does not match Engram hashing")
                 count = min(pos, lookback)
-                # Each packed verification query sees its own earlier proposals.
-                # On rejection the next query starts at the accepted boundary,
-                # so rejected slots from the preceding step never seed its hash.
-                if row % decode.query_width == 0 or previous != row - 1:
-                    state = self.engram_hasher.restore_paged_state(
-                        histories[row][-count:] if count else [], position=pos
-                    )
-                rows.append(self.engram_hasher.hash_tokens([token], state, start_position=pos))
-                previous = row
+                # A hole, request boundary or rejection restores the paged prefix.
+                state = self.engram_hasher.restore_paged_state(histories[row][-count:] if count else [], position=pos)
+                rows.append(
+                    self.engram_hasher.hash_tokens([header[value][2] for value in group], state, start_position=pos)
+                )
+                first = end
             hashes = torch.cat(rows, dim=0)
         else:
             hashes = torch.empty(

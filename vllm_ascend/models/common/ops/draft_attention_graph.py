@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 
 import torch
+from vllm.triton_utils import HAS_TRITON
 from vllm.utils.torch_utils import async_tensor_h2d
 
 from vllm_ascend.device.device_config import get_ascend_device_type
@@ -111,31 +112,43 @@ def draft_attention_core(attention, hidden, positions, table, start, *, device_h
     q = attention.wq_b(qr)[0].view(-1, attention.heads, attention.dim)
     attention.rotate(q.unsqueeze(0), positions)
     query_kv = attention.project_kv(hidden, positions)
-    slots = torch.arange(WINDOW, device=hidden.device)
     batch = start.shape[0]
-    if batch == 1:
-        history = start - 1 - (start - 1 - slots).remainder(WINDOW)
-        metadata = SimpleNamespace(block_table_tensor=table)
-        read_history = history.clamp_min(0) if device_history else history
-        context = attention.cache.read(metadata, 0, read_history, 0, 0, HEAD_DIM).to(hidden.dtype)
-        kv = torch.cat((context, query_kv), dim=0).unsqueeze(0)
+    staged = None
+    if HAS_TRITON and hidden.device.type == "npu" and get_ascend_device_type() == AscendDeviceType.A3:
+        from vllm_ascend.ops.triton.deepseek_v41_draft_staging import stage_draft_pages
+
+        staged = stage_draft_pages(
+            attention.cache.field(0, 0, HEAD_DIM), query_kv, table, start, device_history=device_history
+        )
+    if staged is not None:
+        kv, indices, padded = staged
+        native_inputs = dict(physical_slots=True, padded_kv=padded)
     else:
-        history = start[:, None] - 1 - (start[:, None] - 1 - slots).remainder(WINDOW)
-        read_history = history.clamp_min(0) if device_history else history
-        pages = table.gather(1, read_history // WINDOW).long()
-        cache_slots = pages * WINDOW + read_history % WINDOW
-        context = attention.cache.field(0, 0, HEAD_DIM)[cache_slots]
-        kv = torch.cat((context, query_kv.view(batch, DRAFT_ROWS, HEAD_DIM)), dim=1)
-    indices = torch.arange(WINDOW + DRAFT_ROWS, dtype=torch.int32, device=hidden.device)
-    if device_history:
-        # Short histories occupy the same initial ring slots as the eager path.
-        # Native attention compacts these holes before the five query KV rows.
-        valid_history = history.reshape(batch, WINDOW) >= 0
-        context_indices = torch.where(valid_history, indices[:WINDOW], -1)
-        query_indices = indices[WINDOW:].expand(batch, -1)
-        indices = torch.cat((context_indices, query_indices), dim=1).unsqueeze(1).expand(-1, DRAFT_ROWS, -1)
-    else:
-        indices = indices.view(1, 1, -1).expand(batch, DRAFT_ROWS, -1)
+        slots = torch.arange(WINDOW, device=hidden.device)
+        if batch == 1:
+            history = start - 1 - (start - 1 - slots).remainder(WINDOW)
+            metadata = SimpleNamespace(block_table_tensor=table)
+            read_history = history.clamp_min(0) if device_history else history
+            context = attention.cache.read(metadata, 0, read_history, 0, 0, HEAD_DIM).to(hidden.dtype)
+            kv = torch.cat((context, query_kv), dim=0).unsqueeze(0)
+        else:
+            history = start[:, None] - 1 - (start[:, None] - 1 - slots).remainder(WINDOW)
+            read_history = history.clamp_min(0) if device_history else history
+            pages = table.gather(1, read_history // WINDOW).long()
+            cache_slots = pages * WINDOW + read_history % WINDOW
+            context = attention.cache.field(0, 0, HEAD_DIM)[cache_slots]
+            kv = torch.cat((context, query_kv.view(batch, DRAFT_ROWS, HEAD_DIM)), dim=1)
+        indices = torch.arange(WINDOW + DRAFT_ROWS, dtype=torch.int32, device=hidden.device)
+        if device_history:
+            # Short histories occupy the same initial ring slots as the eager path.
+            # Native attention compacts these holes before the five query KV rows.
+            valid_history = history.reshape(batch, WINDOW) >= 0
+            context_indices = torch.where(valid_history, indices[:WINDOW], -1)
+            query_indices = indices[WINDOW:].expand(batch, -1)
+            indices = torch.cat((context_indices, query_indices), dim=1).unsqueeze(1).expand(-1, DRAFT_ROWS, -1)
+        else:
+            indices = indices.view(1, 1, -1).expand(batch, DRAFT_ROWS, -1)
+        native_inputs = {}
     attended = attention.attention_kernel(
         q.view(batch, DRAFT_ROWS, attention.heads, HEAD_DIM),
         kv,
@@ -143,6 +156,7 @@ def draft_attention_core(attention, hidden, positions, table, start, *, device_h
         indices,
         HEAD_DIM**-0.5,
         mode="SWA draft bidirectional",
+        **native_inputs,
     ).view(-1, attention.heads, HEAD_DIM)
     attention.rotate(attended.unsqueeze(0), positions, inverse=True)
     return attended

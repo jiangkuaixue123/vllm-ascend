@@ -741,8 +741,26 @@ def select_candidate_blocks(logits, compress_lens, topk_blocks, block_size, *, p
     last = (compress_lens - 1) // block_size
     blocks = torch.arange(scores.shape[-1], device=logits.device)
     scores = scores.masked_fill(blocks == last, torch.inf)
-    top = topk_columns(scores, min(topk_blocks, scores.shape[-1]))
-    keep = torch.zeros_like(scores, dtype=torch.bool).scatter_(-1, top, scores.gather(-1, top) > -torch.inf)
+    k = min(topk_blocks, scores.shape[-1])
+    if (
+        HAS_TRITON
+        and scores.device.type == "npu"
+        and scores.ndim == 2
+        and scores.shape[0] in _DECODE_INDEX_SORT_ROWS
+        and scores.shape[-1] in (9600, 19200)
+        and scores.dtype in (torch.float32, torch.bfloat16)
+        and scores.is_contiguous()
+        and k == 2048
+        and torch.is_inference_mode_enabled()
+        and not envs.VLLM_BATCH_INVARIANT
+        and get_ascend_device_type() == AscendDeviceType.A3
+    ):
+        from vllm_ascend.ops.triton.deepseek_v41_selection import candidate_block_mask
+
+        keep = candidate_block_mask(scores, scores.topk(k, dim=-1).values)
+    else:
+        top = topk_columns(scores, k)
+        keep = torch.zeros_like(scores, dtype=torch.bool).scatter_(-1, top, scores.gather(-1, top) > -torch.inf)
     if per_token:
         return _expand_candidate_blocks(keep, block_size, width)
     return keep

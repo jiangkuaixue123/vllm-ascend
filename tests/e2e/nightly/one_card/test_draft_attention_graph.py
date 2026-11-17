@@ -280,3 +280,55 @@ def test_complete_attention_eager_latency(model, monkeypatch, batch):
             **{name: [statistics.median(values) for values in zip(*samples)] for name, samples in measurements.items()},
         }
     )
+
+
+@pytest.mark.parametrize("batch", [1, 2, 4])
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+@torch.inference_mode()
+def test_final_draft_pages_and_slots_refresh_without_scan(batch, dtype):
+    from vllm_ascend.ops.triton.deepseek_v41_draft_staging import stage_draft_pages
+
+    torch.npu.set_device(0)
+    init_device_properties_triton()
+    storage = torch.randn(1024, 528, dtype=torch.bfloat16)
+    storage[::19, 8] = torch.nan
+    field = storage.npu()[:, 8:520]
+    proposed = torch.randn(batch * 5, 512, dtype=torch.bfloat16, device="npu")
+    table = (torch.arange(batch * 1200, dtype=dtype).reshape(batch, 1200) % 8).npu()
+    start = torch.full((batch,), 128, dtype=dtype, device="npu")
+
+    def run():
+        return stage_draft_pages(field, proposed, table, start, device_history=True)
+
+    run()
+    torch.npu.synchronize()
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph):
+        logical, slots, padded = run()
+    addresses = (slots.data_ptr(), padded.data_ptr())
+    for step in range(64):
+        begins = [(0, 1, 7, 127, 128, 129, 8192, 153595)[(step + row) % 8] for row in range(batch)]
+        start.copy_(torch.tensor(begins, dtype=dtype))
+        fresh_table = (torch.arange(batch * 1200, dtype=dtype).reshape(batch, 1200) + step) % 8
+        if step % 3 == 0:
+            fresh_table[:, 0] = -1
+        table.copy_(fresh_table)
+        proposed.copy_(torch.randn_like(proposed))
+        expected = torch.zeros(batch, 144, 512, dtype=torch.bfloat16)
+        expected_slots = []
+        cpu_field, cpu_query = field.cpu(), proposed.cpu()
+        for row, begin in enumerate(begins):
+            for lane in range(128):
+                history = max(begin - 1 - ((begin - 1 - lane) % 128), 0)
+                source = int(fresh_table[row, history // 128]) * 128 + history % 128
+                expected[row, lane] = cpu_field[source]
+            expected[row, 128:133] = cpu_query[row * 5 : (row + 1) * 5]
+            values = list(range(min(begin, 128))) + list(range(128, 133))
+            physical = [row * 144 + value for value in values] + [-1] * (256 - len(values))
+            expected_slots.extend([physical] * 5)
+        graph.replay()
+        torch.npu.synchronize()
+        assert addresses == (slots.data_ptr(), padded.data_ptr())
+        same(padded, expected.npu())
+        same(logical, expected[:, :133].npu())
+        assert torch.equal(slots.cpu(), torch.tensor(expected_slots, dtype=torch.int32).unsqueeze(1))
