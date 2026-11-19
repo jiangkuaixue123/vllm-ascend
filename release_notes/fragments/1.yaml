@@ -1,7 +1,0 @@
-pr: 1
-entries:
-  - category: bugfix
-    text: >-
-      HY4 Flash A5 Ubuntu images now include the paired HY4 vLLM source and
-      identify both packages as 0.33.0+hy4flash. Building these images requires
-      the github_token BuildKit secret.
