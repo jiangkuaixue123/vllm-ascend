@@ -1,0 +1,58 @@
+# Read the Docs configuration file (English + Chinese)
+#
+# Used by both the `vllm-ascend` and `vllm-ascend-cn` projects on
+# Read the Docs. The build entry point `tools/rtd_build.sh` auto-detects
+# Chinese mode from the RTD project slug and sets all DOCS_* env vars
+# required by mkdocs.yml's !ENV tags and docs/hooks/nav_titles.py.
+#
+# For the `vllm-ascend-cn` project, point the "Custom configuration
+# file" RTD setting to this file (or leave blank to use the default
+# `.readthedocs.yaml`). The Chinese build no longer has a separate
+# .readthedocs.zh.yaml.
+#
+# See https://docs.readthedocs.io/en/stable/config-file/v2.html for details.
+
+version: 2
+
+build:
+  os: ubuntu-22.04
+  tools:
+    python: "3.12"
+  jobs:
+    post_checkout:
+      # Revision dates only read commits and trees. Fetch complete history for
+      # this build's commit without downloading historical file contents.
+      - |
+        if [ "$(git rev-parse --is-shallow-repository)" = true ]; then
+          git fetch origin --unshallow --no-tags --filter=blob:none "$(git rev-parse HEAD)"
+        fi
+    install:
+      # Keep the cache on the virtualenv filesystem so uv can link packages
+      # instead of falling back to copying across filesystems.
+      - |
+        UV_CACHE_DIR="$READTHEDOCS_VIRTUALENV_PATH/.uv-cache" \
+        uv pip install \
+          --python "$READTHEDOCS_VIRTUALENV_PATH/bin/python" \
+          -r docs/requirements-docs.txt
+    # Custom build command. rtd_build.sh writes mkdocs output to
+    # $READTHEDOCS_OUTPUT/html/ directly because the default mkdocs
+    # integration (which would move site/ there) is disabled by
+    # overriding build.jobs.build.html. See:
+    # https://docs.readthedocs.io/en/stable/build-customization.html#where-to-put-files
+    build:
+      html:
+        - bash tools/rtd_build.sh
+
+python:
+  # Retain RTD's native uv bootstrap and virtualenv creation. Dependencies
+  # are installed by build.jobs.install above.
+  install:
+    - method: uv
+      command: pip
+      requirements: docs/requirements-docs.txt
+
+mkdocs:
+  configuration: mkdocs.yml
+  fail_on_warning: true
+
+formats: []

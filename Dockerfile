@@ -1,8 +1,102 @@
-FROM alpine:3.20
+#
+# Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# This file is a part of the vllm-ascend project.
+#
+FROM swr.cn-north-12.myhuaweicloud.com/atlas_inference/cann:9.3.0_20261113161300-910b-ubuntu22.04-py3.12
 
-ARG PIP_INDEX_URL
-ARG COMPILE_CUSTOM_KERNELS
+WORKDIR /workspace
 
-LABEL device="a2" os="ubuntu"
+# Install clang-15 (for triton-ascend)
+RUN apt-get update -y && \
+    apt-get install -y git vim wget curl protobuf-compiler libprotobuf-dev net-tools gcc g++ cmake numactl libnuma-dev libibverbs-dev libhiredis-dev clang-15 && \
+    update-alternatives --install /usr/bin/clang clang /usr/bin/clang-15 20 && \
+    update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-15 20 && \
+    rm -rf /var/cache/apt/* && \
+    rm -rf /var/lib/apt/lists/*
 
-CMD ["echo", "hello from a2/ubuntu"]
+# Install modelscope (for fast download) and ray (for multinode)
+RUN python3 -m pip install 'modelscope<1.38' 'ray>=2.47.1,<=2.48.0' 'protobuf>3.20.0' && \
+    python3 -m pip cache purge
+
+# Install vLLM
+ARG VLLM_REPO=https://github.com/vllm-project/vllm.git
+ARG VLLM_TAG=v0.33.0
+ARG VLLM_COMMIT=""
+ARG PYTORCH_INDEX_URL="https://download.pytorch.org/whl/cpu/"
+RUN if [ -n "$VLLM_COMMIT" ]; then \
+      git init /vllm-workspace/vllm && \
+      git -C /vllm-workspace/vllm fetch --depth 1 $VLLM_REPO "$VLLM_COMMIT" && \
+      git -C /vllm-workspace/vllm checkout FETCH_HEAD; \
+    else \
+      git clone --depth 1 -b $VLLM_TAG $VLLM_REPO /vllm-workspace/vllm; \
+    fi && \
+    VLLM_TARGET_DEVICE="empty" python3 -m pip install -e /vllm-workspace/vllm/[audio] --extra-index-url ${PYTORCH_INDEX_URL} && \
+    # In x86, triton will be installed by vllm. But in Ascend, triton doesn't work correctly. we need to uninstall it.
+    python3 -m pip uninstall -y triton && \
+    # The same step also builds the optional Rust frontend (vllm-rs).
+    cd /vllm-workspace/vllm && \
+    export PATH="/root/.cargo/bin:$PATH" && \
+    export PROTOC_INCLUDE=/usr/include && \
+    python3 -m pip install -r requirements/build/rust.txt && \
+    bash tools/build_rust.sh && \
+    python3 -m pip cache purge
+
+# Install vllm-ascend
+# Dependency versions used by the vllm-ascend build.
+ARG SOC_VERSION="ascend910b1"
+ENV DEBIAN_FRONTEND=noninteractive
+# Cap opc/c++/rust build parallelism to bound memory on shared buildkitd nodes:
+# the heavy vllm-ascend compile otherwise spawns unbounded jobs and can exhaust
+# a 128Gi node (OOM-killing kubelet). Overridable via --build-arg MAX_JOBS=N.
+ARG MAX_JOBS=32
+ARG CARGO_BUILD_JOBS=32
+ENV SOC_VERSION=$SOC_VERSION \
+    TASK_QUEUE_ENABLE=1 \
+    OMP_NUM_THREADS=1 \
+    MAX_JOBS=$MAX_JOBS \
+    CARGO_BUILD_JOBS=$CARGO_BUILD_JOBS
+COPY . /vllm-workspace/vllm-ascend/
+ARG ASCEND_INDEX_URL="https://mirrors.huaweicloud.com/ascend/repos/pypi \
+    https://mirrors.huaweicloud.com/ascend/repos/pypi/nightly"
+ARG COMPILE_CUSTOM_KERNELS=1
+RUN export PIP_EXTRA_INDEX_URL="${ASCEND_INDEX_URL}" && \
+    export VLLM_BATCH_INVARIANT=1 && \
+    source /usr/local/Ascend/ascend-toolkit/set_env.sh && \
+    source /usr/local/Ascend/nnal/atb/set_env.sh && \
+    python3 -m pip install -e /vllm-workspace/vllm-ascend/ --extra-index-url ${PYTORCH_INDEX_URL} && \
+    python3 -m pip cache purge
+
+# ===== Install FLA and flash_attn_npu =====
+ARG FLA_VERSION="26.9.1"
+ARG FLASH_ATTN_NPU_VERSION="0.5.0"
+ARG MOONCAKE_VERSION="0.3.14rc3"
+RUN source /usr/local/Ascend/ascend-toolkit/set_env.sh && \
+    source /usr/local/Ascend/nnal/atb/set_env.sh && \
+    source /usr/local/Ascend/cann/set_env.sh && \
+    export PIP_EXTRA_INDEX_URL="${ASCEND_INDEX_URL}" && \
+    # Install memfabric_hybrid kernels
+    TORCH_DEVICE_BACKEND_AUTOLOAD=0 mfcli kernel install --soc-version A2 --install-for-all && \
+    # Install flash-linear-attention-npu from the Ascend mirror
+    python3 -m pip install "flash-linear-attention-npu-a2===${FLA_VERSION}" --force-reinstall --no-deps && \
+    # Keep the CANN env and --no-build-isolation: the isolated build env lacks torch/torch_npu.
+    FLASH_ATTN_BUILD_NPU=910 python3 -m pip install --no-build-isolation "flash_attn_npu==${FLASH_ATTN_NPU_VERSION}" && \
+    # Install mooncake-transfer-engine-npu from the Ascend nightly mirror
+    python3 -m pip install "mooncake-transfer-engine-npu===${MOONCAKE_VERSION}" && \
+    python3 -m pip cache purge
+
+# Append `libascend_hal.so` path (devlib) to LD_LIBRARY_PATH
+RUN echo 'export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib' >> ~/.bashrc
+
+CMD ["/bin/bash"]
