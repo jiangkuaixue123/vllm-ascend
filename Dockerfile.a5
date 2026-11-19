@@ -42,7 +42,7 @@ ARG CARGO_BUILD_JOBS=32
 RUN --mount=type=secret,id=github_token,required=true \
     auth="$(printf 'x-access-token:%s' "$(cat /run/secrets/github_token)" | base64 | tr -d '\n')" && \
     export GIT_CONFIG_COUNT=1 \
-        GIT_CONFIG_KEY_0=http.https://github.com/.extraheader \
+        GIT_CONFIG_KEY_0=http.http://git-cdn-service.git-cdn.svc.cluster.local:8000/.extraheader \
         GIT_CONFIG_VALUE_0="AUTHORIZATION: basic ${auth}" && \
     if [ -n "$VLLM_COMMIT" ]; then \
       git init /vllm-workspace/vllm && \
