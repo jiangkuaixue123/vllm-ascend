@@ -39,20 +39,32 @@ ARG VLLM_TAG=vllm-hy4-flash
 ARG VLLM_COMMIT=""
 ARG PYTORCH_INDEX_URL="https://download.pytorch.org/whl/cpu/"
 ARG CARGO_BUILD_JOBS=32
-RUN --mount=type=secret,id=github_token,required=true \
-    auth="$(printf 'x-access-token:%s' "$(cat /run/secrets/github_token)" | base64 | tr -d '\n')" && \
-    export GIT_CONFIG_COUNT=1 \
-        GIT_CONFIG_KEY_0=http.http://git-cdn-service.git-cdn.svc.cluster.local:8000/.extraheader \
-        GIT_CONFIG_VALUE_0="AUTHORIZATION: basic ${auth}" && \
+ARG GIT_PROXY=""
+RUN --mount=type=secret,id=github_token,required=false \
+    TOKEN=$(cat /run/secrets/github_token 2>/dev/null || true); \
+    if [ -n "$GIT_PROXY" ]; then \
+        PROXY="${GIT_PROXY#https://}"; \
+        git config --global url."https://${PROXY}https://github.com/".insteadOf "https://github.com/"; \
+    fi && \
+    AUTH=""; [ -n "$TOKEN" ] && AUTH="x-access-token:${TOKEN}@"; \
+    CLONE_REPO="$VLLM_REPO"; \
+    case "$VLLM_REPO" in \
+        https://github.com/*) \
+            if [ -n "$GIT_PROXY" ] && [ -n "$AUTH" ]; then \
+                CLONE_REPO="https://${AUTH}${GIT_PROXY#https://}https://github.com/${VLLM_REPO#https://github.com/}"; \
+            fi ;; \
+    esac && \
     if [ -n "$VLLM_COMMIT" ]; then \
       git init /vllm-workspace/vllm && \
-      git -C /vllm-workspace/vllm fetch --depth 1 $VLLM_REPO "$VLLM_COMMIT" && \
+      git -C /vllm-workspace/vllm remote add origin "$CLONE_REPO" && \
+      git -C /vllm-workspace/vllm fetch --depth 1 origin "$VLLM_COMMIT" && \
       git -C /vllm-workspace/vllm checkout FETCH_HEAD; \
     else \
-      git clone --depth 1 -b $VLLM_TAG $VLLM_REPO /vllm-workspace/vllm; \
+      git clone --depth 1 -b $VLLM_TAG "$CLONE_REPO" /vllm-workspace/vllm; \
     fi && \
-    unset auth GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0 && \
-    VLLM_TARGET_DEVICE="empty" python3 -m pip install -e /vllm-workspace/vllm/[audio] --extra-index-url ${PYTORCH_INDEX_URL} && \
+    git -C /vllm-workspace/vllm remote set-url origin "$VLLM_REPO"
+
+RUN VLLM_TARGET_DEVICE="empty" python3 -m pip install -e /vllm-workspace/vllm/[audio] --extra-index-url ${PYTORCH_INDEX_URL} && \
     # In x86, triton will be installed by vllm. But in Ascend, triton doesn't work correctly. we need to uninstall it.
     python3 -m pip uninstall -y triton && \
     # The same step also builds the optional Rust frontend (vllm-rs).
