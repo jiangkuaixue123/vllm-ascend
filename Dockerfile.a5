@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1
 #
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
 #
@@ -34,19 +35,28 @@ RUN python3 -m pip install 'modelscope<1.38' 'ray>=2.47.1,<=2.48.0' 'protobuf>3.
     python3 -m pip cache purge
 
 # Install vLLM
-ARG VLLM_REPO=https://github.com/vllm-project/vllm.git
-ARG VLLM_TAG=v0.33.0
-ARG VLLM_COMMIT=""
+ARG VLLM_REPO=https://github.com/vllm-ascend/DSv4.1.git
+ARG VLLM_TAG=vllm-hy4-flash
+# Pin the paired HY4 snapshot; set VLLM_COMMIT="" to follow VLLM_TAG.
+ARG VLLM_COMMIT=478dc119f61259aefd945bd7973c164c4841093c
+ARG VLLM_BUILD_VERSION=0.33.0+hy4flash
 ARG PYTORCH_INDEX_URL="https://download.pytorch.org/whl/cpu/"
 ARG CARGO_BUILD_JOBS=32
-RUN if [ -n "$VLLM_COMMIT" ]; then \
+RUN --mount=type=secret,id=github_token,required=true \
+    auth="$(printf 'x-access-token:%s' "$(cat /run/secrets/github_token)" | base64 | tr -d '\n')" && \
+    export GIT_CONFIG_COUNT=1 \
+        GIT_CONFIG_KEY_0=http.https://github.com/.extraheader \
+        GIT_CONFIG_VALUE_0="AUTHORIZATION: basic ${auth}" && \
+    if [ -n "$VLLM_COMMIT" ]; then \
       git init /vllm-workspace/vllm && \
-      git -C /vllm-workspace/vllm fetch --depth 1 $VLLM_REPO "$VLLM_COMMIT" && \
+      git -C /vllm-workspace/vllm fetch --depth 1 "$VLLM_REPO" "$VLLM_COMMIT" && \
       git -C /vllm-workspace/vllm checkout FETCH_HEAD; \
     else \
-      git clone --depth 1 -b $VLLM_TAG $VLLM_REPO /vllm-workspace/vllm; \
-    fi && \
-    VLLM_TARGET_DEVICE="empty" python3 -m pip install -e /vllm-workspace/vllm/[audio] --extra-index-url ${PYTORCH_INDEX_URL} && \
+      git clone --depth 1 -b "$VLLM_TAG" "$VLLM_REPO" /vllm-workspace/vllm; \
+    fi
+
+RUN export VLLM_VERSION_OVERRIDE="$VLLM_BUILD_VERSION" && \
+    VLLM_TARGET_DEVICE="empty" python3 -m pip install -e "/vllm-workspace/vllm/[audio]" --extra-index-url "${PYTORCH_INDEX_URL}" && \
     # In x86, triton will be installed by vllm. But in Ascend, triton doesn't work correctly. we need to uninstall it.
     python3 -m pip uninstall -y triton && \
     # The same step also builds the optional Rust frontend (vllm-rs).
@@ -80,7 +90,9 @@ COPY . /vllm-workspace/vllm-ascend/
 ARG ASCEND_INDEX_URL="https://mirrors.huaweicloud.com/ascend/repos/pypi \
     https://mirrors.huaweicloud.com/ascend/repos/pypi/nightly"
 ARG COMPILE_CUSTOM_KERNELS=1
-RUN export PIP_EXTRA_INDEX_URL="${ASCEND_INDEX_URL}" && \
+ARG VLLM_ASCEND_BUILD_VERSION=0.33.0+hy4flash
+RUN export SETUPTOOLS_SCM_PRETEND_VERSION="$VLLM_ASCEND_BUILD_VERSION" && \
+    export PIP_EXTRA_INDEX_URL="${ASCEND_INDEX_URL}" && \
     export VLLM_BATCH_INVARIANT=1 && \
     source /usr/local/Ascend/ascend-toolkit/set_env.sh && \
     source /usr/local/Ascend/nnal/atb/set_env.sh && \
