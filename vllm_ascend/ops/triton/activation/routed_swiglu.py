@@ -50,7 +50,7 @@ def _routed_swiglu_kernel(
         rows = tl.sum(tl.load(groups + expert, expert < experts, other=0).to(tl.int32), axis=0)
     col = tl.arange(0, columns)
     for row in range(tl.program_id(0), tl.minimum(rows, capacity), tl.num_programs(0)):
-        offset = row.to(tl.int64) * width
+        offset = tl.cast(row, tl.int64) * width
         gate = tl.load(x + 2 * offset + col, col < width, other=0).to(tl.float32)
         up = tl.load(x + 2 * offset + width + col, col < width, other=0).to(tl.float32)
         # Match the BF16 rounding of the in-place clamps before npu_swiglu.
