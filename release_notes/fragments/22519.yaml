@@ -1,0 +1,8 @@
+pr: 22519
+entries:
+  - category: performance
+    text: >-
+      On Ascend A3, DeepSeek V4.1 skips unused MC2 receive rows in
+      unquantized MoE layers that use clipped SwiGLU.
+    model: DeepSeek V4.1
+    hardware: [A3]

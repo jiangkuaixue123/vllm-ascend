@@ -6,9 +6,7 @@ from vllm.triton_utils import tl, triton
 
 from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num
 
-# The smallest receive buffer measured in the A3 DSpark operator benchmark.
-_MIN_CAPACITY = 5760
-_MAX_EXPERTS = 64
+_MAX_COUNT_GROUPS = 64
 _MAX_TILE_WIDTH = 4096
 
 
@@ -17,26 +15,27 @@ def can_use_routed_swiglu(x: torch.Tensor, groups: torch.Tensor, group_list_type
         x.device.type == "npu"
         and x.dtype == torch.bfloat16
         and x.ndim == 2
-        and x.shape[0] >= _MIN_CAPACITY
+        and x.shape[0] > 0
         and 0 < x.shape[1] <= 2 * _MAX_TILE_WIDTH
         and x.shape[1] % 32 == 0  # Both BF16 halves start on a 32-byte boundary.
         and x.is_contiguous()
         and group_list_type in (0, 1)
         and groups.ndim == 1
-        and 0 < groups.numel() <= _MAX_EXPERTS
+        and groups.numel() > 0
+        and (group_list_type == 0 or groups.numel() <= _MAX_COUNT_GROUPS)
         and groups.dtype in (torch.int32, torch.int64)
         and groups.device == x.device
         and groups.is_contiguous()
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["capacity"])
 def _routed_swiglu_kernel(
     x,
     groups,
     out,
     limit: tl.constexpr,
-    capacity: tl.constexpr,
+    capacity,
     width: tl.constexpr,
     experts: tl.constexpr,
     group_block: tl.constexpr,

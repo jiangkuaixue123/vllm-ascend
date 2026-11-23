@@ -96,7 +96,6 @@ class HardwareCapability(Enum):
     # Decode native FP8 codes and E8M0 group scales in Engram table lookups.
     ENGRAM_MXFP8 = auto()
     # Node-local shared INT8 Engram tables can use the A3 Host VMM backend.
-    ROUTED_BF16_SWIGLU = auto()
     ENGRAM_LOCAL_HOST_VMM = auto()
     # Enable dynamic-MX norm fusion and the associated ``wo_a`` weight-layout contract.
     DYNAMIC_MX_QUANT_FUSION = auto()
@@ -123,6 +122,8 @@ class HardwareCapability(Enum):
     FUSED_ROTARY_MUL_INTERLEAVE = auto()
     # Pass ``glu_alpha`` and ``glu_bias`` to the fused dequant-SwiGLU-quant operator.
     FUSED_SWIGLU_TUNING_ARGS = auto()
+    # Fuse clipped BF16 SwiGLU over the valid prefix of an MC2 receive buffer.
+    ROUTED_BF16_SWIGLU = auto()
     # Select the compatibility GatedDeltaNet core and state-dtype implementation.
     GDN_COMPATIBILITY = auto()
     # Register the FX graph rewrite that fuses a supported matmul/reduce-scatter pattern.
@@ -383,10 +384,10 @@ _STANDARD_CAPABILITIES = frozenset(
     }
 )
 _A3_CAPABILITIES = _STANDARD_CAPABILITIES | {
-    HardwareCapability.ROUTED_BF16_SWIGLU,
     HardwareCapability.ENGRAM_LOCAL_HOST_VMM,
     HardwareCapability.KDA_INT8_QUANT_OVERLAP,
     HardwareCapability.NATIVE_INT8_SPARSE,
+    HardwareCapability.ROUTED_BF16_SWIGLU,
     HardwareCapability.MINIMAX_M3_GBSA_METADATA_REUSE,
     HardwareCapability.RMS_NORM_DYNAMIC_QUANT,
     HardwareCapability.MC2_FULLMESH_V2_COMM,
