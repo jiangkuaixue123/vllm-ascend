@@ -20,6 +20,7 @@ from vllm_ascend.hisparse.c8 import C8_ROW_BYTES, dequantize_c8_rows, pack_c8_co
 from vllm_ascend.models.hy_v4_flash.aclgraph import FlashAclGraphManager
 from vllm_ascend.models.hy_v4_flash.attention import AscendHYV4FlashAttention, FlashMetadataBuilder
 from vllm_ascend.models.hy_v4_flash.dfly_speculator import build_reuse_indices
+from vllm_ascend.models.hy_v4_flash.prefill_c8 import apply_attention_sink, prefill_window_indices
 
 
 def test_gpu_c8_scale_packs_per_tile_fp8_and_preserves_rope():
@@ -286,3 +287,23 @@ def test_ihc_rms_uses_global_query_boundaries_on_sequence_shards(monkeypatch):
     expected = (torch.cat(means) + eps).rsqrt()
     shards = [ihc._inverse_rms(shard, eps, rank * 2) for rank, shard in enumerate(rows.split(2))]
     torch.testing.assert_close(torch.cat(shards), expected, rtol=0, atol=0)
+
+
+def test_prefill_window_indices_keep_causal_rows_in_order():
+    logical = torch.tensor([0, 1, 3, 4, 9], dtype=torch.int32)
+    offsets = torch.arange(4, dtype=torch.int32)
+    actual = prefill_window_indices(logical, offsets, 4)
+    expected = torch.tensor([[0, -1, -1, -1], [0, 1, -1, -1], [0, 1, 2, 3], [1, 2, 3, 4], [6, 7, 8, 9]])
+    torch.testing.assert_close(actual, expected.to(torch.int32))
+
+
+def test_c8_prefill_renormalization_matches_explicit_sink():
+    logits = torch.tensor([[[7.0, 0.0, -3.0], [1.0, 3.0, 6.0]], [[-3.0, -1.0, 2.0], [1.0, 2.0, 1.0]]])
+    values = torch.tensor([[0.1, 2.0], [1.9, 3.0], [-3.2, 4.0]])
+    sink = torch.tensor([7.0, -1.0])
+    maximum = logits.amax(-1)
+    total = (logits - maximum.unsqueeze(-1)).exp().sum(-1)
+    context = logits.softmax(-1) @ values
+    logits_with_sink = torch.cat((logits, sink.expand(logits.shape[0], -1).unsqueeze(-1)), dim=-1)
+    expected = logits_with_sink.softmax(-1)[..., :-1] @ values
+    torch.testing.assert_close(apply_attention_sink(context, maximum, total, sink), expected)

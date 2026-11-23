@@ -50,6 +50,14 @@ from .index_pool_fp8 import encode_indexpool_fp8
 from .index_pool_select import select_paged_pool
 from .mla_prolog import CANNBotBf16MlaProlog
 from .output_gate import gate_dynamic_mx_quant
+from .prefill_c8 import (
+    C8_QUERY_DIM,
+    INDEX_SCORE_QUERY_BATCH,
+    MIN_FUSED_PREFILL_QUERIES,
+    WINDOW_QUERY_BATCH,
+    attend_packed_c8,
+    prefill_window_indices,
+)
 
 logger = init_logger(__name__)
 
@@ -97,6 +105,7 @@ class FlashAttentionMetadata:
     slot_mapping: torch.Tensor
     precise_decode_reqs: tuple[bool, ...] = ()
     decode_seq_lens: torch.Tensor | None = None
+    prefill_reqs: tuple[bool, ...] = ()
 
 
 def get_flash_attention_metadata() -> FlashAttentionMetadata | None:
@@ -117,15 +126,16 @@ class FlashMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetadata]):
     def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
         meta = common_attn_metadata
         query_starts = tuple(meta.query_start_loc_cpu[: meta.num_reqs + 1].tolist())
-        precise_decode_reqs = ()
-        if self.precise_decode and meta.is_prefilling is not None:
-            precise_decode_reqs = tuple(not prefill for prefill in meta.is_prefilling[: meta.num_reqs].tolist())
+        is_prefilling = getattr(meta, "is_prefilling", None)
+        prefill_reqs = tuple(is_prefilling[: meta.num_reqs].tolist()) if is_prefilling is not None else ()
+        precise_decode_reqs = tuple(not prefill for prefill in prefill_reqs) if self.precise_decode else ()
         return FlashAttentionMetadata(
             query_starts,
             tuple(meta.seq_lens_cpu[: meta.num_reqs].tolist()),
             meta.block_table_tensor,
             meta.slot_mapping,
             precise_decode_reqs,
+            prefill_reqs=prefill_reqs,
         )
 
     def build_for_cudagraph_capture(self, common_attn_metadata):
@@ -270,6 +280,9 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
         if self.use_gpu_c8_scale and not self.use_fp8_cache:
             raise ValueError("hy4flash_gpu_c8_scale requires --kv-cache-dtype fp8")
         use_a5_c8 = HAS_TRITON and self.use_fp8_cache and get_ascend_device_type() is AscendDeviceType.A5
+        self.fuse_c8_prefill = (
+            use_a5_c8 and not reuse_target and vllm_config.additional_config.get("hy4flash_fuse_c8_prefill", True)
+        )
         self.fuse_c8_write = use_a5_c8 and vllm_config.additional_config.get("hy4flash_fuse_c8_write", True)
         self.fuse_c8_qk = (
             use_a5_c8
@@ -618,6 +631,31 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
                     raw_keys, key_pos = self._read_index_rows(
                         cache, meta.block_table[i], block_size, history, positions.ndim
                     )
+            if (
+                self.fuse_c8_prefill
+                and meta.prefill_reqs
+                and meta.prefill_reqs[i]
+                and num_queries >= MIN_FUSED_PREFILL_QUERIES
+                and query.device.type == "npu"
+                and query.dtype == torch.bfloat16
+                and query.shape[-1] == C8_QUERY_DIM
+                and (not may_score_groups or pooled_history is not None)
+                and hasattr(torch.ops._C_ascend, "npu_kv_quant_sparse_flash_attention_vllm")
+            ):
+                self._attend_prefill_c8(
+                    cache,
+                    meta.block_table[i],
+                    block_size,
+                    seq_len,
+                    query[start:stop],
+                    wv,
+                    out[start:stop],
+                    pooled_history,
+                    index_query[start:stop] if may_score_groups else None,
+                    index_weight[start:stop] if may_score_groups else None,
+                    snapshot[start:stop] if snapshot is not None else None,
+                )
+                continue
             history_start = max(0, seq_len - (stop - start) + 1 - self.window) if self.indexer is None else 0
             shared_kv = None
             if verify and (
@@ -709,6 +747,45 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
                 if snapshot is not None:
                     snapshot[start:stop, : selected.shape[-1]].copy_(selected)
                 self._attend_decoded(query[start:stop], selected, kv_selected, wv, out[start:stop], split_pv=True)
+
+    def _attend_prefill_c8(
+        self, cache, table, block_size, seq_len, query, wv, out, pool, index_query, index_weight, snapshot
+    ):
+        first_query = seq_len - query.shape[0]
+        is_window = self.indexer is None
+        history_start = max(0, first_query - self.window + 1) if is_window else 0
+        history = torch.arange(history_start, seq_len, device=query.device)
+        packed = self._gather(cache, table, block_size, history, slice(0, C8_ROW_BYTES))
+        logical = torch.arange(first_query, seq_len, dtype=torch.int32, device=query.device)
+        width = self.window if is_window else (self.indexer.budget + 1) * self.indexer.ratio
+        offsets = torch.arange(width, dtype=torch.int32, device=query.device)
+        batch = WINDOW_QUERY_BATCH if is_window else INDEX_SCORE_QUERY_BATCH
+        # When all completed groups fit, the selected tokens are the full causal prefix.
+        dense_queries = query.shape[0]
+        if pool is not None:
+            dense_queries = min(dense_queries, max(0, self.indexer.budget * self.indexer.ratio - first_query))
+        for begin, end, score in ((0, dense_queries, False), (dense_queries, query.shape[0], True)):
+            for lo in range(begin, end, batch):
+                hi = min(end, lo + batch)
+                positions = logical[lo:hi]
+                if is_window:
+                    selected = prefill_window_indices(positions - history_start, offsets, self.window)
+                elif score:
+                    selected = sparse_candidates(
+                        index_query[lo:hi],
+                        index_weight[lo:hi],
+                        pool,
+                        positions,
+                        self.indexer.ratio,
+                        self.indexer.budget,
+                    )
+                else:
+                    selected = offsets.expand(hi - lo, -1).masked_fill(offsets > positions[:, None], -1)
+                if snapshot is not None:
+                    snapshot[lo:hi, : selected.shape[-1]].copy_(selected)
+                context = attend_packed_c8(query[lo:hi], packed, selected, self.learnable_sink_param, self.scale)
+                out[lo:hi].copy_(_head_bmm(context, wv).reshape_as(out[lo:hi]))
+        logger.info_once("HYV4 Flash uses the native C8 sparse attention operator for prefill.")
 
     def _forward_decode_graph(self, meta, cache, block_size, hidden, q_c, positions, query, wv, out):
         seq_lens = meta.decode_seq_lens
