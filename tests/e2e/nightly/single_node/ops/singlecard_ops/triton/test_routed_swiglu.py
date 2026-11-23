@@ -15,17 +15,18 @@ pytestmark = pytest.mark.skipif(
 
 
 @pytest.mark.parametrize("group_list_type", [0, 1])
-@pytest.mark.parametrize("active", [0, 864, 5760])
-def test_routed_swiglu(group_list_type, active):
-    capacity, width = 5760, 96
+@pytest.mark.parametrize(("capacity", "active"), [(128, 0), (128, 47), (5760, 864), (5760, 5760)])
+def test_routed_swiglu(group_list_type, capacity, active):
+    width = 2304
     limit = 3.3
     init_device_properties_triton()
     x = torch.randn(capacity, 2 * width, device="npu", dtype=torch.bfloat16) * 5
-    groups = torch.tensor([active // 2, 0, active - active // 2], dtype=torch.int64, device="npu")
+    empty_experts = 63 if group_list_type == 0 else 1
+    groups = torch.tensor([active // 2, *([0] * empty_experts), active - active // 2], dtype=torch.int64, device="npu")
     if group_list_type == 0:
         groups = groups.cumsum(0)
     assert can_use_routed_swiglu(x, groups, group_list_type)
-    assert not can_use_routed_swiglu(x[:-1], groups, group_list_type)
+    assert not can_use_routed_swiglu(x[:0], groups, group_list_type)
     gate, up = x.chunk(2, dim=-1)
     expected = torch_npu.npu_swiglu(torch.cat([gate.clamp(max=limit), up.clamp(-limit, limit)], dim=-1))
     actual = routed_swiglu(x, groups, group_list_type, limit)
@@ -46,3 +47,32 @@ def test_routed_swiglu(group_list_type, active):
         triton.next_power_of_2(width),
     )
     assert out[active:].isnan().all()
+
+
+def test_routed_swiglu_gmm2_graph_replay():
+    capacity, width = 128, 2304
+    init_device_properties_triton()
+    x = torch.randn(capacity, 2 * width, device="npu", dtype=torch.bfloat16)
+    weight = torch.randn(2, width, 32, device="npu", dtype=torch.bfloat16)
+    groups = torch.tensor([capacity // 2, capacity], dtype=torch.int64, device="npu")
+
+    def run():
+        return torch_npu.npu_grouped_matmul(
+            x=[routed_swiglu(x, groups, 0, 10.0)],
+            weight=[weight],
+            group_list=groups,
+            group_list_type=0,
+            group_type=0,
+            split_item=2,
+        )[0]
+
+    run()
+    torch.npu.synchronize()
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph):
+        captured = run()
+
+    for active in (47, capacity):
+        groups.copy_(torch.tensor([active // 2, active], dtype=groups.dtype, device=groups.device))
+        graph.replay()
+        torch.testing.assert_close(captured[:active], run()[:active], rtol=0, atol=0)

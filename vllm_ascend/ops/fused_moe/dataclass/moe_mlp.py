@@ -60,6 +60,7 @@ class MoEMlpComputeInput:
     topk_ids: torch.Tensor | None = None
     # Optional per-layer MoE LoRA state, propagated from MoEFusedExpertsInput.
     lora_context: Any = None
+    # Ordinary MC2 groups describe a valid prefix that is also used by GMM2.
     has_mc2_dispatch_capacity: bool = False
 
 
