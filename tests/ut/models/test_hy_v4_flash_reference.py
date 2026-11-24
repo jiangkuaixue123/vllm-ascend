@@ -457,3 +457,29 @@ def test_resident_pool_invalidation_preserves_captured_storage():
     pool.invalidate()
     torch.testing.assert_close(pool.physical, torch.full_like(pool.physical, -1))
     assert addresses == (pool.physical.data_ptr(), pool.keys.data_ptr())
+
+
+def test_draft_projection_sum_preserves_wide_and_non_bf16_reductions():
+    from types import SimpleNamespace
+    from unittest.mock import Mock, PropertyMock, patch
+
+    from vllm_ascend.models.hy_v4_flash.draft_projection_reduce import DraftRowParallelOp
+
+    transport = Mock()
+    transport.all_reduce.side_effect = lambda x: x + 2
+    op = object.__new__(DraftRowParallelOp)
+    op.rows = 6
+    op.layer = None
+    op.quant_method = SimpleNamespace(apply=lambda layer, x, bias: x)
+    op.reducer = SimpleNamespace(reduce=lambda x: x + 1)
+    with patch.object(DraftRowParallelOp, "comm_group", new_callable=PropertyMock, return_value=transport):
+        for shape, dtype, increment in [
+            ((6, 3072), torch.bfloat16, 1),
+            ((12, 3072), torch.bfloat16, 2),
+            ((6, 3072), torch.float32, 2),
+            ((6, 128), torch.bfloat16, 2),
+        ]:
+            x = torch.zeros(shape, dtype=dtype)
+            out, bias = op.apply_impl(x)
+            assert bias is None
+            torch.testing.assert_close(out, x + increment)

@@ -17,6 +17,7 @@ from vllm.v1.worker.gpu.cudagraph_utils import CudaGraphManager
 from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
 
 from .dfly import CHECKPOINT_PREFIX, MODEL_PREFIX, FlashDFlyDraft
+from .draft_projection_reduce import configure_draft_sums
 
 
 def build_reuse_indices(target_rows, anchor, width, window, active):
@@ -79,6 +80,14 @@ class FlashDFlySpeculator(DraftModelSpeculator):
             loader.load_weights(draft, self.draft_model_config)
             process_weights_after_loading(draft, self.draft_model_config, self.device)
         self.target = getattr(target_model, "language_model", target_model)
+        copy_group = getattr(self.target.model, "copy_group", None)
+        if (
+            copy_group is not None
+            and self.num_speculative_steps == 5
+            and self.vllm_config.additional_config.get("hy4flash_draft_projection_sums", False)
+        ):
+            with set_current_vllm_config(config):
+                configure_draft_sums(draft, copy_group)
         target_layers = self.target.model.layers
         self.index_layers = tuple(target_layers[i].self_attn for i in draft.config.target_index_layer)
         self.kv_layers = tuple(target_layers[i].self_attn for i in draft.config.target_kv_layers)
