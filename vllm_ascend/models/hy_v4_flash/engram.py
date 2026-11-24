@@ -18,6 +18,17 @@ from vllm.logger import logger
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.models.hy_v4_flash.reference import decode_e4m3fn, hash_ngrams
+from vllm.triton_utils import HAS_TRITON
+
+from vllm_ascend.device.device_config import get_ascend_device_type
+from vllm_ascend.device.hardware import AscendDeviceType
+
+from .feature_channels import normalized_channel_products
+
+_FEATURE_CHANNELS = 4
+_FEATURE_HIDDEN_SIZE = 3072
+_FEATURE_VERIFY_TOKENS = 6
+_FEATURE_NORM_EPS = torch.finfo(torch.float32).eps
 
 
 class FlashEngramLayout:
@@ -330,9 +341,53 @@ class FlashEngram(nn.Module):
         self.start = self.multi_head_embedding.head_start * layout.head_dim
         self.stop = self.multi_head_embedding.head_end * layout.head_dim
         self.rank = get_tensor_model_parallel_rank()
+        self.pack_feature_channels = (
+            vllm_config.additional_config.get("hy4flash_pack_feature_channels", False)
+            and HAS_TRITON
+            and storage.cpu_offload
+            and self.multi_head_embedding.tp_size == 8
+            and (self.hc_mult, self.hidden_size) == (_FEATURE_CHANNELS, _FEATURE_HIDDEN_SIZE)
+            and vllm_config.model_config.dtype == torch.bfloat16
+            and get_ascend_device_type() is AscendDeviceType.A5
+        )
+        for name in ("channel_weights", "channel_biases", "key_gammas", "query_gammas", "channel_scales"):
+            self.register_buffer(name, None, persistent=False)
         for projection in [self.value_proj, *self.key_projs]:
             set_weight_attrs(projection.weight, {"weight_loader": self._load_projection})
             set_weight_attrs(projection.bias, {"weight_loader": self._load_bias})
+
+    @torch.no_grad()
+    def process_weights_after_loading(self):
+        if not self.pack_feature_channels or self.value_proj.weight.device.type != "npu":
+            return
+        projections = (*self.key_projs, self.value_proj)
+        parameters = {
+            "channel_weights": [p.weight for p in projections],
+            "channel_biases": [p.bias for p in projections],
+            "key_gammas": [norm.weight for norm in self.norm_key],
+            "query_gammas": [norm.weight for norm in self.norm_query],
+            "channel_scales": list(self.unified_per_hc_scales),
+        }
+        # A captured graph uses the same buffers when checkpoint parameters are reloaded.
+        for name, parts in parameters.items():
+            current = getattr(self, name)
+            if current is None:
+                setattr(self, name, torch.stack(parts))
+            else:
+                torch.stack(parts, out=current)
+
+    def _mix_feature_channels(self, x, hidden, hashes):
+        projected = nn.functional.linear(x, self.channel_weights.flatten(0, 1), self.channel_biases.flatten())
+        projected = tensor_model_parallel_all_reduce(projected).view(x.shape[0], self.hc_mult + 1, self.hidden_size)
+        products = normalized_channel_products(projected, hidden, self.key_gammas, self.query_gammas)
+        dots = products.sum(-1) * self.hidden_size**-0.5
+        gates = (dots.abs().clamp_min(1e-6).sqrt() * dots.sign()).sigmoid()
+        value = projected[:, -1].float()
+        signal = (self.unified_pre_gamma.float() * value) * (
+            value.square().mean(-1, keepdim=True) + _FEATURE_NORM_EPS
+        ).rsqrt()
+        update = ((gates.float().unsqueeze(-1) + self.channel_scales) * signal.unsqueeze(1)).to(hidden.dtype)
+        return hidden + update.masked_fill((hashes < 0).all(-1)[:, None, None], 0)
 
     def _load_projection(self, parameter, value):
         if value.shape != (self.hidden_size, self.total_width):
@@ -351,6 +406,15 @@ class FlashEngram(nn.Module):
         x = rows.masked_fill(local_hashes.unsqueeze(-1) < 0, 0)
         x = (x * (x.square().mean(-1, keepdim=True) + eps).rsqrt() * gamma).to(hidden.dtype)
         x = x.flatten(1)
+        if (
+            self.channel_weights is not None
+            and hidden.shape == (_FEATURE_VERIFY_TOKENS, _FEATURE_CHANNELS, _FEATURE_HIDDEN_SIZE)
+            and hidden.device.type == "npu"
+            and hidden.dtype == x.dtype == self.channel_weights.dtype == torch.bfloat16
+            and hidden.is_contiguous()
+        ):
+            logger.info_once("HYV4 Flash groups the four feature keys and their value in a single TP reduction.")
+            return self._mix_feature_channels(x, hidden, hashes)
         gates = []
         for channel in range(self.hc_mult):
             key = self.key_projs[channel](x)
