@@ -45,6 +45,7 @@ from vllm_ascend.utils import attention_calculation_stream, npu_stream_switch
 from .attention_logits import build_mla_logits
 from .c8_read import gather_c8_qk, gather_c8_rows
 from .c8_write import write_c8_rows
+from .decode_layout import VerificationLayout, decode_positions, dense_candidates, pool_update_positions, window_history
 from .index_pool_cache import copy_pool_keys
 from .index_pool_fp8 import encode_indexpool_fp8
 from .index_pool_select import select_paged_pool
@@ -278,6 +279,9 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
         if self.use_gpu_c8_scale and not self.use_fp8_cache:
             raise ValueError("hy4flash_gpu_c8_scale requires --kv-cache-dtype fp8")
         use_a5_c8 = HAS_TRITON and self.use_fp8_cache and get_ascend_device_type() is AscendDeviceType.A5
+        self.share_verify_layout = (
+            use_a5_c8 and not reuse_target and vllm_config.additional_config.get("hy4flash_share_verify_layout", False)
+        )
         self.native_sparse_c8_verify = (
             use_a5_c8
             and not reuse_target
@@ -794,10 +798,13 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
         seq_lens = meta.decode_seq_lens
         num_tokens = query.shape[0]
         num_queries = num_tokens // seq_lens.shape[0]
-        live = meta.slot_mapping[:num_tokens].view(-1, num_queries) >= 0
-        seq_lens = seq_lens.long().masked_fill(~live[:, 0], 0)
-        offsets = torch.arange(num_queries, device=query.device)
-        logical = (seq_lens[:, None] - num_queries + offsets).masked_fill(~live, -1)
+        layout = None
+        if self.share_verify_layout and seq_lens.shape[0] == 1:
+            logger.info_once("HYV4 Flash shares single-request decode positions across target layers.")
+            layout = VerificationLayout.for_forward(get_forward_context(), meta, num_queries)
+            seq_lens, live, logical = layout.seq_lens, layout.live, layout.logical
+        else:
+            seq_lens, live, logical = decode_positions(seq_lens, meta.slot_mapping[:num_tokens], num_queries)
         snapshot = self.topk_snapshot
         window = min(self.window, self.max_model_len)
         shared_positions = None
@@ -809,10 +816,9 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
             and cache.shape[-1] % torch.int32.itemsize == 0
         ):
             # The union of consecutive windows has window + num_queries - 1 rows.
-            history_offsets = torch.arange(1 - window - num_queries, 0, device=query.device)
-            shared_positions = seq_lens[:, None] + history_offsets
-            # Slot padding can also occur at the tail of an otherwise live request.
-            shared_positions.masked_fill_(shared_positions > logical.amax(dim=1, keepdim=True), -1)
+            shared_positions = (
+                layout.get_window_history(window) if layout is not None else window_history(seq_lens, logical, window)
+            )
 
         score_groups = self.indexer is not None and self.max_model_len > (self.indexer.budget + 1) * self.indexer.ratio
         use_paged_pool = False
@@ -837,10 +843,17 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
             table = meta.block_table[request]
             visible = logical[request]
             if self.indexer is None:
-                selected = window_candidates(visible, window)
+                selected = (
+                    layout.get_window_candidates(window) if layout is not None else window_candidates(visible, window)
+                )
             else:
                 if self.incremental_index_pool:
-                    self._update_decode_pool(cache, table, block_size, seq_lens[request], num_queries, positions.ndim)
+                    update = (
+                        layout.pool_update(self.indexer.ratio)
+                        if layout is not None
+                        else pool_update_positions(seq_lens[request], num_queries, self.indexer.ratio)
+                    )
+                    self._update_decode_pool(cache, table, block_size, update, positions.ndim)
                 if score_groups:
                     ratio = self.indexer.ratio
                     if use_paged_pool:
@@ -861,10 +874,14 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
                         selected = sparse_candidates(
                             index_query[start:stop], index_weight[start:stop], pool, visible, ratio, self.indexer.budget
                         )
-                    dense = self._dense_decode_candidates(visible, selected.shape[-1])
-                    selected = torch.where((visible // ratio > self.indexer.budget)[:, None], selected, dense)
+                    if layout is not None:
+                        dense, recall = layout.dense_prefix(selected.shape[-1], ratio, self.indexer.budget)
+                    else:
+                        dense = dense_candidates(visible, selected.shape[-1])
+                        recall = (visible // ratio > self.indexer.budget)[:, None]
+                    selected = torch.where(recall, selected, dense)
                 else:
-                    selected = self._dense_decode_candidates(visible, self.max_model_len)
+                    selected = dense_candidates(visible, self.max_model_len)
             if snapshot is not None:
                 snapshot[start:stop, : selected.shape[-1]].copy_(selected)
             split_pv = (
@@ -921,22 +938,11 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
         context = attend_packed_c8(query, packed, candidates, self.learnable_sink_param, self.scale)
         return context.masked_fill_((visible < 0)[:, None, None], 0)
 
-    @staticmethod
-    def _dense_decode_candidates(visible, width):
-        history = torch.arange(width, device=visible.device).expand(visible.shape[0], -1)
-        return history.masked_fill(history > visible[:, None], -1)
-
-    def _update_decode_pool(self, cache, table, block_size, seq_len, num_queries, position_ndim):
-        ratio = self.indexer.ratio
-        first = (seq_len - num_queries).clamp_min(0) // ratio
-        end = seq_len // ratio
-        # A width-q decode can close at most ceil(q / ratio) groups.
-        width = ((num_queries + ratio - 1) // ratio) * ratio
-        history = first * ratio + torch.arange(width, device=seq_len.device)
-        history = history.masked_fill(history >= end * ratio, 0)
+    def _update_decode_pool(self, cache, table, block_size, update, position_ndim):
+        first, end, history = update
         raw, key_pos = self._read_index_rows(cache, table, block_size, history, position_ndim)
         keys = self.indexer.encode_keys(raw, key_pos, full_graph=True)
-        copy_pool_keys(cache, table, keys, first, block_size, ratio, write=True, end_group=end)
+        copy_pool_keys(cache, table, keys, first, block_size, self.indexer.ratio, write=True, end_group=end)
 
     def _read_decode_pool(self, cache, table, block_size, seq_len, position_ndim):
         ratio = self.indexer.ratio
