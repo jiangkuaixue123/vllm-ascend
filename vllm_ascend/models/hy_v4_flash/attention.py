@@ -72,6 +72,7 @@ from .index_pool_select import (
 )
 from .layer_recall import paired_recall_layer, recall_rows_for_forward
 from .mla_prolog import CANNBotBf16MlaProlog
+from .ordered_verification_scatter import rank_ordered_scatter, supports_ordered_scatter
 from .output_gate import gate_dynamic_mx_quant
 from .packed_query import ACL_FORMAT_ND, MLAAbsorptionWeights, kv_b_weight_views, pack_rotary_query
 from .prefill_c8 import (
@@ -492,6 +493,8 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
             heads * self.v_dim, hidden, bias=False, quant_config=quant, prefix=f"{prefix}.o_proj"
         )
         self.sequence_parallel_output = False
+        self.ordered_scatter_group = None
+        self.ordered_scatter_rank = 0
         rope_parameters = config.rope_for_layer(layer_idx)
         self.rotary_emb = get_rope(
             self.rope_dim,
@@ -689,7 +692,16 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
                 gate = gate.sigmoid()
             output = self.o_proj(out * gate)[0]
         if self.sequence_parallel_output:
-            output = sp_reduce_scatter(output)
+            if (
+                self.ordered_scatter_group is not None
+                and full_decode
+                and meta.decode_seq_lens.numel() == 1
+                and supports_ordered_scatter(output)
+            ):
+                output = rank_ordered_scatter(output, self.ordered_scatter_group, self.ordered_scatter_rank)
+                logger.info_once("HYV4 Flash reduces verification rows in the checked BF16 rank order.")
+            else:
+                output = sp_reduce_scatter(output)
         return self.post_proj_norm(output) if self.post_proj_norm is not None else output
 
     def _forward_paged(

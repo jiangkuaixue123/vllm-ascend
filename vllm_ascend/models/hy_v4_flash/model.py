@@ -19,6 +19,7 @@ from .engram import FlashEngram, FlashNgramHashState
 from .ihc import FlashHCHeadLayer, FlashHCLayer
 from .local_vocabulary import LocalVocabulary
 from .moe import AscendFlashMoE
+from .ordered_verification_scatter import matches_native_scatter
 
 FLASHCOMM_950_PEER_BYTES = 768 * 1024
 
@@ -192,6 +193,13 @@ class AscendHYV4FlashModel(HYV4FlashModel):
             self.copy_group = tp.device_communicator.enable_ccu_copy_group(tp.ranks)
             for layer in self.layers:
                 layer.copy_group = self.copy_group
+            if vllm_config.additional_config.get("hy4flash_ordered_verify_scatter", False) and matches_native_scatter(
+                tp, self.copy_group
+            ):
+                for layer in self.layers:
+                    if layer.sequence_parallel:
+                        layer.self_attn.ordered_scatter_group = self.copy_group
+                        layer.self_attn.ordered_scatter_rank = tp.rank_in_group
         self.uses_dfly = vllm_config.speculative_config is not None
         self.local_vocabulary = None
 

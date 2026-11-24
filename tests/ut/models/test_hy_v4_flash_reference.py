@@ -434,3 +434,13 @@ def test_copy_only_group_preserves_rank_order_and_fallback(monkeypatch):
     assert model.gather_verify_rows(other, group) is other
     assert gathers == [group, group]
     assert fallback.call_count == 4
+
+
+def test_ordered_scatter_requires_six_contiguous_bf16_rows():
+    from vllm_ascend.models.hy_v4_flash.ordered_verification_scatter import supports_ordered_scatter
+
+    rows = torch.zeros(6, 3072, dtype=torch.bfloat16)
+    assert supports_ordered_scatter(rows)
+    assert not supports_ordered_scatter(rows[:1])
+    assert not supports_ordered_scatter(rows.float())
+    assert not supports_ordered_scatter(torch.empty(3072, 6, dtype=torch.bfloat16).T)
