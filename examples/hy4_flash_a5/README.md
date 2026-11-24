@@ -39,5 +39,6 @@ The recipe reserves 131,584 positions for requests with 130,048 input and 1,024 
 | `hy4flash_fuse_indexpool_rotate_encode` | Encodes short rotated IndexPool queries and keys in one Hadamard and E4M3 rounding kernel, using scale boundaries obtained on the device. |
 | `hy4flash_pack_window_operands` | Writes the contiguous FP32 key and value operands for six sliding-window queries while decoding their shared C8 rows. |
 | `hy4flash_pack_mla_query` | Prepares MLA projection weights during loading and writes the absorbed six-row verification query with its interleaved rotary components. Uses about 134.8 MiB per rank for this TP8 checkpoint. |
+| `hy4flash_batch_host_lookup` | Transfers the hash indices for four CPU-resident Engram tables together during single-request, six-token verification. Each table supplies its trained BF16 rows to the captured graph. |
 
 The fixed-length test measures one client request at a time. Each reported TPOT divides the elapsed time between its first and last generated-token events by 1,023. The reported P50 is the median across twenty distinct requests. The accuracy run uses all thirty AIME2026 questions at concurrency sixteen. [Per-request timings and hardware results](https://github.com/InferMatrixLab/InferRSI/issues/613)

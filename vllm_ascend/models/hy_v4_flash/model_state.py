@@ -3,12 +3,17 @@
 
 import torch
 from vllm.config import CUDAGraphMode
+from vllm.logger import logger
 from vllm.triton_utils import triton
 
+from vllm_ascend.device.device_config import get_ascend_device_type
+from vllm_ascend.device.hardware import AscendDeviceType
 from vllm_ascend.ops.triton.engram_lookback import _gather_lookback_kernel
 from vllm_ascend.worker.v2.model_states.default import AscendModelState
 
 from .aclgraph import FlashAclGraphManager
+
+_SINGLE_VERIFY_TOKENS = 6
 
 
 class FlashModelState(AscendModelState):
@@ -18,6 +23,10 @@ class FlashModelState(AscendModelState):
         super().__init__(vllm_config, model, encoder_cache, device)
         self._graph_decode = False
         self._graph_hashes = None
+        self._batch_host_lookup = (
+            vllm_config.additional_config.get("hy4flash_batch_host_lookup", False)
+            and get_ascend_device_type() is AscendDeviceType.A5
+        )
         if model.token_lookback_depth and vllm_config.compilation_config.cudagraph_mode.has_full_cudagraphs():
             self._flash_model = getattr(model, "language_model", model).model
             engram = self._flash_model.engram_hash
@@ -55,6 +64,27 @@ class FlashModelState(AscendModelState):
             )
         }
 
+    def _prepare_lookup_rows(self, hashes, rows, num_reqs):
+        lookup = hashes
+        if (
+            self._batch_host_lookup
+            and num_reqs == 1
+            and hashes.shape[1] == _SINGLE_VERIFY_TOKENS
+            and all(
+                table.cpu_offload
+                and not table.fp8
+                and table.embedding.weight.device.type == "cpu"
+                and table.embedding.weight.dtype == torch.bfloat16
+                for table in self._engram_embeddings
+            )
+        ):
+            # The four CPU tables consume slices of the same device tensor.
+            # Transfer that tensor once before selecting each rank's trained rows.
+            lookup = hashes.cpu()
+            logger.info_once("HYV4 Flash transfers the verification hashes to the CPU tables together.")
+        for i, (table, output) in enumerate(zip(self._engram_embeddings, rows)):
+            output.copy_(table(lookup[i]))
+
     def prepare_engram_inputs(self, input_batch, req_states):
         depth = self.model.token_lookback_depth
         if depth == 0:
@@ -89,7 +119,6 @@ class FlashModelState(AscendModelState):
                     input_batch.query_start_loc_np[: input_batch.num_reqs + 1],
                     hashes,
                 )
-                for i, (embedding, output) in enumerate(zip(self._engram_embeddings, rows)):
-                    output.copy_(embedding(hashes[i]))
+                self._prepare_lookup_rows(hashes, rows, input_batch.num_reqs_after_padding)
             return inputs
         return {"lookback_token_ids": history}

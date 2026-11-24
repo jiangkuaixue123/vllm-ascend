@@ -1987,6 +1987,7 @@ def init_ascend_config(vllm_config: VllmConfig) -> AscendConfig:
         "enable_flashcomm1",
         # Consumed by the HYV4 Flash model and its attention metadata builder.
         "hy4flash_batch_verify_attention",
+        "hy4flash_batch_host_lookup",
         "hy4flash_cannbot_mla_prolog",
         "hy4flash_fuse_attn_output_gate",
         "hy4flash_fuse_c8_qk",
