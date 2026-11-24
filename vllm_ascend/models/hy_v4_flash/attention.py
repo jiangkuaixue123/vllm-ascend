@@ -278,6 +278,11 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
         if self.use_gpu_c8_scale and not self.use_fp8_cache:
             raise ValueError("hy4flash_gpu_c8_scale requires --kv-cache-dtype fp8")
         use_a5_c8 = HAS_TRITON and self.use_fp8_cache and get_ascend_device_type() is AscendDeviceType.A5
+        self.native_sparse_c8_verify = (
+            use_a5_c8
+            and not reuse_target
+            and vllm_config.additional_config.get("hy4flash_native_sparse_c8_verify", False)
+        )
         self.fuse_c8_prefill = (
             use_a5_c8 and not reuse_target and vllm_config.additional_config.get("hy4flash_fuse_c8_prefill", True)
         )
@@ -868,6 +873,18 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
                 and (self.local_heads, selected.shape[-1]) == BATCH_VERIFY_SPARSE_SHAPE
             )
             q = query[start:stop]
+            if (
+                self.native_sparse_c8_verify
+                and self.indexer is not None
+                and seq_lens.shape[0] == 1
+                and num_queries == BATCH_VERIFY_MAX_QUERIES
+                and split_pv
+                and q.dtype == torch.bfloat16
+            ):
+                context = self._attend_sparse_verify_c8(q, cache, table, block_size, selected, visible)
+                out[start:stop].copy_(_head_bmm(context, wv).reshape_as(out[start:stop]))
+                logger.info_once("HYV4 Flash uses native C8 sparse attention for single-request verification.")
+                continue
             scores = None
             if (
                 self.indexer is not None
@@ -893,6 +910,16 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
         if shared_positions is not None:
             # Inactive queries may overlap live KV rows in the unfolded view.
             out[:num_tokens].masked_fill_(~live.reshape(-1, 1), 0)
+
+    def _attend_sparse_verify_c8(self, query, cache, table, block_size, selected, visible):
+        # Pack each query's recalled rows contiguously. The native operator
+        # addresses the joined buffer and uses -1 to skip padded candidates.
+        history = selected.flatten()
+        packed = self._gather(cache, table, block_size, history.clamp_min(0), slice(0, C8_ROW_BYTES))
+        offsets = torch.arange(history.numel(), device=query.device, dtype=torch.int32).view_as(selected)
+        candidates = offsets.masked_fill(selected < 0, -1)
+        context = attend_packed_c8(query, packed, candidates, self.learnable_sink_param, self.scale)
+        return context.masked_fill_((visible < 0)[:, None, None], 0)
 
     @staticmethod
     def _dense_decode_candidates(visible, width):

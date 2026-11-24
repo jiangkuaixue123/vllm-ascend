@@ -1,3 +1,12 @@
 {
-  "--max-model-len": "131584"
+  "--max-model-len": "131584",
+  "--additional-config": {
+    "enable_flashcomm1": true,
+    "enable_shared_expert_dp": true,
+    "multistream_overlap_shared_expert": true,
+    "ascend_compilation_config": {
+      "enable_npugraph_ex": true
+    },
+    "hy4flash_native_sparse_c8_verify": true
+  }
 }
