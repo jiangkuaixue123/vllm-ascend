@@ -7,6 +7,7 @@
     "ascend_compilation_config": {
       "enable_npugraph_ex": true
     },
-    "hy4flash_native_sparse_c8_verify": true
+    "hy4flash_native_sparse_c8_verify": true,
+    "hy4flash_fuse_ihc_pre": true
   }
 }

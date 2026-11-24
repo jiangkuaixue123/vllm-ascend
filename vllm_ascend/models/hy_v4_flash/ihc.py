@@ -2,11 +2,23 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import torch
+from vllm.config import get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_rank
+from vllm.logger import logger
 from vllm.models.hy_v4.nvidia.hc import HYV4HCHeadLayer, HYV4HCLayer, HYV4HCPreLayer
+from vllm.models.hy_v4.nvidia.triton_ihc import _ihc_pre_stage1, _ihc_pre_stage2
 from vllm.triton_utils import HAS_TRITON, tl, triton
 
+from vllm_ascend.device.device_config import get_ascend_device_type
+from vllm_ascend.device.hardware import AscendDeviceType
+
 from .attention import get_flash_attention_metadata
+
+_IHC_PRE_SHAPE = (4, 3072)
+_IHC_PRE_DECODE_MAX_ROWS = 16
+_IHC_PRE_BLOCK = 1024
+# Eight FP32 gate sums and an RMS sum per split, padded to 64 bytes.
+_IHC_PRE_PARTIAL_STRIDE = 16
 
 
 @triton.jit
@@ -79,6 +91,73 @@ def _inverse_rms(x: torch.Tensor, eps: float, row_offset: int = 0) -> torch.Tens
 
 class FlashHCPreLayer(HYV4HCPreLayer):
     sequence_parallel_input = False
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fuse_decode_pre = (
+            HAS_TRITON
+            and get_current_vllm_config().additional_config.get("hy4flash_fuse_ihc_pre", False)
+            and get_ascend_device_type() is AscendDeviceType.A5
+        )
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if not (
+            self.fuse_decode_pre
+            and x.device.type == "npu"
+            and x.dtype == torch.bfloat16
+            and self.hpc_op is None
+            and x.is_contiguous()
+            and x.shape[1:] == _IHC_PRE_SHAPE
+            and 0 < x.shape[0] <= _IHC_PRE_DECODE_MAX_ROWS
+            and self.hc_fn.weight.dtype == self.hc_base.dtype == self.hc_scale.dtype == torch.float32
+            and self.hc_fn.weight.shape == (2 * self.hc_mult, self.hc_mult * self.hidden_dim)
+            and self.hc_fn.weight.is_contiguous()
+            and self.hc_base.is_contiguous()
+            and self.hc_scale.is_contiguous()
+        ):
+            return super().forward(x)
+
+        logger.info_once("HYV4 Flash uses fused iHC pre-processing for small NPU batches.")
+        rows, channels, hidden = x.shape
+        flat_width = channels * hidden
+        splits = triton.cdiv(flat_width, _IHC_PRE_BLOCK)
+        partial = x.new_empty((rows, splits, _IHC_PRE_PARTIAL_STRIDE), dtype=torch.float32)
+        output = x.new_empty((rows, hidden))
+        post = partial.new_empty((rows, channels))
+        _ihc_pre_stage1[(rows, splits)](
+            x,
+            self.hc_fn.weight,
+            partial,
+            flat_width,
+            channels,
+            channels,
+            splits,
+            _IHC_PRE_BLOCK,
+            _IHC_PRE_PARTIAL_STRIDE,
+            num_warps=1,
+            enable_fp_fusion=False,
+        )
+        _ihc_pre_stage2[(rows, triton.cdiv(hidden, _IHC_PRE_BLOCK))](
+            x,
+            partial,
+            self.hc_scale,
+            self.hc_base,
+            output,
+            post,
+            hidden,
+            flat_width,
+            channels,
+            channels,
+            splits,
+            _IHC_PRE_PARTIAL_STRIDE,
+            _IHC_PRE_BLOCK,
+            self.magnitude,
+            self.layernorm_epsilon,
+            self.hc_eps,
+            num_warps=1,
+            enable_fp_fusion=False,
+        )
+        return output, post
 
     def _inverse_rms(self, x: torch.Tensor) -> torch.Tensor:
         row_offset = get_tensor_model_parallel_rank() * x.shape[0] if self.sequence_parallel_input else 0
