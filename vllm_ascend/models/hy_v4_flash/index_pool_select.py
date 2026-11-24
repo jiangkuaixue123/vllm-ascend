@@ -9,6 +9,7 @@ from vllm.triton_utils import tl, triton
 
 from vllm_ascend.ops.triton.sparse_index_remap import _sort
 
+from .cache_pages import PAGE_BYTES, POOL_RATIO, POOL_START
 from .index_pool_cache import pool_key_addresses
 
 _QUERIES = 6
@@ -176,6 +177,16 @@ def _expand_groups(
     tl.store(rows + query * GROUP_TILE * RATIO + token, tl.where(live, pos, -1))
 
 
+def _finish_recall(scores, visible, ratio, budget):
+    # Global top-k receives the original shape and logical order, including ties.
+    max_groups = scores.shape[-1]
+    values, group_ids = scores.topk(budget, dim=-1)
+    group_tile = budget + 1
+    rows = torch.empty((_QUERIES, group_tile * ratio), dtype=torch.int64, device=scores.device)
+    _expand_groups[(_QUERIES,)](values, group_ids, visible, rows, budget, ratio, group_tile, max_groups, num_warps=1)
+    return rows
+
+
 def select_sharded_paged_pool(query, weights, cache, table, visible, page_size, max_groups, ratio, budget):
     """Score each page-aligned history shard locally and restore the global top-k input order."""
     tp = get_tp_group()
@@ -190,12 +201,125 @@ def select_sharded_paged_pool(query, weights, cache, table, visible, page_size, 
     _join_score_shards[(_QUERIES, triton.cdiv(max_groups, _SCORE_COPY_TILE))](
         gathered, scores, _QUERIES, max_groups, shard, _SCORE_COPY_TILE, num_warps=1
     )
-    # Global top-k receives the original shape and logical order, including ties.
-    values, group_ids = scores.topk(budget, dim=-1)
-    group_tile = budget + 1
-    rows = torch.empty((_QUERIES, group_tile * ratio), dtype=torch.int64, device=query.device)
-    _expand_groups[(_QUERIES,)](values, group_ids, visible, rows, budget, ratio, group_tile, max_groups, num_warps=1)
-    return rows
+    return _finish_recall(scores, visible, ratio, budget)
+
+
+@triton.jit
+def _visible_pool_table(
+    table,
+    visible,
+    pages,
+    PAGE_COUNT: tl.constexpr,
+    TABLE_SIZE: tl.constexpr,
+    QUERIES: tl.constexpr,
+    GROUPS_PER_PAGE: tl.constexpr,
+    RATIO: tl.constexpr,
+    BUDGET: tl.constexpr,
+    TILE: tl.constexpr,
+):
+    page = tl.program_id(0) * TILE + tl.arange(0, TILE)
+    q = tl.arange(0, triton.next_power_of_2(QUERIES))
+    cutoff = tl.max(tl.load(visible + q, q < QUERIES, -1), 0) // RATIO
+    live = (page < TABLE_SIZE) & (cutoff > BUDGET) & (page * GROUPS_PER_PAGE < cutoff)
+    physical = tl.load(table + page, live, 0)
+    tl.store(pages + page, physical, page < PAGE_COUNT)
+
+
+@triton.jit
+def _copy_pool_pages(
+    cache,
+    table,
+    keys,
+    PAGE_ELEMENTS: tl.constexpr,
+    TILE: tl.constexpr,
+    LAYOUT_PAGE_BYTES: tl.constexpr = PAGE_BYTES,
+    LAYOUT_POOL_START: tl.constexpr = POOL_START,
+):
+    page = tl.program_id(0)
+    lane = tl.program_id(1) * TILE + tl.arange(0, TILE)
+    physical = tl.load(table + page).to(tl.int64)
+    values = tl.load(cache + physical * (LAYOUT_PAGE_BYTES // 2) + LAYOUT_POOL_START // 2 + lane)
+    tl.store(keys + page * PAGE_ELEMENTS + lane, values)
+
+
+@triton.jit
+def _weight_page_scores(
+    matrix,
+    weights,
+    visible,
+    scores,
+    GROUPS: tl.constexpr,
+    HEADS: tl.constexpr,
+    BUDGET: tl.constexpr,
+    TILE: tl.constexpr,
+    LAYOUT_POOL_RATIO: tl.constexpr = POOL_RATIO,
+):
+    query = tl.program_id(0)
+    head = tl.arange(0, HEADS)
+    group = tl.program_id(1) * TILE + tl.arange(0, TILE)
+    product = tl.load(matrix + (query * HEADS + head[:, None]) * GROUPS + group[None, :], group[None, :] < GROUPS, 0.0)
+    weight = tl.load(weights + query * HEADS + head)
+    score = tl.sum(tl.maximum(product, 0.0) * weight[:, None], axis=0)
+    cutoff = tl.load(visible + query) // LAYOUT_POOL_RATIO
+    tl.store(
+        scores + query * GROUPS + group,
+        tl.where((cutoff > BUDGET) & (group < cutoff), score, -float("inf")),
+        group < GROUPS,
+    )
+
+
+def select_native_page_pool(
+    query, weights, cache, table, visible, page_size, max_groups, ratio, budget, *, page_tables=None
+):
+    """Read contiguous per-page keys and score all logical groups using the original global top-k."""
+    queries, heads, head_dim = query.shape
+    groups_per_page = page_size // ratio
+    page_count = triton.cdiv(max_groups, groups_per_page)
+    # VerificationLayout already identifies one metadata group and one request.
+    # Its block table and the visible positions are shared by that group's layers.
+    table_key = (page_count, groups_per_page, ratio, budget)
+    pages = page_tables.get(table_key) if page_tables is not None else None
+    if pages is None:
+        pages = torch.empty((page_count,), device=table.device, dtype=table.dtype)
+        # Redirect unused entries before the bulk copy. Each physical page is in
+        # bounds and its keys form a contiguous plane. Score masking handles the
+        # unfilled tail of the last visible page and the reserved zero page.
+        _visible_pool_table[(triton.cdiv(page_count, _GROUP_TILE),)](
+            table,
+            visible,
+            pages,
+            page_count,
+            table.numel(),
+            queries,
+            groups_per_page,
+            ratio,
+            budget,
+            _GROUP_TILE,
+            num_warps=1,
+        )
+        if page_tables is not None:
+            page_tables[table_key] = pages
+    keys = torch.empty((page_count * groups_per_page, head_dim), device=query.device, dtype=torch.bfloat16)
+    page_elements = groups_per_page * head_dim
+    _copy_pool_pages[(page_count, page_elements // _SCORE_COPY_TILE)](
+        cache.view(torch.bfloat16), pages, keys, page_elements, _SCORE_COPY_TILE, num_warps=1
+    )
+    keys = keys[:max_groups]
+    matrix = torch.mm(query.bfloat16().view(queries * heads, head_dim), keys.t(), out_dtype=torch.float32)
+    scores = torch.empty((queries, max_groups), device=query.device, dtype=torch.float32)
+    _weight_page_scores[(queries, triton.cdiv(max_groups, _GROUP_TILE))](
+        matrix,
+        weights,
+        visible,
+        scores,
+        max_groups,
+        heads,
+        budget,
+        _GROUP_TILE,
+        num_warps=1,
+        enable_fp_fusion=False,
+    )
+    return _finish_recall(scores, visible, ratio, budget)
 
 
 def select_paged_pool(query, weights, cache, table, visible, page_size, max_groups, ratio, budget):

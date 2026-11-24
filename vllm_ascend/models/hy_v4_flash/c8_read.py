@@ -6,6 +6,8 @@ from vllm.triton_utils import tl, triton
 
 from vllm_ascend.attention.utils import SFA_QSFA_TILE_SIZE
 
+from .cache_pages import c8_byte_offset
+
 _LATENT = 512
 _ROPE = 64
 _ROWS_PER_PROGRAM = 8
@@ -48,21 +50,19 @@ def _read_c8_rows(
     position = tl.load(positions + i, in_bounds, -1)
     live = in_bounds & (position >= 0)
     page = tl.load(block_table + position // PAGE_SIZE, live, 0).to(tl.int64)
-    slot = page * PAGE_SIZE + position % PAGE_SIZE
+    offset = c8_byte_offset(page, position, PAGE_SIZE, ROW_BYTES)
     lane = tl.arange(0, LATENT)
-    bits = tl.load(cache + slot[:, None] * ROW_BYTES + lane[None, :], live[:, None], 0)
+    bits = tl.load(cache + offset[:, None] + lane[None, :], live[:, None], 0)
     value = _decode_e4m3fn(bits)
     scale = tl.load(
-        scale_cache + slot[:, None] * (ROW_BYTES // 4) + (LATENT + 2 * ROPE) // 4 + lane[None, :] // SCALE_TILE,
+        scale_cache + (offset // 4)[:, None] + (LATENT + 2 * ROPE) // 4 + lane[None, :] // SCALE_TILE,
         live[:, None],
         0.0,
     )
     dst = i[:, None] * (LATENT + ROPE)
     tl.store(output + dst + lane[None, :], value * scale, in_bounds[:, None])
     r = tl.arange(0, ROPE)
-    rope = tl.load(rope_cache + slot[:, None] * (ROW_BYTES // 2) + LATENT // 2 + r[None, :], live[:, None], 0.0).to(
-        tl.float32
-    )
+    rope = tl.load(rope_cache + (offset // 2)[:, None] + LATENT // 2 + r[None, :], live[:, None], 0.0).to(tl.float32)
     tl.store(output + dst + LATENT + r[None, :], rope, in_bounds[:, None])
 
 
@@ -114,14 +114,14 @@ def _read_window_operands(
     position = tl.load(history + row, in_bounds, -1)
     live = in_bounds & (position >= 0)
     page = tl.load(block_table + position // PAGE_SIZE, live, 0).to(tl.int64)
-    slot = page * PAGE_SIZE + position % PAGE_SIZE
+    offset = c8_byte_offset(page, position, PAGE_SIZE, ROW_BYTES)
     if group * SCALE_TILE < LATENT:
-        bits = tl.load(cache + slot[:, None] * ROW_BYTES + lane[None, :], live[:, None], 0)
-        scale = tl.load(scale_cache + slot * (ROW_BYTES // 4) + (LATENT + 2 * ROPE) // 4 + group, live, 0.0)
+        bits = tl.load(cache + offset[:, None] + lane[None, :], live[:, None], 0)
+        scale = tl.load(scale_cache + offset // 4 + (LATENT + 2 * ROPE) // 4 + group, live, 0.0)
         data = _decode_e4m3fn(bits) * scale[:, None]
     else:
         data = tl.load(
-            rope_cache + slot[:, None] * (ROW_BYTES // 2) + LATENT // 2 + (lane - LATENT)[None, :],
+            rope_cache + (offset // 2)[:, None] + LATENT // 2 + (lane - LATENT)[None, :],
             live[:, None] & (lane[None, :] < LATENT + ROPE),
             0.0,
         ).to(tl.float32)
@@ -192,7 +192,7 @@ def _read_c8_qk(
     position = tl.load(positions + qi * TOPK + row, row < TOPK, -1)
     live = position >= 0
     page = tl.load(block_table + position // PAGE_SIZE, live, 0).to(tl.int64)
-    slot = page * PAGE_SIZE + position % PAGE_SIZE
+    offset = c8_byte_offset(page, position, PAGE_SIZE, ROW_BYTES)
     q_base = (qi * HEADS + head[:, None]) * (LATENT + ROPE)
     value_base = (qi * TOPK + row[:, None]) * LATENT
     acc = tl.zeros((HEAD_TILE, CANDIDATE_TILE), tl.float32)
@@ -201,17 +201,15 @@ def _read_c8_qk(
     for group in tl.static_range(LATENT // SCALE_TILE):
         col = group * SCALE_TILE + lane
         q = tl.load(query + q_base + col[None, :], head[:, None] < HEADS, 0).to(tl.float32)
-        bits = tl.load(cache + slot[:, None] * ROW_BYTES + col[None, :], live[:, None], 0)
-        scale = tl.load(scale_cache + slot * (ROW_BYTES // 4) + (LATENT + 2 * ROPE) // 4 + group, live, 0)
+        bits = tl.load(cache + offset[:, None] + col[None, :], live[:, None], 0)
+        scale = tl.load(scale_cache + offset // 4 + (LATENT + 2 * ROPE) // 4 + group, live, 0)
         k = _decode_e4m3fn(bits) * scale[:, None]
         tl.store(values + value_base + col[None, :], k, row[:, None] < TOPK)
         acc = tl.dot(q, tl.trans(k), acc, input_precision="ieee")
 
     rope = tl.arange(0, ROPE)
     q_rope = tl.load(query + q_base + LATENT + rope[None, :], head[:, None] < HEADS, 0).to(tl.float32)
-    k_rope = tl.load(rope_cache + slot[:, None] * (ROW_BYTES // 2) + LATENT // 2 + rope[None, :], live[:, None], 0).to(
-        tl.float32
-    )
+    k_rope = tl.load(rope_cache + (offset // 2)[:, None] + LATENT // 2 + rope[None, :], live[:, None], 0).to(tl.float32)
     acc = tl.dot(q_rope, tl.trans(k_rope), acc, input_precision="ieee")
     tl.store(
         scores + (qi * HEADS + head[:, None]) * TOPK + row[None, :],

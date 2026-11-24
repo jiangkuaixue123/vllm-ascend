@@ -21,6 +21,7 @@ from vllm_ascend.hisparse.c8 import C8_ROW_BYTES, dequantize_c8_rows, pack_c8_co
 from vllm_ascend.models.hy_v4_flash import greedy_sampling
 from vllm_ascend.models.hy_v4_flash.aclgraph import FlashAclGraphManager
 from vllm_ascend.models.hy_v4_flash.attention import AscendHYV4FlashAttention, FlashMetadataBuilder
+from vllm_ascend.models.hy_v4_flash.cache_pages import PAGE_BYTES, PAGE_TOKENS
 from vllm_ascend.models.hy_v4_flash.dfly_speculator import build_reuse_indices
 from vllm_ascend.models.hy_v4_flash.layer_recall import paired_recall_layer, recall_rows_for_forward
 from vllm_ascend.models.hy_v4_flash.prefill_c8 import apply_attention_sink, prefill_window_indices
@@ -277,6 +278,22 @@ def test_paged_cache_gathers_fields_in_logical_order():
             torch.testing.assert_close(single, expected[0], atol=0, rtol=0)
 
 
+def test_sparse_c8_page_copy_preserves_token_addresses():
+    pages = torch.full((4, PAGE_BYTES), 255, dtype=torch.uint8)
+    rows = torch.arange(2 * PAGE_TOKENS * C8_ROW_BYTES).view(2, PAGE_TOKENS, C8_ROW_BYTES)
+    expected = (rows % 251).to(torch.uint8)
+    table = torch.tensor([2, 0])
+    for page, logical in zip(table, expected, strict=True):
+        pages[page, : PAGE_TOKENS * C8_ROW_BYTES].copy_(logical.flatten())
+
+    positions = torch.tensor([0, PAGE_TOKENS - 1, PAGE_TOKENS, 2 * PAGE_TOKENS - 1])
+    for physical_page in (2, 3):
+        pages[physical_page].copy_(pages[2])
+        table[0] = physical_page
+        selected = AscendHYV4FlashAttention._gather(pages, table, PAGE_TOKENS, positions, slice(C8_ROW_BYTES))
+        torch.testing.assert_close(selected, expected.flatten(0, 1)[positions], atol=0, rtol=0)
+
+
 def test_ihc_rms_uses_global_query_boundaries_on_sequence_shards(monkeypatch):
     from vllm_ascend.models.hy_v4_flash import ihc
 
@@ -373,3 +390,18 @@ def test_plain_greedy_verifier_defers_to_transformed_or_sampled_requests():
     rejection.enable_adaptive_verification = False
     runner.sampler.get_logprobs_dims = lambda _: (5, 0)
     assert not greedy_sampling.plain_greedy_batch(runner, batch, None)
+
+
+def test_native_index_pages_select_physical_block_size():
+    config = SimpleNamespace(cache_config=SimpleNamespace(block_size=64))
+    layer = SimpleNamespace(page_planes=True, cache_width=1025, use_fp8_cache=True)
+    backend = AscendHYV4FlashAttention.get_attn_backend(layer)
+    assert backend.get_preferred_block_size(128) == 64
+    assert backend.get_supported_kernel_block_sizes() == [64]
+    assert backend.supports_block_size(64)
+    assert not backend.supports_block_size(128)
+    spec = AscendHYV4FlashAttention.get_kv_cache_spec(layer, config)
+    assert spec.num_states == 64
+    assert spec.page_size_bytes == PAGE_BYTES
+    layer.page_planes = False
+    assert AscendHYV4FlashAttention.get_attn_backend(layer).supports_block_size(128)

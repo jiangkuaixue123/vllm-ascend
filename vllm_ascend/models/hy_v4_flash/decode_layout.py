@@ -46,6 +46,7 @@ class VerificationLayout:
     window_rows: dict = field(default_factory=dict)
     window_candidates: dict = field(default_factory=dict)
     pool_updates: dict = field(default_factory=dict)
+    visible_pool_pages: dict = field(default_factory=dict)
     dense_prefixes: dict = field(default_factory=dict)
 
     @classmethod

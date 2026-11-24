@@ -3,6 +3,7 @@
 """Ascend MLA and IndexPool with cache pages owned by the vLLM scheduler."""
 
 from dataclasses import dataclass
+from functools import partial
 from typing import ClassVar
 
 import torch
@@ -45,6 +46,15 @@ from vllm_ascend.utils import attention_calculation_stream, npu_stream_switch
 from .attention_logits import build_mla_logits
 from .c8_read import gather_c8_qk, gather_c8_rows, gather_c8_window_operands
 from .c8_write import write_c8_rows
+from .cache_pages import (
+    ALLOCATED_ROW_BYTES,
+    PAGE_BYTES,
+    PAGE_TOKENS,
+    POOL_RATIO,
+    TOKEN_BYTES,
+    gather_page_field,
+    physical_c8_indices,
+)
 from .decode_layout import VerificationLayout, decode_positions, dense_candidates, pool_update_positions, window_history
 from .index_pool_cache import copy_pool_keys
 from .index_pool_fp8 import (
@@ -54,7 +64,12 @@ from .index_pool_fp8 import (
     index_rotary_frequencies,
     index_scale_transitions,
 )
-from .index_pool_select import select_paged_pool, select_sharded_paged_pool, supports_sharded_recall
+from .index_pool_select import (
+    select_native_page_pool,
+    select_paged_pool,
+    select_sharded_paged_pool,
+    supports_sharded_recall,
+)
 from .layer_recall import paired_recall_layer, recall_rows_for_forward
 from .mla_prolog import CANNBotBf16MlaProlog
 from .output_gate import gate_dynamic_mx_quant
@@ -171,6 +186,18 @@ class FlashAttentionBackend(CacheOnlyAttentionBackend):
     @staticmethod
     def get_impl_cls():
         return FlashAttentionImpl
+
+
+class FlashIndexPageBackend(FlashAttentionBackend):
+    @staticmethod
+    def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int]:
+        return [PAGE_TOKENS]
+
+    @classmethod
+    def supports_block_size(cls, block_size: int | None) -> bool:
+        # HiddenStateCacheSpec binds exactly one physical page per manager
+        # block. This layout cannot split a larger logical block into two.
+        return block_size is None or block_size == PAGE_TOKENS
 
 
 class FlashIndexPool(nn.Module):
@@ -401,6 +428,21 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
         self.cache_width = self.token_storage_width
         if self.incremental_index_pool:
             self.cache_width += INDEX_DIM // ratio * index_element_width
+        self.page_planes = (
+            self.fuse_c8_write
+            and not reuse_target
+            and self.incremental_index_pool
+            and vllm_config.additional_config.get("hy4flash_native_index_pages", False)
+            and (
+                not getattr(vllm_config.cache_config, "user_specified_block_size", False)
+                or vllm_config.cache_config.block_size == PAGE_TOKENS
+            )
+            and ratio == POOL_RATIO
+            and self.cache_width == TOKEN_BYTES
+        )
+        if self.page_planes:
+            self.cache_width = ALLOCATED_ROW_BYTES
+            logger.info_once("HYV4 Flash requests 64-token KV pages for native IndexPool storage.")
         self.kv_cache = torch.empty(0)
         self.topk_snapshot = None
         if not reuse_target:
@@ -478,7 +520,10 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
         )
 
     def get_attn_backend(self):
-        return FlashAttentionBackend
+        return FlashIndexPageBackend if self.page_planes else FlashAttentionBackend
+
+    def cache_rows(self):
+        return self.kv_cache.view(-1, PAGE_BYTES if self.page_planes else self.cache_width)
 
     def get_kv_cache_spec(self, vllm_config):
         return HiddenStateCacheSpec(
@@ -654,8 +699,10 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
         if not isinstance(metadata, dict) or self.layer_name not in metadata:
             return
         meta = metadata[self.layer_name]
-        cache = self.kv_cache.view(-1, self.cache_width)
+        cache = self.cache_rows()
         block_size = self.kv_cache.shape[2]
+        if self.page_planes and block_size != PAGE_TOKENS:
+            raise ValueError(f"Hy4 native IndexPool storage requires {PAGE_TOKENS}-token pages, got {block_size}")
         num_tokens = meta.query_start_loc[-1]
         if not num_tokens:
             return
@@ -686,8 +733,8 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
         if (
             self.fuse_c8_write
             and cache.device.type == "npu"
-            and num_tokens <= MAX_FUSED_C8_WRITE_TOKENS
-            and self.cache_width % torch.int32.itemsize == 0
+            and (self.page_planes or num_tokens <= MAX_FUSED_C8_WRITE_TOKENS)
+            and cache.shape[-1] % torch.int32.itemsize == 0
         ):
             payload, scales = self._quantize_c8(kv_c[:num_tokens], gpu_scale=self.use_gpu_c8_scale)
             write_c8_rows(cache, slots, payload, k_pe[:num_tokens], scales, keys, positions[..., :num_tokens])
@@ -991,6 +1038,10 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
                     if use_paged_pool:
                         logger.info_once("HYV4 Flash uses paged IndexPool scoring for six verification queries.")
                         select = select_sharded_paged_pool if use_sharded_pool else select_paged_pool
+                        if self.page_planes and use_sharded_pool:
+                            tables = layout.visible_pool_pages if layout is not None else None
+                            select = partial(select_native_page_pool, page_tables=tables)
+                            logger.info_once("HYV4 Flash scores contiguous IndexPool pages.")
                         selected = select(
                             index_query[start:stop],
                             index_weight[start:stop],
@@ -1079,6 +1130,12 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
             out[:num_tokens].masked_fill_(~live.reshape(-1, 1), 0)
 
     def _attend_sparse_verify_c8(self, query, cache, table, block_size, selected, visible):
+        if cache.shape[-1] == PAGE_BYTES:
+            candidates = physical_c8_indices(table, selected)
+            context = attend_packed_c8(
+                query, cache.view(-1, C8_ROW_BYTES), candidates, self.learnable_sink_param, self.scale
+            )
+            return context.masked_fill_((visible < 0)[:, None, None], 0)
         # Pack each query's recalled rows contiguously. The native operator
         # addresses the joined buffer and uses -1 to skip padded candidates.
         history = selected.flatten()
@@ -1251,6 +1308,8 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
             blocks = block_table.index_select(0, pages.flatten()).view_as(positions)
         else:
             blocks = block_table.gather(1, pages)
+        if cache.shape[-1] == PAGE_BYTES:
+            return gather_page_field(cache, blocks, positions, columns)
         slots = blocks.long() * block_size + positions % block_size
         rows = cache.index_select(0, slots.flatten())[:, columns].contiguous()
         return rows.view(*positions.shape, rows.shape[-1])

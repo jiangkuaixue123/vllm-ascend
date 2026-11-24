@@ -7,6 +7,8 @@ from vllm.triton_utils import tl, triton
 
 from vllm_ascend.hisparse.c8 import C8_ROW_BYTES
 
+from .cache_pages import PAGE_BYTES, PAGE_TOKENS, POOL_START, RAW_START, TOKEN_BYTES
+
 _WORD_BYTES = torch.int32.itemsize
 _LATENT_WORDS = 512 // _WORD_BYTES
 _ROPE_END = (512 + 64 * torch.bfloat16.itemsize) // _WORD_BYTES
@@ -39,6 +41,11 @@ def _write_c8_rows(
     C8_END: tl.constexpr,
     INDEX_END: tl.constexpr,
     POSITIONS_END: tl.constexpr,
+    LAYOUT_PAGE_BYTES: tl.constexpr = PAGE_BYTES,
+    LAYOUT_PAGE_TOKENS: tl.constexpr = PAGE_TOKENS,
+    LAYOUT_POOL_START: tl.constexpr = POOL_START,
+    LAYOUT_RAW_START: tl.constexpr = RAW_START,
+    LAYOUT_TOKEN_BYTES: tl.constexpr = TOKEN_BYTES,
 ):
     token = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
     slot = tl.load(slots + token, token < tokens, -1).to(tl.int64)
@@ -71,7 +78,23 @@ def _write_c8_rows(
             live & (lane >= INDEX_END) & (lane < POSITIONS_END),
             0,
         )
-    tl.store(cache + slot[:, None] * ROW_WIDTH + lane, bits, live & (lane < ROW_WIDTH))
+    if ROW_WIDTH == LAYOUT_PAGE_BYTES // 4:
+        start = (slot // LAYOUT_PAGE_TOKENS * ROW_WIDTH)[:, None]
+        token_in_page = (slot % LAYOUT_PAGE_TOKENS)[:, None]
+        raw_words = POSITIONS_END - C8_END
+        pool_words = LAYOUT_TOKEN_BYTES // 4 - POSITIONS_END
+        address = tl.where(
+            lane < C8_END,
+            token_in_page * C8_END + lane,
+            tl.where(
+                lane < POSITIONS_END,
+                LAYOUT_RAW_START // 4 + token_in_page * raw_words + lane - C8_END,
+                LAYOUT_POOL_START // 4 + token_in_page * pool_words + lane - POSITIONS_END,
+            ),
+        )
+        tl.store(cache + start + address, bits, live & (lane < LAYOUT_TOKEN_BYTES // 4))
+    else:
+        tl.store(cache + slot[:, None] * ROW_WIDTH + lane, bits, live & (lane < ROW_WIDTH))
 
 
 def write_c8_rows(cache, slots, latent, rope, scales, keys=None, positions=None):
@@ -106,7 +129,7 @@ def write_c8_rows(cache, slots, latent, rope, scales, keys=None, positions=None)
         has_indexer,
         row_width,
         rows,
-        triton.next_power_of_2(row_width),
+        triton.next_power_of_2(TOKEN_BYTES // _WORD_BYTES if cache.shape[-1] == PAGE_BYTES else row_width),
         _LATENT_WORDS,
         _ROPE_END,
         _C8_END,

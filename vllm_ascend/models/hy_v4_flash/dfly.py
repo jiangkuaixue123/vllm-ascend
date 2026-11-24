@@ -50,8 +50,7 @@ class DFlyAttention(AscendHYV4FlashAttention):
         block_size, block_table, indices, query_positions = self.context
         source = self.target_attention()
         assert source is not None
-        cache = source.kv_cache
-        cache = cache.view(-1, source.cache_width)
+        cache = source.cache_rows()
         batch, width = query_positions.shape
         if ready_query is None:
             query, wv = self._absorb_query(q_nope, q_pe, absorbed=absorbed)

@@ -19,6 +19,7 @@
     "hy4flash_verify_host_features": true,
     "hy4flash_local_vocabulary": true,
     "hy4flash_share_neighbor_recall": true,
-    "hy4flash_sharded_greedy_verify": true
+    "hy4flash_sharded_greedy_verify": true,
+    "hy4flash_native_index_pages": true
   }
 }

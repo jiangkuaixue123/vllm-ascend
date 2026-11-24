@@ -5,6 +5,8 @@ import torch
 from vllm.models.hy_v4_flash.reference import INDEX_DIM
 from vllm.triton_utils import tl, triton
 
+from .cache_pages import PAGE_BYTES, POOL_START
+
 _GROUPS_PER_PROGRAM = 16
 
 
@@ -18,9 +20,14 @@ def pool_key_addresses(
     BLOCK_SIZE: tl.constexpr,
     RATIO: tl.constexpr,
     LANES_PER_ROW: tl.constexpr,
+    LAYOUT_PAGE_BYTES: tl.constexpr = PAGE_BYTES,
+    LAYOUT_POOL_START: tl.constexpr = POOL_START,
 ):
     token = group * RATIO
     block = tl.load(block_table + token // BLOCK_SIZE, mask=live, other=0).to(tl.int64)
+    if ROW_WIDTH == LAYOUT_PAGE_BYTES // 2:
+        start = block * ROW_WIDTH + LAYOUT_POOL_START // 2 + (group % (BLOCK_SIZE // RATIO)) * (LANES_PER_ROW * RATIO)
+        return start[:, None] + lane[None, :]
     slot = block * BLOCK_SIZE + token % BLOCK_SIZE
     # Spread each key across the spare lanes of its group's token rows.
     return (
