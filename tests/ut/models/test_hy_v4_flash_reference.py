@@ -20,6 +20,7 @@ from vllm_ascend.hisparse.c8 import C8_ROW_BYTES, dequantize_c8_rows, pack_c8_co
 from vllm_ascend.models.hy_v4_flash.aclgraph import FlashAclGraphManager
 from vllm_ascend.models.hy_v4_flash.attention import AscendHYV4FlashAttention, FlashMetadataBuilder
 from vllm_ascend.models.hy_v4_flash.dfly_speculator import build_reuse_indices
+from vllm_ascend.models.hy_v4_flash.layer_recall import paired_recall_layer, recall_rows_for_forward
 from vllm_ascend.models.hy_v4_flash.prefill_c8 import apply_attention_sink, prefill_window_indices
 
 
@@ -307,3 +308,25 @@ def test_c8_prefill_renormalization_matches_explicit_sink():
     logits_with_sink = torch.cat((logits, sink.expand(logits.shape[0], -1).unsqueeze(-1)), dim=-1)
     expected = logits_with_sink.softmax(-1)[..., :-1] @ values
     torch.testing.assert_close(apply_attention_sink(context, maximum, total, sink), expected)
+
+
+def test_neighbor_recall_is_limited_to_one_forward_and_matching_metadata():
+    layer_types = [SPARSE_ATTENTION if i in (0, 1, 5, 9, 13, 17) else SLIDING_ATTENTION for i in range(18)]
+    assert paired_recall_layer(layer_types, 0, SPARSE_ATTENTION) is None
+    assert paired_recall_layer(layer_types, 17, SPARSE_ATTENTION) is None
+    donor = paired_recall_layer(layer_types, 1, SPARSE_ATTENTION)
+    consumer = paired_recall_layer(layer_types, 5, SPARSE_ATTENTION)
+    assert donor == (1, True) and consumer == (1, False)
+    context = SimpleNamespace(additional_kwargs={})
+    metadata = object()
+    shape = (2, 6, 4, 511)
+    _, pending = recall_rows_for_forward(context, metadata, donor, *shape)
+    pending.append(torch.tensor([0, 1, 2, -1]))
+    assert recall_rows_for_forward(context, metadata, consumer, *shape) == (None, None)
+    pending.append(torch.tensor([8, 9, -1, -1]))
+    rows, writer = recall_rows_for_forward(context, metadata, consumer, *shape)
+    assert rows is pending and writer is None
+    assert recall_rows_for_forward(context, object(), consumer, *shape) == (None, None)
+    assert recall_rows_for_forward(context, metadata, consumer, 2, 1, 4, 511) == (None, None)
+    fresh = SimpleNamespace(additional_kwargs={})
+    assert recall_rows_for_forward(fresh, metadata, consumer, *shape) == (None, None)

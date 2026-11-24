@@ -18,7 +18,7 @@ from vllm.model_executor.layers.linear import ColumnParallelLinear, ReplicatedLi
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.model_loader.weight_utils import make_attention_sink
 from vllm.model_executor.models.extract_hidden_states import CacheOnlyAttentionBackend, CacheOnlyAttentionImpl
-from vllm.models.hy_v4_flash.configs import SLIDING_ATTENTION
+from vllm.models.hy_v4_flash.configs import SLIDING_ATTENTION, SPARSE_ATTENTION
 from vllm.models.hy_v4_flash.reference import (
     INDEX_DIM,
     indexpool_fp8,
@@ -55,6 +55,7 @@ from .index_pool_fp8 import (
     index_scale_transitions,
 )
 from .index_pool_select import select_paged_pool, select_sharded_paged_pool, supports_sharded_recall
+from .layer_recall import paired_recall_layer, recall_rows_for_forward
 from .mla_prolog import CANNBotBf16MlaProlog
 from .output_gate import gate_dynamic_mx_quant
 from .packed_query import ACL_FORMAT_ND, MLAAbsorptionWeights, kv_b_weight_views, pack_rotary_query
@@ -367,6 +368,14 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
             and vllm_config.additional_config.get("hy4flash_overlap_attn_output_gate", True)
             and get_ascend_device_type() is AscendDeviceType.A5
         )
+        self.paired_recall = None
+        if (
+            use_a5_c8
+            and not reuse_target
+            and not self.is_window_layer
+            and vllm_config.additional_config.get("hy4flash_share_neighbor_recall", False)
+        ):
+            self.paired_recall = paired_recall_layer(config.layer_types, layer_idx, SPARSE_ATTENTION)
         self.use_cannbot_prolog = not reuse_target and vllm_config.additional_config.get(
             "hy4flash_cannbot_mla_prolog", False
         )
@@ -918,8 +927,24 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
             )
 
         score_groups = self.indexer is not None and self.max_model_len > (self.indexer.budget + 1) * self.indexer.ratio
+        reused_rows, published_rows = None, None
+        if score_groups and self.paired_recall is not None:
+            reused_rows, published_rows = recall_rows_for_forward(
+                get_forward_context(),
+                meta,
+                self.paired_recall,
+                seq_lens.shape[0],
+                num_queries,
+                self.indexer.ratio,
+                self.indexer.budget,
+            )
+            if reused_rows is not None:
+                logger.info_once(
+                    "HYV4 Flash reuses logical sparse recall from the preceding target layer (%s).",
+                    "single request" if seq_lens.shape[0] == 1 else "multiple requests",
+                )
         use_paged_pool = False
-        if score_groups:
+        if score_groups and reused_rows is None:
             index_query, index_weight = self.indexer.encode_queries(
                 hidden[:num_tokens], q_c[:num_tokens], positions[..., :num_tokens], full_graph=True
             )
@@ -959,7 +984,9 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
                         else pool_update_positions(seq_lens[request], num_queries, self.indexer.ratio)
                     )
                     self._update_decode_pool(cache, table, block_size, update, positions.ndim)
-                if score_groups:
+                if reused_rows is not None:
+                    selected = reused_rows[request]
+                elif score_groups:
                     ratio = self.indexer.ratio
                     if use_paged_pool:
                         logger.info_once("HYV4 Flash uses paged IndexPool scoring for six verification queries.")
@@ -989,6 +1016,8 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
                         selected = torch.where(recall, selected, dense)
                 else:
                     selected = dense_candidates(visible, self.max_model_len)
+            if published_rows is not None:
+                published_rows.append(selected)
             if snapshot is not None:
                 snapshot[start:stop, : selected.shape[-1]].copy_(selected)
             split_pv = (
