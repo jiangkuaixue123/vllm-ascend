@@ -11,6 +11,7 @@
     "hy4flash_fuse_ihc_pre": true,
     "hy4flash_share_verify_layout": true,
     "hy4flash_shard_indexpool_scores": true,
-    "hy4flash_fuse_indexpool_rotate_encode": true
+    "hy4flash_fuse_indexpool_rotate_encode": true,
+    "hy4flash_pack_window_operands": true
   }
 }

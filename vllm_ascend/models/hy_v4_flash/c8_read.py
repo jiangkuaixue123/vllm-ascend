@@ -9,6 +9,7 @@ from vllm_ascend.attention.utils import SFA_QSFA_TILE_SIZE
 _LATENT = 512
 _ROPE = 64
 _ROWS_PER_PROGRAM = 8
+_WINDOW_ROW_TILE = 16
 _QK_HEAD_TILE = 16
 _QK_CANDIDATE_TILE = 32
 
@@ -86,6 +87,83 @@ def gather_c8_rows(cache, block_table, block_size, positions):
             num_warps=1,
         )
     return output
+
+
+@triton.jit
+def _read_window_operands(
+    cache,
+    rope_cache,
+    scale_cache,
+    block_table,
+    history,
+    keys,
+    values,
+    QUERIES: tl.constexpr,
+    WINDOW: tl.constexpr,
+    LATENT: tl.constexpr,
+    ROPE: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    ROW_BYTES: tl.constexpr,
+    ROWS: tl.constexpr,
+    SCALE_TILE: tl.constexpr,
+):
+    row = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
+    group = tl.program_id(1)
+    lane = group * SCALE_TILE + tl.arange(0, SCALE_TILE)
+    in_bounds = row < WINDOW + QUERIES - 1
+    position = tl.load(history + row, in_bounds, -1)
+    live = in_bounds & (position >= 0)
+    page = tl.load(block_table + position // PAGE_SIZE, live, 0).to(tl.int64)
+    slot = page * PAGE_SIZE + position % PAGE_SIZE
+    if group * SCALE_TILE < LATENT:
+        bits = tl.load(cache + slot[:, None] * ROW_BYTES + lane[None, :], live[:, None], 0)
+        scale = tl.load(scale_cache + slot * (ROW_BYTES // 4) + (LATENT + 2 * ROPE) // 4 + group, live, 0.0)
+        data = _decode_e4m3fn(bits) * scale[:, None]
+    else:
+        data = tl.load(
+            rope_cache + slot[:, None] * (ROW_BYTES // 2) + LATENT // 2 + (lane - LATENT)[None, :],
+            live[:, None] & (lane[None, :] < LATENT + ROPE),
+            0.0,
+        ).to(tl.float32)
+    # Write each native GEMM batch independently. Both contractions retain the
+    # reduction order of the corresponding single-query window.
+    for query in tl.static_range(QUERIES):
+        local = row - query
+        keep = in_bounds & (local >= 0) & (local < WINDOW)
+        dst = query * WINDOW + local
+        tl.store(
+            keys + dst[:, None] * (LATENT + ROPE) + lane[None, :], data, keep[:, None] & (lane[None, :] < LATENT + ROPE)
+        )
+        if group * SCALE_TILE < LATENT:
+            tl.store(values + dst[:, None] * LATENT + lane[None, :], data, keep[:, None])
+
+
+def gather_c8_window_operands(cache, block_table, block_size, history, queries, window):
+    """Build contiguous native QK and PV operands from the union of consecutive C8 windows."""
+    keys = cache.new_empty((queries, window, _LATENT + _ROPE), dtype=torch.float32)
+    values = cache.new_empty((queries, window, _LATENT), dtype=torch.float32)
+    _read_window_operands[
+        (triton.cdiv(history.numel(), _WINDOW_ROW_TILE), triton.cdiv(_LATENT + _ROPE, SFA_QSFA_TILE_SIZE))
+    ](
+        cache,
+        cache.view(torch.bfloat16),
+        cache.view(torch.float32),
+        block_table,
+        history,
+        keys,
+        values,
+        queries,
+        window,
+        _LATENT,
+        _ROPE,
+        block_size,
+        cache.shape[-1],
+        _WINDOW_ROW_TILE,
+        SFA_QSFA_TILE_SIZE,
+        num_warps=1,
+        enable_fp_fusion=False,
+    )
+    return keys.transpose(1, 2), values
 
 
 @triton.jit

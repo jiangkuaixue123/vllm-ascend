@@ -37,5 +37,6 @@ The recipe reserves 131,584 positions for requests with 130,048 input and 1,024 
 | `hy4flash_share_verify_layout` | Reuses the current request's positions and window rows across target layers in a captured forward. |
 | `hy4flash_shard_indexpool_scores` | Divides long-context IndexPool scoring across eight tensor ranks and preserves the global top-k order. |
 | `hy4flash_fuse_indexpool_rotate_encode` | Encodes short rotated IndexPool queries and keys in one Hadamard and E4M3 rounding kernel, using scale boundaries obtained on the device. |
+| `hy4flash_pack_window_operands` | Writes the contiguous FP32 key and value operands for six sliding-window queries while decoding their shared C8 rows. |
 
 The fixed-length test measures one client request at a time. Each reported TPOT divides the elapsed time between its first and last generated-token events by 1,023. The reported P50 is the median across twenty distinct requests. The accuracy run uses all thirty AIME2026 questions at concurrency sixteen. [Per-request timings and hardware results](https://github.com/InferMatrixLab/InferRSI/issues/613)

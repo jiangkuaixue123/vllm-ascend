@@ -2003,6 +2003,7 @@ def init_ascend_config(vllm_config: VllmConfig) -> AscendConfig:
         "hy4flash_overlap_attn_output_gate",
         "hy4flash_precise_decode",
         "hy4flash_share_swa_c8_reads",
+        "hy4flash_pack_window_operands",
         "hy4flash_triton_mla_logits",
         # injected fields (factory passes explicitly; a copy in additional_config would conflict)
         "scheduler_config",

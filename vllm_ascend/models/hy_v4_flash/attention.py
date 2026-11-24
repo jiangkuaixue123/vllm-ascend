@@ -43,7 +43,7 @@ from vllm_ascend.quantization.utils import DynamicMXQuantScaleAlg
 from vllm_ascend.utils import attention_calculation_stream, npu_stream_switch
 
 from .attention_logits import build_mla_logits
-from .c8_read import gather_c8_qk, gather_c8_rows
+from .c8_read import gather_c8_qk, gather_c8_rows, gather_c8_window_operands
 from .c8_write import write_c8_rows
 from .decode_layout import VerificationLayout, decode_positions, dense_candidates, pool_update_positions, window_history
 from .index_pool_cache import copy_pool_keys
@@ -342,6 +342,13 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
             and vllm_config.parallel_config.data_parallel_size == 1
         )
         self.share_swa_c8_reads = use_a5_c8 and vllm_config.additional_config.get("hy4flash_share_swa_c8_reads", True)
+        self.pack_window_operands = (
+            self.share_swa_c8_reads
+            and self.is_window_layer
+            and not reuse_target
+            and (self.latent_dim, self.rope_dim) == (512, 64)
+            and vllm_config.additional_config.get("hy4flash_pack_window_operands", False)
+        )
         self.fuse_swa_q_norm = (
             self.is_window_layer
             and not reuse_target
@@ -969,6 +976,20 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
             ):
                 logger.info_once("HYV4 Flash fuses paged C8 reads and FP32 QK for sparse verification.")
                 scores, rows = gather_c8_qk(q, cache, table, block_size, selected)
+            elif (
+                self.pack_window_operands
+                and shared_positions is not None
+                and seq_lens.shape[0] == 1
+                and q.dtype == torch.bfloat16
+                and table.is_contiguous()
+            ):
+                keys, rows = gather_c8_window_operands(
+                    cache, table, block_size, shared_positions[request], num_queries, window
+                )
+                scores = torch.bmm(q.float(), keys)
+                if torch_npu.get_npu_format(scores) != ACL_FORMAT_ND:
+                    scores = torch_npu.npu_format_cast(scores, ACL_FORMAT_ND)
+                logger.info_once("HYV4 Flash packs sliding-window C8 rows directly into verification operands.")
             elif shared_positions is None:
                 rows = self._gather_attention_rows(cache, table, block_size, selected, mask_padding=True)
             else:
