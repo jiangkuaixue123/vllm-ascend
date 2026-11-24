@@ -1989,6 +1989,7 @@ def init_ascend_config(vllm_config: VllmConfig) -> AscendConfig:
         "hy4flash_batch_verify_attention",
         "hy4flash_batch_host_lookup",
         "hy4flash_cannbot_mla_prolog",
+        "hy4flash_local_vocabulary",
         "hy4flash_fuse_attn_output_gate",
         "hy4flash_fuse_c8_qk",
         "hy4flash_fuse_c8_write",

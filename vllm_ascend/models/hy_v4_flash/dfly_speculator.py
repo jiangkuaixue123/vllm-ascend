@@ -194,10 +194,19 @@ class FlashDFlySpeculator(DraftModelSpeculator):
         anchor_embeddings = embeddings[:: self.num_query_per_req]
         anchor_embeddings.copy_(self.model.mtp_fusion(anchor_embeddings, target_hidden))
         hidden = self.model(embeddings, positions).view(ids.shape[0], self.num_query_per_req, -1)
+        vocabulary = getattr(self.target.model, "local_vocabulary", None)
+        local_greedy = (
+            ids.shape[0] == 1 and vocabulary is not None and vocabulary.supports_greedy(self.model.logits_processor)
+        )
+        if local_greedy:
+            logger.info_once("HYV4 Flash selects DFly tokens from eight rank-local FP32 vocabulary winners.")
         previous = ids[:, 0].contiguous()
         for step in range(self.num_speculative_steps):
             corrected = self.model.hidden_correction(hidden[:, step + 1], self.target.embed_input_ids(previous))
-            previous = self.model.logits_processor(self.target.lm_head, corrected).argmax(dim=-1)
+            if local_greedy:
+                previous = vocabulary.greedy(corrected)
+            else:
+                previous = self.model.logits_processor(self.target.lm_head, corrected).argmax(dim=-1)
             result[:, step] = previous.masked_fill(~active, -1)
 
     def propose(

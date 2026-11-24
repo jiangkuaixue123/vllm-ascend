@@ -15,6 +15,7 @@ from .attention import AscendHYV4FlashAttention, FlashAttentionBackend
 from .dfly_config import METHOD
 from .engram import FlashEngram, FlashNgramHashState
 from .ihc import FlashHCHeadLayer, FlashHCLayer
+from .local_vocabulary import LocalVocabulary
 from .moe import AscendFlashMoE
 
 FLASHCOMM_950_PEER_BYTES = 768 * 1024
@@ -166,8 +167,11 @@ class AscendHYV4FlashModel(HYV4FlashModel):
                 group.device_communicator.max_sequence_collective_peer_bytes = FLASHCOMM_950_PEER_BYTES
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         self.uses_dfly = vllm_config.speculative_config is not None
+        self.local_vocabulary = None
 
     def embed_input_ids(self, input_ids):
+        if self.local_vocabulary is not None and self.local_vocabulary.can_embed(input_ids):
+            return self.local_vocabulary.embed(input_ids)
         # Async speculative batches can contain -1 at discarded query slots.
         return super().embed_input_ids(input_ids.clamp_min(0) if self.uses_dfly else input_ids)
 
@@ -178,6 +182,16 @@ class AscendHYV4FlashForCausalLM(HYV4FlashForCausalLM):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         validate_runtime(vllm_config)
         super().__init__(vllm_config=vllm_config, prefix=prefix)
+        parallel = vllm_config.parallel_config
+        if (
+            vllm_config.additional_config.get("hy4flash_local_vocabulary", False)
+            and get_ascend_device_type() is AscendDeviceType.A5
+            and parallel.tensor_parallel_size == 8
+            and parallel.data_parallel_size == parallel.pipeline_parallel_size == 1
+            and vllm_config.speculative_config is not None
+            and LocalVocabulary.supports(self.model.embed_tokens, self.lm_head)
+        ):
+            self.model.local_vocabulary = LocalVocabulary(self.model.embed_tokens, self.lm_head)
 
     @staticmethod
     def get_model_state_cls():
