@@ -15,6 +15,7 @@
     "hy4flash_pack_window_operands": true,
     "hy4flash_pack_mla_query": true,
     "hy4flash_batch_host_lookup": true,
-    "hy4flash_pack_feature_channels": true
+    "hy4flash_pack_feature_channels": true,
+    "hy4flash_verify_host_features": true
   }
 }

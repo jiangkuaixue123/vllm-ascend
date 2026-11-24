@@ -4,7 +4,7 @@
 import torch
 from vllm.config import CUDAGraphMode
 from vllm.logger import logger
-from vllm.triton_utils import triton
+from vllm.triton_utils import HAS_TRITON, triton
 
 from vllm_ascend.device.device_config import get_ascend_device_type
 from vllm_ascend.device.hardware import AscendDeviceType
@@ -12,6 +12,7 @@ from vllm_ascend.ops.triton.engram_lookback import _gather_lookback_kernel
 from vllm_ascend.worker.v2.model_states.default import AscendModelState
 
 from .aclgraph import FlashAclGraphManager
+from .verify_hashes import fill_host_feature_rows, fill_verify_hashes, supports_verify_hash_geometry
 
 _SINGLE_VERIFY_TOKENS = 6
 
@@ -21,6 +22,11 @@ class FlashModelState(AscendModelState):
 
     def __init__(self, vllm_config, model, encoder_cache, device):
         super().__init__(vllm_config, model, encoder_cache, device)
+        self._verify_host_features = (
+            HAS_TRITON
+            and vllm_config.additional_config.get("hy4flash_verify_host_features", False)
+            and get_ascend_device_type() is AscendDeviceType.A5
+        )
         self._graph_decode = False
         self._graph_hashes = None
         self._batch_host_lookup = (
@@ -85,6 +91,25 @@ class FlashModelState(AscendModelState):
         for i, (table, output) in enumerate(zip(self._engram_embeddings, rows)):
             output.copy_(table(lookup[i]))
 
+    def _prepare_registered_features(self, input_batch, history, hashes, rows):
+        engram = self._flash_model.engram_hash
+        starts = input_batch.query_start_loc_np
+        if not (
+            input_batch.num_reqs == input_batch.num_reqs_after_padding == 1
+            and supports_verify_hash_geometry(engram, hashes, history)
+            and input_batch.input_ids.stride(0) == 1
+            and starts[0] == 0
+            and 0 <= starts[1] <= hashes.shape[1]
+            and engram.layout.lookup_table is not None
+            and all(table.host_weight is not None for table in self._engram_embeddings)
+        ):
+            return False
+        fill_verify_hashes(engram, input_batch.input_ids, history, int(starts[1]), hashes)
+        for table, layer_hashes, output in zip(self._engram_embeddings, hashes.unbind(), rows):
+            fill_host_feature_rows(table, layer_hashes, output)
+        logger.info_once("HYV4 Flash reads verification rows directly from registered CPU tables.")
+        return True
+
     def prepare_engram_inputs(self, input_batch, req_states):
         depth = self.model.token_lookback_depth
         if depth == 0:
@@ -113,6 +138,8 @@ class FlashModelState(AscendModelState):
                 for output in rows:
                     output.zero_()
             else:
+                if self._verify_host_features and self._prepare_registered_features(input_batch, history, hashes, rows):
+                    return inputs
                 self._flash_model.engram_hash.prepare_batch_hashes(
                     input_batch.input_ids,
                     history,

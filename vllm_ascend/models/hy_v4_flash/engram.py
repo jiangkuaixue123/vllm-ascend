@@ -22,6 +22,7 @@ from vllm.triton_utils import HAS_TRITON
 
 from vllm_ascend.device.device_config import get_ascend_device_type
 from vllm_ascend.device.hardware import AscendDeviceType
+from vllm_ascend.models.host_offload import register_host_offload_owner
 
 from .feature_channels import normalized_channel_products
 
@@ -166,7 +167,7 @@ class FlashNgramHashState(nn.Module):
 
 
 class FlashEmbedding(nn.Module):
-    def __init__(self, sizes, dim, dtype, cpu_offload, dp_shared_memory=False):
+    def __init__(self, sizes, dim, dtype, cpu_offload, dp_shared_memory=False, *, direct_host_rows=False):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
         self.head_start, self.head_end = head_range(sizes, self.tp_size, get_tensor_model_parallel_rank())
@@ -176,6 +177,10 @@ class FlashEmbedding(nn.Module):
         self.n_hash_cols = len(sizes)
         self.dim = dim
         self.cpu_offload = cpu_offload
+        self._direct_host_rows = direct_host_rows and cpu_offload and not dp_shared_memory
+        self.host_weight = None
+        if self._direct_host_rows:
+            register_host_offload_owner(self)
         self._shared_group = None
         self._shared_buffers = {}
         if dp_shared_memory:
@@ -222,6 +227,19 @@ class FlashEmbedding(nn.Module):
                 buffer.shm.name,
             )
             return buffer.tensor
+        if self._direct_host_rows and leaf == "weight" and shape[0] and dtype == torch.bfloat16:
+            # Load the host registration runtime after the worker has initialized its device operators.
+            from vllm_ascend.models.deepseek_v41.engram.npu import HostUvaBuffer, HostUvaBufferCleanupError
+
+            try:
+                self.host_weight = HostUvaBuffer(shape, dtype, torch.device("npu", torch.npu.current_device()))
+            except HostUvaBufferCleanupError as exc:
+                self.host_weight = exc.host_buffer
+                raise
+            except RuntimeError as exc:
+                logger.warning("HYV4 Flash Engram will use CPU lookup after host registration failed: %s", exc)
+            else:
+                return self.host_weight.tensor
         parameter = getattr(self.embedding, leaf, None)
         storage = {"device": parameter.device} if parameter is not None else {}
         if self.cpu_offload:
@@ -247,6 +265,12 @@ class FlashEmbedding(nn.Module):
             raise RuntimeError(f"Flash Engram shared table loading failed: {errors}")
 
     def close_host_offload(self):
+        if self.host_weight is not None:
+            self.host_weight.close()
+            self.host_weight = None
+            parameter = getattr(self.embedding, "weight", None)
+            if parameter is not None:
+                parameter.data = torch.empty(0, dtype=parameter.dtype, device="cpu")
         for leaf, buffer in tuple(self._shared_buffers.items()):
             buffer.close()
             parameter = getattr(self.embedding, leaf)
@@ -322,7 +346,18 @@ class FlashEngram(nn.Module):
                 raise ValueError("Flash Engram DP shared memory requires checkpoint loading")
             dtype = torch.float8_e4m3fn if config.engram_fp8_embedding else torch.bfloat16
         self.multi_head_embedding = FlashEmbedding(
-            sizes, layout.head_dim, dtype, storage.cpu_offload, storage.dp_shared_memory
+            sizes,
+            layout.head_dim,
+            dtype,
+            storage.cpu_offload,
+            storage.dp_shared_memory,
+            direct_host_rows=(
+                vllm_config.additional_config.get("hy4flash_verify_host_features", False)
+                and HAS_TRITON
+                and vllm_config.parallel_config.data_parallel_size == 1
+                and vllm_config.parallel_config.tensor_parallel_size == 8
+                and get_ascend_device_type() is AscendDeviceType.A5
+            ),
         )
         self.hidden_size, self.hc_mult = config.hidden_size, config.hc_mult
         local = self.multi_head_embedding.head_end - self.multi_head_embedding.head_start
