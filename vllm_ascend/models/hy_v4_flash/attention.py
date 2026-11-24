@@ -83,6 +83,7 @@ from .prefill_c8 import (
     attend_packed_c8,
     prefill_window_indices,
 )
+from .resident_pool import ResidentPool
 
 C8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
 C8_GPU_MIN_SCALE = 1e-4
@@ -516,6 +517,20 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
             )
         )
         self.learnable_sink_param = make_attention_sink(self.local_heads, torch.float32)
+        self.resident_pool = None
+        if (
+            self.indexer is not None
+            and self.page_planes
+            and self.shard_indexpool_scores
+            and (self.paired_recall is None or self.paired_recall[1])
+            and vllm_config.kv_transfer_config is None
+            and not vllm_config.cache_config.enable_prefix_caching
+            and not getattr(vllm_config.cache_config, "kv_offloading_size", None)
+            and not vllm_config.model_config.enable_sleep_mode
+            and vllm_config.additional_config.get("hy4flash_resident_index_keys", False)
+        ):
+            self.resident_pool = ResidentPool(self.max_model_len, INDEX_DIM, self.learnable_sink_param.device)
+
         self.post_proj_norm = (
             RMSNorm(hidden, config.rms_norm_eps)
             if config.sandwich_norm and (self.is_window_layer or not config.dsa_skip_attn_post_norm)
@@ -731,6 +746,8 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
             self._forward_decode_graph(meta, cache, block_size, hidden, q_c, positions, query, wv, out)
             return
 
+        if self.resident_pool is not None:
+            self.resident_pool.invalidate()
         if keys is not None and self.incremental_index_pool:
             self._update_index_pool(cache, block_size, meta, keys, positions)
         self._attend_eager(meta, cache, block_size, hidden, q_c, positions, query, wv, out)
@@ -1026,6 +1043,7 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
                 block_size, self.max_model_len // self.indexer.ratio, self.indexer.ratio, self.indexer.budget
             )
         )
+        refreshed_pool = False
         for request in range(seq_lens.shape[0]):
             start = request * num_queries
             stop = start + num_queries
@@ -1053,6 +1071,12 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
                         if self.page_planes and use_sharded_pool:
                             tables = layout.visible_pool_pages if layout is not None else None
                             select = partial(select_native_page_pool, page_tables=tables)
+                            if self.resident_pool is not None:
+                                select = partial(select, resident=self.resident_pool, updated=update[:2])
+                                refreshed_pool = True
+                                logger.info_once(
+                                    "HYV4 Flash refreshes logical IndexPool keys on cache writes and page remaps."
+                                )
                             logger.info_once("HYV4 Flash scores contiguous IndexPool pages.")
                         selected = select(
                             index_query[start:stop],
@@ -1137,6 +1161,9 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
                 )
                 rows = history.unfold(0, window, 1).transpose(1, 2)
             self._attend_decoded(q, selected, rows, wv, out[start:stop], split_pv=split_pv, scores=scores)
+        if self.resident_pool is not None and not refreshed_pool:
+            # This operation is captured in multi-request and one-token graphs as well.
+            self.resident_pool.invalidate()
         if shared_positions is not None:
             # Inactive queries may overlap live KV rows in the unfolded view.
             out[:num_tokens].masked_fill_(~live.reshape(-1, 1), 0)

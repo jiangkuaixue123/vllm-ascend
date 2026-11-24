@@ -269,7 +269,19 @@ def _weight_page_scores(
 
 
 def select_native_page_pool(
-    query, weights, cache, table, visible, page_size, max_groups, ratio, budget, *, page_tables=None
+    query,
+    weights,
+    cache,
+    table,
+    visible,
+    page_size,
+    max_groups,
+    ratio,
+    budget,
+    *,
+    page_tables=None,
+    resident=None,
+    updated=None,
 ):
     """Read contiguous per-page keys and score all logical groups using the original global top-k."""
     queries, heads, head_dim = query.shape
@@ -299,11 +311,14 @@ def select_native_page_pool(
         )
         if page_tables is not None:
             page_tables[table_key] = pages
-    keys = torch.empty((page_count * groups_per_page, head_dim), device=query.device, dtype=torch.bfloat16)
-    page_elements = groups_per_page * head_dim
-    _copy_pool_pages[(page_count, page_elements // _SCORE_COPY_TILE)](
-        cache.view(torch.bfloat16), pages, keys, page_elements, _SCORE_COPY_TILE, num_warps=1
-    )
+    if resident is None:
+        keys = torch.empty((page_count * groups_per_page, head_dim), device=query.device, dtype=torch.bfloat16)
+        page_elements = groups_per_page * head_dim
+        _copy_pool_pages[(page_count, page_elements // _SCORE_COPY_TILE)](
+            cache.view(torch.bfloat16), pages, keys, page_elements, _SCORE_COPY_TILE, num_warps=1
+        )
+    else:
+        keys = resident.read(cache, pages, *updated)
     keys = keys[:max_groups]
     matrix = torch.mm(query.bfloat16().view(queries * heads, head_dim), keys.t(), out_dtype=torch.float32)
     scores = torch.empty((queries, max_groups), device=query.device, dtype=torch.float32)

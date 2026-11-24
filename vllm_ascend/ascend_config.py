@@ -1995,6 +1995,7 @@ def init_ascend_config(vllm_config: VllmConfig) -> AscendConfig:
         "hy4flash_native_index_pages",
         "hy4flash_ccu_copy_gathers",
         "hy4flash_ordered_verify_scatter",
+        "hy4flash_resident_index_keys",
         "hy4flash_fuse_attn_output_gate",
         "hy4flash_fuse_c8_qk",
         "hy4flash_fuse_c8_write",

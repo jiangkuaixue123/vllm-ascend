@@ -22,6 +22,7 @@
     "hy4flash_sharded_greedy_verify": true,
     "hy4flash_native_index_pages": true,
     "hy4flash_ccu_copy_gathers": true,
-    "hy4flash_ordered_verify_scatter": true
+    "hy4flash_ordered_verify_scatter": true,
+    "hy4flash_resident_index_keys": true
   }
 }

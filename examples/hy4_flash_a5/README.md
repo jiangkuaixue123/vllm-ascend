@@ -48,5 +48,6 @@ The recipe reserves 131,584 positions for requests with 130,048 input and 1,024 
 | `hy4flash_native_index_pages` | Requests 64-token KV pages for native C8 and contiguous pooled IndexPool keys. This increases each cached token from 1,000 to 1,025 bytes. Other explicitly requested page sizes keep the standard layout. |
 | `hy4flash_ccu_copy_gathers` | Uses a separate CCU group to gather small token shards and vocabulary winners on eight A5 devices. BF16 reductions use the original TP group. |
 | `hy4flash_ordered_verify_scatter` | On eight A5 devices, exchanges six verification rows and sums each BF16 shard in the native rank order. Uses the original reduction if the startup comparison differs. |
+| `hy4flash_resident_index_keys` | Keeps a per-layer BF16 view of active pooled keys, refreshing changed pages and invalidating it on other cache writes. Requires native pages and disabled prefix caching and KV transfer. |
 
 The fixed-length test measures one client request at a time. Each reported TPOT divides the elapsed time between its first and last generated-token events by 1,023. The reported P50 is the median across twenty distinct requests. The accuracy run uses all thirty AIME2026 questions at concurrency sixteen. [Per-request timings and hardware results](https://github.com/InferMatrixLab/InferRSI/issues/613)

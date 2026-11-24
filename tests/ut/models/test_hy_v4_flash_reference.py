@@ -444,3 +444,16 @@ def test_ordered_scatter_requires_six_contiguous_bf16_rows():
     assert not supports_ordered_scatter(rows[:1])
     assert not supports_ordered_scatter(rows.float())
     assert not supports_ordered_scatter(torch.empty(3072, 6, dtype=torch.bfloat16).T)
+
+
+def test_resident_pool_invalidation_preserves_captured_storage():
+    from vllm_ascend.models.hy_v4_flash.resident_pool import ResidentPool
+
+    pool = ResidentPool(131, 128, torch.device("cpu"))
+    addresses = (pool.physical.data_ptr(), pool.keys.data_ptr())
+    assert pool.physical.shape == (2,) and pool.keys.shape == (32, 128)
+    assert pool.state_dict() == {}
+    pool.physical.copy_(torch.tensor([3, 1]))
+    pool.invalidate()
+    torch.testing.assert_close(pool.physical, torch.full_like(pool.physical, -1))
+    assert addresses == (pool.physical.data_ptr(), pool.keys.data_ptr())
