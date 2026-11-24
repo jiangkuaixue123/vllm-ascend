@@ -56,7 +56,7 @@ def sample(runner, hidden, batch, vocabulary):
     group = get_tp_group()
     sampled, counts = choose(
         local_scores,
-        group.device_group,
+        vocabulary.copy_group if batch.num_reqs == 1 and vocabulary.copy_group is not None else group.device_group,
         vocabulary.start,
         group.world_size,
         batch.cu_num_logits,

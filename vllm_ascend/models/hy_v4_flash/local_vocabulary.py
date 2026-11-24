@@ -43,11 +43,12 @@ def _select_winner(packets, output, RANKS: tl.constexpr):
 class LocalVocabulary(nn.Module):
     """Replicate ordinary input embeddings and keep a rank-local FP32 projection."""
 
-    def __init__(self, embedding, head, sharded_verification=False):
+    def __init__(self, embedding, head, sharded_verification=False, copy_group=None):
         super().__init__()
         self.embedding = ref(embedding)
         self.head = ref(head)
         self.sharded_verification = sharded_verification
+        self.copy_group = copy_group
         self.register_buffer("table", None, persistent=False)
         self.register_buffer("projection", None, persistent=False)
         self.start = embedding.shard_indices.org_vocab_start_index
@@ -117,7 +118,10 @@ class LocalVocabulary(nn.Module):
         packet = scores.new_empty(2, dtype=torch.int32)
         gathered = packet.new_empty(_TP_SIZE * 2)
         _pack_winner[(1,)](value, index, packet, self.start, num_warps=1)
-        dist.all_gather_into_tensor(gathered, packet, group=get_tp_group().device_group)
+        group = get_tp_group().device_group if self.copy_group is None else self.copy_group
+        dist.all_gather_into_tensor(gathered, packet, group=group)
+        if self.copy_group is not None:
+            logger.info_once("HYV4 Flash gathers draft vocabulary winners with CCU.")
         winner = index.new_empty(1)
         _select_winner[(1,)](gathered, winner, _TP_SIZE, num_warps=1)
         return winner

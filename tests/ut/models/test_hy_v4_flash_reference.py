@@ -405,3 +405,32 @@ def test_native_index_pages_select_physical_block_size():
     assert spec.page_size_bytes == PAGE_BYTES
     layer.page_planes = False
     assert AscendHYV4FlashAttention.get_attn_backend(layer).supports_block_size(128)
+
+
+def test_copy_only_group_preserves_rank_order_and_fallback(monkeypatch):
+    from unittest.mock import Mock
+
+    from vllm_ascend.models.hy_v4_flash import model
+
+    group = Mock()
+    group.size.return_value = 8
+    gathers = []
+
+    def collect(output, local, group):
+        gathers.append(group)
+        for rank in range(8):
+            output[rank].copy_(local[0] + rank)
+
+    monkeypatch.setattr(model.dist, "all_gather_into_tensor", collect)
+    fallback = Mock(side_effect=lambda x: x)
+    monkeypatch.setattr(model, "sp_all_gather", fallback)
+    for shape in ((1, 12), (1, 4, 12)):
+        x = torch.arange(torch.Size(shape).numel(), dtype=torch.bfloat16).reshape(shape)
+        torch.testing.assert_close(model.gather_verify_rows(x, group), torch.cat([x + rank for rank in range(8)]))
+        assert model.gather_verify_rows(x, None) is x
+    wide = torch.zeros(2, 4, dtype=torch.bfloat16)
+    assert model.gather_verify_rows(wide, group) is wide
+    other = wide[:1].float()
+    assert model.gather_verify_rows(other, group) is other
+    assert gathers == [group, group]
+    assert fallback.call_count == 4

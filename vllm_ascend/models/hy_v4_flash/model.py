@@ -2,8 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import torch
+import torch.distributed as dist
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.distributed import get_ep_group, get_tp_group
+from vllm.logger import logger
 from vllm.models.hy_v4_flash.model import HYV4FlashDecoderLayer, HYV4FlashForCausalLM, HYV4FlashModel
 
 from vllm_ascend.ascend_config import get_ascend_config
@@ -84,6 +86,16 @@ def validate_runtime(vllm_config: VllmConfig) -> None:
             raise ValueError(f"{field} must be divisible by tensor_parallel_size")
 
 
+def gather_verify_rows(hidden: torch.Tensor, copy_group: dist.ProcessGroup | None) -> torch.Tensor:
+    # A worker holds a single token shard in the six-query verification graph.
+    if copy_group is None or hidden.shape[0] != 1 or hidden.dtype != torch.bfloat16:
+        return sp_all_gather(hidden)
+    result = hidden.new_empty((copy_group.size(), *hidden.shape[1:]))
+    dist.all_gather_into_tensor(result, hidden.contiguous(), group=copy_group)
+    logger.info_once("HYV4 Flash gathers verification token shards with CCU.")
+    return result
+
+
 class AscendHYV4FlashDecoderLayer(HYV4FlashDecoderLayer):
     attention_cls = AscendHYV4FlashAttention
     hc_layer_cls = FlashHCLayer
@@ -91,6 +103,7 @@ class AscendHYV4FlashDecoderLayer(HYV4FlashDecoderLayer):
 
     def __init__(self, config, vllm_config, cache_config=None, quant_config=None, prefix="", topk_indices_buffer=None):
         super().__init__(config, vllm_config, cache_config, quant_config, prefix, topk_indices_buffer)
+        self.copy_group = None
         self.sequence_parallel = vllm_config.parallel_config.use_sequence_parallel_moe and self.block_type == "moe"
         if self.sequence_parallel:
             layers = config.mlp_layer_types
@@ -117,15 +130,15 @@ class AscendHYV4FlashDecoderLayer(HYV4FlashDecoderLayer):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         if self.input_is_sharded:
-            hidden_states = sp_all_gather(hidden_states)[:num_tokens]
+            hidden_states = gather_verify_rows(hidden_states, self.copy_group)[:num_tokens]
         else:
             residual = sp_shard(residual)
         hidden_states = self.self_attn(positions=positions, hidden_states=hidden_states)
         residual = hidden_states + residual
         hidden_states = self.mlp(self.post_attention_layernorm(residual))
         if not self.keep_output_sharded:
-            hidden_states = sp_all_gather(hidden_states)[:num_tokens]
-            residual = sp_all_gather(residual)[:num_tokens]
+            hidden_states = gather_verify_rows(hidden_states, self.copy_group)[:num_tokens]
+            residual = gather_verify_rows(residual, self.copy_group)[:num_tokens]
         return hidden_states, residual
 
     def _forward_ihc(self, positions, hidden_states):
@@ -137,7 +150,7 @@ class AscendHYV4FlashDecoderLayer(HYV4FlashDecoderLayer):
         hidden_states, post_gates, residual = self.hc_attn_layer.pre(hidden_states)
         hidden_states = self.input_layernorm(hidden_states)
         if self.input_is_sharded:
-            hidden_states = sp_all_gather(hidden_states)[:num_tokens]
+            hidden_states = gather_verify_rows(hidden_states, self.copy_group)[:num_tokens]
         else:
             residual = sp_shard(residual)
             post_gates = sp_shard(post_gates)
@@ -149,7 +162,7 @@ class AscendHYV4FlashDecoderLayer(HYV4FlashDecoderLayer):
         hidden_states = self.mlp(self.post_attention_layernorm(hidden_states))
         hidden_states = self.hc_mlp_layer.post(hidden_states, residual, post_gates)
         if not self.keep_output_sharded:
-            hidden_states = sp_all_gather(hidden_states)[:num_tokens]
+            hidden_states = gather_verify_rows(hidden_states, self.copy_group)[:num_tokens]
         return hidden_states, None
 
 
@@ -166,6 +179,19 @@ class AscendHYV4FlashModel(HYV4FlashModel):
             for group in (get_tp_group(), get_ep_group()):
                 group.device_communicator.max_sequence_collective_peer_bytes = FLASHCOMM_950_PEER_BYTES
         super().__init__(vllm_config=vllm_config, prefix=prefix)
+        self.copy_group = None
+        if (
+            vllm_config.additional_config.get("hy4flash_ccu_copy_gathers", False)
+            and get_ascend_device_type() == AscendDeviceType.A5
+            and vllm_config.parallel_config.tensor_parallel_size == 8
+            and vllm_config.parallel_config.data_parallel_size == 1
+            and vllm_config.parallel_config.pipeline_parallel_size == 1
+            and dist.get_world_size() == 8
+        ):
+            tp = get_tp_group()
+            self.copy_group = tp.device_communicator.enable_ccu_copy_group(tp.ranks)
+            for layer in self.layers:
+                layer.copy_group = self.copy_group
         self.uses_dfly = vllm_config.speculative_config is not None
         self.local_vocabulary = None
 
@@ -194,6 +220,7 @@ class AscendHYV4FlashForCausalLM(HYV4FlashForCausalLM):
             self.model.local_vocabulary = LocalVocabulary(
                 self.model.embed_tokens,
                 self.lm_head,
+                copy_group=self.model.copy_group,
                 sharded_verification=vllm_config.additional_config.get("hy4flash_sharded_greedy_verify", False)
                 and vllm_config.lora_config is None,
             )

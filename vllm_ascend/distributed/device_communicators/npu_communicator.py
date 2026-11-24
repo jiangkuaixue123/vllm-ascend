@@ -17,6 +17,7 @@
 
 import torch
 import torch.distributed as dist
+import torch_npu
 from vllm.distributed.device_communicators.base_device_communicator import DeviceCommunicatorBase
 from vllm.logger import logger
 
@@ -24,6 +25,7 @@ from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.distributed.device_communicators.quantized_all_reduce import (
     QuantizedAllReduce,
 )
+from vllm_ascend.utils import get_default_buffer_config
 
 
 class _NpuAll2AllManager:
@@ -63,6 +65,7 @@ class NPUCommunicator(DeviceCommunicatorBase):
         )
         self.device = torch.npu.current_device()
         self.ca_comm = None
+        self.copy_group: dist.ProcessGroup | None = None
         # vLLM #53576 reads this CUDA-only communicator during graph capture.
         # Keep the shared coordinator protocol available without enabling the
         # FlashInfer PCIe IPC backend on NPU.
@@ -90,6 +93,26 @@ class NPUCommunicator(DeviceCommunicatorBase):
         if self.quantized_ar is not None and self.world_size > 1:
             return self.quantized_ar.all_reduce(input_)
         return super().all_reduce(input_)
+
+    def enable_ccu_copy_group(self, ranks: list[int]) -> dist.ProcessGroup:
+        # One group per owning TP coordinator, shared by layers and the drafter.
+        # HcclCommConfig uses 6 for CCU_SCHED on Ascend 950.
+        if self.copy_group is None:
+            ccu_schedule = 6
+            options = torch_npu._C._distributed_c10d.ProcessGroupHCCL.Options()
+            options.hccl_config = {
+                **get_default_buffer_config(),
+                "group_name": "hy4_verify_copy",
+                "hccl_op_expansion_mode": ccu_schedule,
+            }
+            self.copy_group = dist.new_group(ranks=ranks, backend="hccl", pg_options=options)
+        return self.copy_group
+
+    def destroy(self) -> None:
+        if self.copy_group is not None:
+            dist.destroy_process_group(self.copy_group)
+            self.copy_group = None
+        super().destroy()
 
     def _sequence_chunk_size(self, input_: torch.Tensor, dim: int, shards: int = 1) -> int | None:
         limit = self.max_sequence_collective_peer_bytes
