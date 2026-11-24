@@ -3,11 +3,10 @@
 
 import torch
 import torch_npu
-from vllm.logger import init_logger
+from vllm.logger import logger
 
 _ACL_FORMAT_ND = 2
 _SCRATCH_BLOCK_SIZE = 64
-logger = init_logger(__name__)
 
 
 class CANNBotBf16MlaProlog:

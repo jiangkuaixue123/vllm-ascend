@@ -6,7 +6,7 @@ from copy import copy
 import torch
 from vllm.config import CUDAGraphMode, set_current_vllm_config
 from vllm.forward_context import set_forward_context
-from vllm.logger import init_logger
+from vllm.logger import logger
 from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 from vllm.model_executor.model_loader.utils import get_draft_load_config, process_weights_after_loading
 from vllm.model_executor.model_loader.weight_utils import get_quant_config
@@ -17,8 +17,6 @@ from vllm.v1.worker.gpu.cudagraph_utils import CudaGraphManager
 from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
 
 from .dfly import CHECKPOINT_PREFIX, MODEL_PREFIX, FlashDFlyDraft
-
-logger = init_logger(__name__)
 
 
 def build_reuse_indices(target_rows, anchor, width, window, active):

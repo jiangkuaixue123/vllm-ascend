@@ -11,7 +11,7 @@ from torch import nn
 from vllm.config.cache import CacheDType
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
-from vllm.logger import init_logger
+from vllm.logger import logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import ColumnParallelLinear, ReplicatedLinear, RowParallelLinear
@@ -58,8 +58,6 @@ from .prefill_c8 import (
     attend_packed_c8,
     prefill_window_indices,
 )
-
-logger = init_logger(__name__)
 
 ACL_FORMAT_ND = 2
 C8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
