@@ -6,6 +6,7 @@ from vllm.config import CUDAGraphMode
 from vllm.logger import logger
 from vllm.triton_utils import HAS_TRITON, triton
 
+from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.device.device_config import get_ascend_device_type
 from vllm_ascend.device.hardware import AscendDeviceType
 from vllm_ascend.ops.triton.engram_lookback import _gather_lookback_kernel
@@ -26,6 +27,15 @@ class FlashModelState(AscendModelState):
             HAS_TRITON
             and vllm_config.additional_config.get("hy4flash_verify_host_features", False)
             and get_ascend_device_type() is AscendDeviceType.A5
+        )
+        target = getattr(model, "language_model", model)
+        self._verify_vocabulary = getattr(target.model, "local_vocabulary", None)
+        self._verify_processor = getattr(target, "logits_processor", None)
+        self._enable_sharded_verification = (
+            self._verify_vocabulary is not None
+            and self._verify_vocabulary.sharded_verification
+            and self._verify_processor is not None
+            and not get_ascend_config().rejection_sampler_config.enable_entropy_verify
         )
         self._graph_decode = False
         self._graph_hashes = None
@@ -55,6 +65,19 @@ class FlashModelState(AscendModelState):
                 )
                 for embedding in self._engram_embeddings
             )
+
+    def try_sharded_greedy_sample(self, runner, hidden_states, batch, grammar):
+        if not self._enable_sharded_verification:
+            return None
+        # The sampling modules are supplied by the V2 runner. Load them only on the
+        # supported worker path, after platform-specific sampler patches are installed.
+        from . import greedy_sampling
+
+        if not self._verify_vocabulary.supports_greedy(self._verify_processor):
+            return None
+        if not greedy_sampling.plain_greedy_batch(runner, batch, grammar):
+            return None
+        return greedy_sampling.sample(runner, hidden_states, batch, self._verify_vocabulary)
 
     def prepare_attn(self, input_batch, cudagraph_mode, *args, **kwargs):
         self._graph_decode = cudagraph_mode == CUDAGraphMode.FULL

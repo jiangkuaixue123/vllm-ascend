@@ -1185,6 +1185,11 @@ class NPUModelRunner(GPUModelRunner):
         compute_logits the same row count — pad up to ``_lmhead_tp_max_num_logits()``
         and trim back; prompt_logprobs stays unsupported (same as V1)."""
         if not lmhead_tp_enable():
+            verify = getattr(getattr(self, "model_state", None), "try_sharded_greedy_sample", None)
+            if verify is not None:
+                sampled = verify(self, hidden_states, input_batch, grammar_output)
+                if sampled is not None:
+                    return sampled
             return super().sample(hidden_states, input_batch, grammar_output)
 
         num_logits = input_batch.logits_indices.shape[0]

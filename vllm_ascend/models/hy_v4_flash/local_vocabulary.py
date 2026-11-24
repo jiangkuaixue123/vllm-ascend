@@ -43,10 +43,11 @@ def _select_winner(packets, output, RANKS: tl.constexpr):
 class LocalVocabulary(nn.Module):
     """Replicate ordinary input embeddings and keep a rank-local FP32 projection."""
 
-    def __init__(self, embedding, head):
+    def __init__(self, embedding, head, sharded_verification=False):
         super().__init__()
         self.embedding = ref(embedding)
         self.head = ref(head)
+        self.sharded_verification = sharded_verification
         self.register_buffer("table", None, persistent=False)
         self.register_buffer("projection", None, persistent=False)
         self.start = embedding.shard_indices.org_vocab_start_index
@@ -105,8 +106,13 @@ class LocalVocabulary(nn.Module):
             and processor.org_vocab_size == self.table.shape[0]
         )
 
+    def project(self, hidden):
+        if self.sharded_verification and hidden.dtype == torch.bfloat16:
+            return torch.mm(hidden, self.head().weight.T, out_dtype=torch.float32)
+        return F.linear(hidden.float(), self.projection)
+
     def greedy(self, hidden):
-        scores = F.linear(hidden.float(), self.projection)
+        scores = self.project(hidden)
         value, index = scores.max(dim=-1)
         packet = scores.new_empty(2, dtype=torch.int32)
         gathered = packet.new_empty(_TP_SIZE * 2)

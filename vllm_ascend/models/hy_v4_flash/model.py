@@ -191,7 +191,12 @@ class AscendHYV4FlashForCausalLM(HYV4FlashForCausalLM):
             and vllm_config.speculative_config is not None
             and LocalVocabulary.supports(self.model.embed_tokens, self.lm_head)
         ):
-            self.model.local_vocabulary = LocalVocabulary(self.model.embed_tokens, self.lm_head)
+            self.model.local_vocabulary = LocalVocabulary(
+                self.model.embed_tokens,
+                self.lm_head,
+                sharded_verification=vllm_config.additional_config.get("hy4flash_sharded_greedy_verify", False)
+                and vllm_config.lora_config is None,
+            )
 
     @staticmethod
     def get_model_state_cls():

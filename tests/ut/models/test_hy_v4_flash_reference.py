@@ -3,6 +3,7 @@
 
 from types import SimpleNamespace
 
+import numpy as np
 import torch
 from vllm.config import CUDAGraphMode
 from vllm.models.hy_v4_flash.configs import SLIDING_ATTENTION, SPARSE_ATTENTION, HYV4FlashConfig, HYV4FlashVLConfig
@@ -17,6 +18,7 @@ from vllm.models.hy_v4_flash.reference import (
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 
 from vllm_ascend.hisparse.c8 import C8_ROW_BYTES, dequantize_c8_rows, pack_c8_components
+from vllm_ascend.models.hy_v4_flash import greedy_sampling
 from vllm_ascend.models.hy_v4_flash.aclgraph import FlashAclGraphManager
 from vllm_ascend.models.hy_v4_flash.attention import AscendHYV4FlashAttention, FlashMetadataBuilder
 from vllm_ascend.models.hy_v4_flash.dfly_speculator import build_reuse_indices
@@ -330,3 +332,44 @@ def test_neighbor_recall_is_limited_to_one_forward_and_matching_metadata():
     assert recall_rows_for_forward(context, metadata, consumer, 2, 1, 4, 511) == (None, None)
     fresh = SimpleNamespace(additional_kwargs={})
     assert recall_rows_for_forward(fresh, metadata, consumer, *shape) == (None, None)
+
+
+def test_plain_greedy_verifier_defers_to_transformed_or_sampled_requests():
+    slots = np.array([1, 3])
+    temp = np.zeros(4)
+    needs_processing = np.zeros(4, dtype=bool)
+    sampler = SimpleNamespace(
+        sampling_states=SimpleNamespace(temperature=SimpleNamespace(np=temp)),
+        needs_logits_processing=needs_processing,
+        get_logprobs_dims=lambda _: None,
+        return_sampling_mask=False,
+        compute_nans=False,
+        trace_replay_state=None,
+    )
+    rejection = SimpleNamespace(
+        sampler=sampler,
+        watermark_key=None,
+        synthetic_conditional_rates=None,
+        enable_adaptive_verification=False,
+        use_block_verification=False,
+        fly_window_size=0,
+    )
+    runner = SimpleNamespace(
+        sampler=sampler, rejection_sampler=rejection, batch_sharder=None, speculator=SimpleNamespace(draft_logits=None)
+    )
+    batch = SimpleNamespace(idx_mapping_np=slots, num_draft_tokens=5, num_reqs=2)
+    assert greedy_sampling.plain_greedy_batch(runner, batch, None)
+    temp[0] = 0.75
+    assert greedy_sampling.plain_greedy_batch(runner, batch, None)
+    temp[3] = 0.75
+    assert not greedy_sampling.plain_greedy_batch(runner, batch, None)
+    temp[3] = 0
+    needs_processing[1] = True
+    assert not greedy_sampling.plain_greedy_batch(runner, batch, None)
+    needs_processing[1] = False
+    assert not greedy_sampling.plain_greedy_batch(runner, batch, object())
+    rejection.enable_adaptive_verification = True
+    assert not greedy_sampling.plain_greedy_batch(runner, batch, None)
+    rejection.enable_adaptive_verification = False
+    runner.sampler.get_logprobs_dims = lambda _: (5, 0)
+    assert not greedy_sampling.plain_greedy_batch(runner, batch, None)
