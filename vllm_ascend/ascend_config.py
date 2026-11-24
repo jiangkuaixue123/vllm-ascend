@@ -1993,6 +1993,7 @@ def init_ascend_config(vllm_config: VllmConfig) -> AscendConfig:
         "hy4flash_fuse_c8_write",
         "hy4flash_fuse_ihc_pre",
         "hy4flash_fuse_indexpool_fp8",
+        "hy4flash_fuse_indexpool_rotate_encode",
         "hy4flash_fuse_indexpool_select",
         "hy4flash_fuse_swa_q_norm",
         "hy4flash_gpu_c8_scale",

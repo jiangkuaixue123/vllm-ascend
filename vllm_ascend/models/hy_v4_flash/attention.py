@@ -47,7 +47,13 @@ from .c8_read import gather_c8_qk, gather_c8_rows
 from .c8_write import write_c8_rows
 from .decode_layout import VerificationLayout, decode_positions, dense_candidates, pool_update_positions, window_history
 from .index_pool_cache import copy_pool_keys
-from .index_pool_fp8 import encode_indexpool_fp8
+from .index_pool_fp8 import (
+    INDEX_ROTARY_WIDTH,
+    SMALL_ROTARY_TOKENS,
+    encode_indexpool_fp8,
+    index_rotary_frequencies,
+    index_scale_transitions,
+)
 from .index_pool_select import select_paged_pool, select_sharded_paged_pool, supports_sharded_recall
 from .mla_prolog import CANNBotBf16MlaProlog
 from .output_gate import gate_dynamic_mx_quant
@@ -167,9 +173,12 @@ class FlashAttentionBackend(CacheOnlyAttentionBackend):
 
 
 class FlashIndexPool(nn.Module):
-    def __init__(self, config, quant_config, rope_parameters, prefix, *, fuse_fp8_encoding=False):
+    def __init__(self, config, quant_config, rope_parameters, prefix, *, fuse_fp8_encoding=False, fuse_rotary=False):
         super().__init__()
         self.fuse_fp8_encoding = fuse_fp8_encoding
+        self.fuse_rotary = fuse_rotary
+        self.register_buffer("_rotary_inverse", None, persistent=False)
+        self.register_buffer("_scale_transitions", None, persistent=False)
         self.ratio = config.compressed_indexer_compress_ratio
         self.budget = config.compressed_indexer_group_topk - 1
         self.num_heads = config.compressed_indexer_num_attention_heads
@@ -198,6 +207,17 @@ class FlashIndexPool(nn.Module):
         self.key_norm = nn.RMSNorm(INDEX_DIM, eps=self.eps, dtype=torch.float32)
         self.intra_group_ape = nn.Parameter(torch.empty(self.ratio, INDEX_DIM, dtype=torch.float32))
 
+    @torch.no_grad()
+    def process_weights_after_loading(self):
+        if not self.fuse_rotary or not self.fuse_fp8_encoding or self.rope_dim != INDEX_ROTARY_WIDTH:
+            return
+        device = self.key_norm.weight.device
+        if device.type == "npu" and self._scale_transitions is None:
+            self._rotary_inverse = self.theta ** (
+                -torch.arange(0, self.rope_dim, 2, device=device, dtype=torch.float32) / self.rope_dim
+            )
+            self._scale_transitions = index_scale_transitions(device)
+
     def rotate(self, vectors, positions):
         inverse = self.theta ** (
             -torch.arange(0, self.rope_dim, 2, device=vectors.device, dtype=torch.float32) / self.rope_dim
@@ -220,22 +240,38 @@ class FlashIndexPool(nn.Module):
             (nope, (even * cos - odd * sin).to(vectors.dtype), (odd * cos + even * sin).to(vectors.dtype)), dim=-1
         )
 
-    def _encode_fp8(self, vectors, *, full_graph):
-        if (
+    def _encode_rotated(self, vectors, positions, *, full_graph):
+        use_fused = (
             full_graph
             and self.fuse_fp8_encoding
             and vectors.device.type == "npu"
             and vectors.dtype == torch.bfloat16
-            and vectors.is_contiguous()
             and 0 < vectors.numel() <= MAX_FUSED_INDEXPOOL_ROWS * INDEX_DIM
+        )
+        if (
+            use_fused
+            and self._scale_transitions is not None
+            and self.rope_dim == INDEX_ROTARY_WIDTH
+            and vectors.is_contiguous()
+            and 0 < vectors.shape[0] <= SMALL_ROTARY_TOKENS
+            and positions.shape[-1] == vectors.shape[0]
+            and (
+                positions.ndim == 1
+                or (positions.ndim == 2 and positions.shape[0] == 3 and self.sections and len(self.sections) == 3)
+            )
         ):
-            return encode_indexpool_fp8(vectors)
-        return indexpool_fp8(vectors)
+            cosine, sine = index_rotary_frequencies(positions, self._rotary_inverse, self.sections, self.interleaved)
+            logger.info_once("HYV4 Flash fuses small IndexPool rotations with the FP8 Hadamard transform.")
+            return encode_indexpool_fp8(vectors, cosine=cosine, sine=sine, transitions=self._scale_transitions)
+        rotated = self.rotate(vectors, positions)
+        if use_fused and rotated.is_contiguous():
+            return encode_indexpool_fp8(rotated)
+        return indexpool_fp8(rotated)
 
     def encode_queries(self, hidden, q_c, positions, *, full_graph=False):
         query = self.query_projection(q_c)[0].reshape(-1, self.num_heads, INDEX_DIM)
         weight = self.head_weight_projection(hidden)[0].float() * (self.num_heads * INDEX_DIM) ** -0.5
-        return self._encode_fp8(self.rotate(query, positions), full_graph=full_graph), weight
+        return self._encode_rotated(query, positions, full_graph=full_graph), weight
 
     def encode_keys(self, raw, positions, *, full_graph=False):
         groups = raw.shape[0] // self.ratio
@@ -250,8 +286,7 @@ class FlashIndexPool(nn.Module):
             self.key_norm.weight,
             self.eps,
         )
-        pooled = self.rotate(pooled, positions[..., : groups * self.ratio : self.ratio])
-        return self._encode_fp8(pooled, full_graph=full_graph)
+        return self._encode_rotated(pooled, positions[..., : groups * self.ratio : self.ratio], full_graph=full_graph)
 
 
 class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
@@ -409,6 +444,8 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
                 quant,
                 rope_parameters,
                 f"{prefix}.indexer",
+                fuse_rotary=use_a5_c8
+                and vllm_config.additional_config.get("hy4flash_fuse_indexpool_rotate_encode", False),
                 fuse_fp8_encoding=use_a5_c8 and vllm_config.additional_config.get("hy4flash_fuse_indexpool_fp8", True),
             )
         )
