@@ -39,7 +39,12 @@ class DFlyAttention(AscendHYV4FlashAttention):
         # part of draft weight traversal and post-processing.
         self.target_attention = ref(source)
 
-    def _forward_paged(self, hidden, q_c, q_nope, q_pe, kv_c, k_pe, positions, out, *, absorbed=False):
+    def _is_decode_verification(self):
+        return self.context is not None
+
+    def _forward_paged(
+        self, hidden, q_c, q_nope, q_pe, kv_c, k_pe, positions, out, *, absorbed=False, ready_query=None
+    ):
         if self.context is None:
             return
         block_size, block_table, indices, query_positions = self.context
@@ -48,7 +53,10 @@ class DFlyAttention(AscendHYV4FlashAttention):
         cache = source.kv_cache
         cache = cache.view(-1, source.cache_width)
         batch, width = query_positions.shape
-        query, wv = self._absorb_query(q_nope, q_pe, absorbed=absorbed)
+        if ready_query is None:
+            query, wv = self._absorb_query(q_nope, q_pe, absorbed=absorbed)
+        else:
+            query, wv = ready_query, self.absorption_weights.value
         query_kv = self._pack_kv(kv_c, k_pe).reshape(batch, width, -1)
         for first in range(0, batch, ATTENTION_BATCH_CHUNK):
             last = min(first + ATTENTION_BATCH_CHUNK, batch)

@@ -57,6 +57,7 @@ from .index_pool_fp8 import (
 from .index_pool_select import select_paged_pool, select_sharded_paged_pool, supports_sharded_recall
 from .mla_prolog import CANNBotBf16MlaProlog
 from .output_gate import gate_dynamic_mx_quant
+from .packed_query import ACL_FORMAT_ND, MLAAbsorptionWeights, kv_b_weight_views, pack_rotary_query
 from .prefill_c8 import (
     C8_QUERY_DIM,
     INDEX_SCORE_QUERY_BATCH,
@@ -66,7 +67,6 @@ from .prefill_c8 import (
     prefill_window_indices,
 )
 
-ACL_FORMAT_ND = 2
 C8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
 C8_GPU_MIN_SCALE = 1e-4
 BF16_QUERY_PROJECTION_LAYER = 1
@@ -429,6 +429,11 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
         )
         # Absorbed MLA reads this projection's weight directly, as in DSV4.1 wo_a.
         self.kv_b_proj.skip_weight_nz_conversion = True
+        self.absorption_weights = None
+        if use_a5_c8 and vllm_config.additional_config.get("hy4flash_pack_mla_query", False):
+            self.absorption_weights = MLAAbsorptionWeights(
+                self.kv_b_proj, self.local_heads, self.nope_dim, self.v_dim, self.latent_dim
+            )
         self.linear_gate = ColumnParallelLinear(
             hidden, heads * self.v_dim, bias=False, quant_config=quant, prefix=f"{prefix}.linear_gate"
         )
@@ -505,6 +510,32 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
         q_c = self.q_a_layernorm(q_a)
         return self.q_b_proj(q_c)[0], q_c
 
+    def _can_pack_query(self, positions, q_rope, k_rope):
+        rotary = self.rotary_emb
+        return (
+            self.absorption_weights is not None
+            and self.absorption_weights.key is not None
+            and q_rope.shape[0] == BATCH_VERIFY_MAX_QUERIES
+            and q_rope.device.type == "npu"
+            and q_rope.dtype == k_rope.dtype == rotary.cos_sin_cache.dtype == torch.bfloat16
+            and q_rope.stride(-1) == k_rope.stride(-1) == 1
+            and (self.latent_dim, self.rope_dim) == (512, 64)
+            and (rotary.head_size, rotary.rotary_dim) == (64, 64)
+            and not rotary.is_neox_style
+            and getattr(rotary, "mrope_interleaved", False)
+            and len(rotary.mrope_section) == 3
+            and positions.shape == (3, q_rope.shape[0])
+            and rotary.cos_sin_cache.ndim == 2
+            and rotary.cos_sin_cache.shape[-1] == self.rope_dim
+            and rotary.cos_sin_cache.is_contiguous()
+            and rotary.cos_sin_cache.device == q_rope.device
+            and self._is_decode_verification()
+        )
+
+    def _is_decode_verification(self):
+        metadata = get_flash_attention_metadata()
+        return metadata is not None and metadata.decode_seq_lens is not None
+
     def _can_fuse_output_gate(self, value: torch.Tensor) -> bool:
         scheme = getattr(self.o_proj.quant_method, "quant_method", None)
         return (
@@ -556,8 +587,17 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
             kv_c, k_pe = self.kv_a_proj_with_mqa(hidden_states)[0].split((self.latent_dim, self.rope_dim), -1)
             kv_c = self.kv_a_layernorm(kv_c)
             q_nope, q_pe = q.split((self.nope_dim, self.rope_dim), dim=-1)
-        q_pe, k_pe = self.rotary_emb(positions, q_pe.reshape(q.shape[0], -1).contiguous(), k_pe.contiguous())
-        q_pe = q_pe.reshape(-1, self.local_heads, self.rope_dim)
+        ready_query = None
+        if self._can_pack_query(positions, q_pe, k_pe):
+            latent = q_nope if absorbed else _head_bmm(q_nope, self.absorption_weights.key)
+            rotary = self.rotary_emb
+            ready_query, k_pe = pack_rotary_query(
+                q_pe, k_pe, latent, positions, rotary.cos_sin_cache, rotary.mrope_section
+            )
+            logger.info_once("HYV4 Flash packs the absorbed verification query and rotates its C8 key.")
+        else:
+            q_pe, k_pe = self.rotary_emb(positions, q_pe.reshape(q.shape[0], -1).contiguous(), k_pe.contiguous())
+            q_pe = q_pe.reshape(-1, self.local_heads, self.rope_dim)
         out = hidden_states.new_zeros((q.shape[0], self.local_heads * self.v_dim))
         meta = get_flash_attention_metadata() if self.fuse_attn_output_gate or self.overlap_attn_output_gate else None
         full_decode = meta is not None and meta.decode_seq_lens is not None
@@ -572,7 +612,9 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
                 hidden_states.record_stream(gate_stream)
                 gate = self._project_output_gate(hidden_states, fuse_gate)
 
-        self._forward_paged(hidden_states, q_c, q_nope, q_pe, kv_c, k_pe, positions, out, absorbed=absorbed)
+        self._forward_paged(
+            hidden_states, q_c, q_nope, q_pe, kv_c, k_pe, positions, out, absorbed=absorbed, ready_query=ready_query
+        )
         if overlap_gate:
             main_stream.wait_stream(gate_stream)
             gate.record_stream(main_stream)
@@ -596,7 +638,9 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
             output = sp_reduce_scatter(output)
         return self.post_proj_norm(output) if self.post_proj_norm is not None else output
 
-    def _forward_paged(self, hidden, q_c, q_nope, q_pe, kv_c, k_pe, positions, out, *, absorbed=False):
+    def _forward_paged(
+        self, hidden, q_c, q_nope, q_pe, kv_c, k_pe, positions, out, *, absorbed=False, ready_query=None
+    ):
         metadata = get_forward_context().attn_metadata
         if not isinstance(metadata, dict) or self.layer_name not in metadata:
             return
@@ -611,7 +655,10 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
             snapshot[:num_tokens].fill_(-1)
         full_graph = meta.decode_seq_lens is not None
         keys = self._write_cache_rows(cache, meta, hidden, kv_c, k_pe, positions, num_tokens, full_graph=full_graph)
-        query, wv = self._absorb_query(q_nope[:num_tokens], q_pe[:num_tokens], absorbed=absorbed)
+        if ready_query is None:
+            query, wv = self._absorb_query(q_nope[:num_tokens], q_pe[:num_tokens], absorbed=absorbed)
+        else:
+            query, wv = ready_query[:num_tokens], self.absorption_weights.value
         if full_graph:
             self._forward_decode_graph(meta, cache, block_size, hidden, q_c, positions, query, wv, out)
             return
@@ -1121,17 +1168,22 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
         )
 
     def _kv_b_weights(self):
-        weight = self.kv_b_proj.weight.data
-        if torch_npu.get_npu_format(weight) != ACL_FORMAT_ND:
-            weight = torch_npu.npu_format_cast(weight, ACL_FORMAT_ND)
-        return weight.reshape(self.local_heads, self.nope_dim + self.v_dim, self.latent_dim).split(
-            (self.nope_dim, self.v_dim), dim=1
-        )
+        return kv_b_weight_views(self.kv_b_proj, self.local_heads, self.nope_dim, self.v_dim, self.latent_dim)
 
     def _absorb_query(self, q_nope, q_pe, *, absorbed=False):
-        wk, wv = self._kv_b_weights()
+        if (
+            self.absorption_weights is not None
+            and self.absorption_weights.key is not None
+            and q_nope.shape[0] == BATCH_VERIFY_MAX_QUERIES
+            and self._is_decode_verification()
+        ):
+            wk = self.absorption_weights.key
+            value_weight = self.absorption_weights.value
+        else:
+            wk, wv = self._kv_b_weights()
+            value_weight = wv.transpose(1, 2).contiguous()
         q_latent = q_nope if absorbed else _head_bmm(q_nope, wk.contiguous())
-        return torch.cat((q_latent, q_pe), dim=-1), wv.transpose(1, 2).contiguous()
+        return torch.cat((q_latent, q_pe), dim=-1), value_weight
 
     def _attend(self, query, selected, kv_selected, wv, out):
         if self.use_fp8_cache:
