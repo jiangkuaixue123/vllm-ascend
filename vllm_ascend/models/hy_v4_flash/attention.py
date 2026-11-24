@@ -48,7 +48,7 @@ from .c8_write import write_c8_rows
 from .decode_layout import VerificationLayout, decode_positions, dense_candidates, pool_update_positions, window_history
 from .index_pool_cache import copy_pool_keys
 from .index_pool_fp8 import encode_indexpool_fp8
-from .index_pool_select import select_paged_pool
+from .index_pool_select import select_paged_pool, select_sharded_paged_pool, supports_sharded_recall
 from .mla_prolog import CANNBotBf16MlaProlog
 from .output_gate import gate_dynamic_mx_quant
 from .prefill_c8 import (
@@ -299,6 +299,12 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
         )
         self.fuse_indexpool_select = (
             use_a5_c8 and not reuse_target and vllm_config.additional_config.get("hy4flash_fuse_indexpool_select", True)
+        )
+        self.shard_indexpool_scores = (
+            self.fuse_indexpool_select
+            and vllm_config.additional_config.get("hy4flash_shard_indexpool_scores", False)
+            and vllm_config.parallel_config.tensor_parallel_size == 8
+            and vllm_config.parallel_config.data_parallel_size == 1
         )
         self.share_swa_c8_reads = use_a5_c8 and vllm_config.additional_config.get("hy4flash_share_swa_c8_reads", True)
         self.fuse_swa_q_norm = (
@@ -837,6 +843,14 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
                 and index_query.is_contiguous()
                 and index_weight.is_contiguous()
             )
+        use_sharded_pool = (
+            use_paged_pool
+            and self.shard_indexpool_scores
+            and seq_lens.shape[0] == 1
+            and supports_sharded_recall(
+                block_size, self.max_model_len // self.indexer.ratio, self.indexer.ratio, self.indexer.budget
+            )
+        )
         for request in range(seq_lens.shape[0]):
             start = request * num_queries
             stop = start + num_queries
@@ -858,7 +872,8 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
                     ratio = self.indexer.ratio
                     if use_paged_pool:
                         logger.info_once("HYV4 Flash uses paged IndexPool scoring for six verification queries.")
-                        selected = select_paged_pool(
+                        select = select_sharded_paged_pool if use_sharded_pool else select_paged_pool
+                        selected = select(
                             index_query[start:stop],
                             index_weight[start:stop],
                             cache,
@@ -874,12 +889,13 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
                         selected = sparse_candidates(
                             index_query[start:stop], index_weight[start:stop], pool, visible, ratio, self.indexer.budget
                         )
-                    if layout is not None:
-                        dense, recall = layout.dense_prefix(selected.shape[-1], ratio, self.indexer.budget)
-                    else:
-                        dense = dense_candidates(visible, selected.shape[-1])
-                        recall = (visible // ratio > self.indexer.budget)[:, None]
-                    selected = torch.where(recall, selected, dense)
+                    if not use_sharded_pool:
+                        if layout is not None:
+                            dense, recall = layout.dense_prefix(selected.shape[-1], ratio, self.indexer.budget)
+                        else:
+                            dense = dense_candidates(visible, selected.shape[-1])
+                            recall = (visible // ratio > self.indexer.budget)[:, None]
+                        selected = torch.where(recall, selected, dense)
                 else:
                     selected = dense_candidates(visible, self.max_model_len)
             if snapshot is not None:
