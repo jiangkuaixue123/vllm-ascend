@@ -75,6 +75,7 @@ from .index_pool_select import (
 )
 from .layer_recall import paired_recall_layer, recall_rows_for_forward
 from .mla_prolog import CANNBotBf16MlaProlog
+from .native_pool_updates import plan_pool_refresh, refresh_pool_keys
 from .ordered_verification_scatter import rank_ordered_scatter, supports_ordered_scatter
 from .output_gate import gate_dynamic_mx_quant
 from .packed_query import ACL_FORMAT_ND, MLAAbsorptionWeights, kv_b_weight_views, pack_rotary_query
@@ -107,6 +108,8 @@ BATCH_VERIFY_SWA_SHAPE = (8, 512)
 BATCH_VERIFY_SPARSE_SHAPE = (4, 2048)
 # Queries, index heads, compression ratio, and complete groups recalled.
 PAGED_POOL_DECODE_SHAPE = (6, 16, 4, 511)
+# Bound the single-vector last-writer comparison used for potentially shared pages.
+MAX_BATCHED_POOL_UPDATES = 32
 # Store three int64 MRoPE coordinates in the BF16 sidecar by bit reinterpretation.
 POSITION_LANES = 3 * torch.int64.itemsize // torch.bfloat16.itemsize
 
@@ -206,10 +209,22 @@ class FlashIndexPageBackend(FlashAttentionBackend):
 
 
 class FlashIndexPool(nn.Module):
-    def __init__(self, config, quant_config, rope_parameters, prefix, *, fuse_fp8_encoding=False, fuse_rotary=False):
+    def __init__(
+        self,
+        config,
+        quant_config,
+        rope_parameters,
+        prefix,
+        *,
+        fuse_fp8_encoding=False,
+        fuse_rotary=False,
+        compact_updates=False,
+    ):
         super().__init__()
         self.fuse_fp8_encoding = fuse_fp8_encoding
         self.fuse_rotary = fuse_rotary
+        self.compact_updates = compact_updates
+        self.register_buffer("pool_projection", None, persistent=False)
         self.register_buffer("_rotary_inverse", None, persistent=False)
         self.register_buffer("_scale_transitions", None, persistent=False)
         self.ratio = config.compressed_indexer_compress_ratio
@@ -242,6 +257,16 @@ class FlashIndexPool(nn.Module):
 
     @torch.no_grad()
     def process_weights_after_loading(self):
+        if (
+            getattr(self, "compact_updates", False)
+            and self.ratio == POOL_RATIO
+            and self.key_norm.weight.device.type == "npu"
+        ):
+            weights = (self.key_value_projection.weight, self.key_gate_projection.weight)
+            if self.pool_projection is None:
+                self.pool_projection = torch.cat(weights)
+            else:
+                torch.cat(weights, out=self.pool_projection)
         if not self.fuse_rotary or not self.fuse_fp8_encoding or self.rope_dim != INDEX_ROTARY_WIDTH:
             return
         device = self.key_norm.weight.device
@@ -540,6 +565,8 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
                 quant,
                 rope_parameters,
                 f"{prefix}.indexer",
+                compact_updates=use_a5_c8
+                and vllm_config.additional_config.get("hy4flash_compact_index_updates", False),
                 fuse_rotary=use_a5_c8
                 and vllm_config.additional_config.get("hy4flash_fuse_indexpool_rotate_encode", False),
                 fuse_fp8_encoding=use_a5_c8 and vllm_config.additional_config.get("hy4flash_fuse_indexpool_fp8", True),
@@ -1154,6 +1181,27 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
                 block_size, self.max_model_len // self.indexer.ratio, self.indexer.ratio, self.indexer.budget
             )
         )
+        compact_refresh = (
+            getattr(self.indexer, "pool_projection", None) is not None
+            and self.incremental_index_pool
+            and self.page_planes
+            and cache.device.type == "npu"
+            and cache.dtype == torch.uint8
+            and block_size == PAGE_TOKENS
+            and cache.shape[-1] == PAGE_BYTES
+            and meta.block_table.stride(-1) == 1
+            and positions.ndim in (1, 2)
+            and 0 < num_queries <= BATCH_VERIFY_MAX_QUERIES
+            and seq_lens.shape[0] * ((num_queries + POOL_RATIO - 1) // POOL_RATIO) <= MAX_BATCHED_POOL_UPDATES
+        )
+        if compact_refresh:
+            slots = (
+                layout.get_native_update_slots(meta.block_table)
+                if layout is not None
+                else plan_pool_refresh(seq_lens, meta.block_table, num_queries)
+            )
+            refresh_pool_keys(self.indexer, cache, slots, positions.ndim)
+            logger.info_once("HYV4 Flash refreshes request-local native IndexPool keys together across decode batches.")
         assigned_rows = None
         if (
             use_paged_pool
@@ -1167,13 +1215,14 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
             )
         ):
             # All ranks keep all local physical pages current. Scores alone are distributed.
-            for request in range(seq_lens.shape[0]):
-                update = (
-                    layout.pool_update(self.indexer.ratio, request)
-                    if layout is not None
-                    else pool_update_positions(seq_lens[request], num_queries, self.indexer.ratio)
-                )
-                self._update_decode_pool(cache, meta.block_table[request], block_size, update, positions.ndim)
+            if not compact_refresh:
+                for request in range(seq_lens.shape[0]):
+                    update = (
+                        layout.pool_update(self.indexer.ratio, request)
+                        if layout is not None
+                        else pool_update_positions(seq_lens[request], num_queries, self.indexer.ratio)
+                    )
+                    self._update_decode_pool(cache, meta.block_table[request], block_size, update, positions.ndim)
             if query_stream is not None:
                 consumer = torch.npu.current_stream()
                 consumer.wait_stream(query_stream)
@@ -1222,13 +1271,14 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
                     else window_candidates(visible, window)
                 )
             else:
-                if self.incremental_index_pool and assigned_rows is None:
+                if self.incremental_index_pool and (not compact_refresh or use_sharded_pool) and assigned_rows is None:
                     update = (
                         layout.pool_update(self.indexer.ratio, request)
                         if layout is not None
                         else pool_update_positions(seq_lens[request], num_queries, self.indexer.ratio)
                     )
-                    self._update_decode_pool(cache, table, block_size, update, positions.ndim)
+                    if not compact_refresh:
+                        self._update_decode_pool(cache, table, block_size, update, positions.ndim)
                 if reused_rows is not None:
                     selected = reused_rows[request]
                 elif assigned_rows is not None:

@@ -7,6 +7,8 @@ from dataclasses import dataclass, field
 import torch
 from vllm.models.hy_v4_flash.reference import window_candidates
 
+from .native_pool_updates import plan_pool_refresh
+
 
 def decode_positions(seq_lens, slots, num_queries):
     live = slots.view(-1, num_queries) >= 0
@@ -47,6 +49,7 @@ class VerificationLayout:
     window_candidates: dict = field(default_factory=dict)
     pool_updates: dict = field(default_factory=dict)
     visible_pool_pages: dict = field(default_factory=dict)
+    native_update_slots: tuple | None = None
     dense_prefixes: dict = field(default_factory=dict)
 
     @classmethod
@@ -59,6 +62,14 @@ class VerificationLayout:
             num_tokens = meta.decode_seq_lens.numel() * num_queries
             layouts[key] = cls(*decode_positions(meta.decode_seq_lens, meta.slot_mapping[:num_tokens], num_queries))
         return layouts[key]
+
+    def get_native_update_slots(self, table):
+        # The layout belongs to one metadata group and graph forward. Retain the table
+        # itself so another view or KV group always resolves its own physical addresses.
+        if self.native_update_slots is None or self.native_update_slots[0] is not table:
+            slots = plan_pool_refresh(self.seq_lens, table, self.logical.shape[1])
+            self.native_update_slots = (table, slots)
+        return self.native_update_slots[1]
 
     def get_window_history(self, window):
         if window not in self.window_rows:
