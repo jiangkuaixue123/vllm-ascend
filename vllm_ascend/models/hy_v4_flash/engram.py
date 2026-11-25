@@ -411,6 +411,17 @@ class FlashEngram(nn.Module):
             else:
                 torch.stack(parts, out=current)
 
+    def _can_group_feature_projections(self, hidden, x, embedding_rows):
+        return (
+            self.channel_weights is not None
+            and hidden.ndim == 3
+            and hidden.shape[1:] == (_FEATURE_CHANNELS, _FEATURE_HIDDEN_SIZE)
+            and (hidden.shape[0] == _FEATURE_VERIFY_TOKENS or (embedding_rows is not None and hidden.shape[0] > 0))
+            and hidden.device.type == "npu"
+            and hidden.dtype == x.dtype == self.channel_weights.dtype == torch.bfloat16
+            and hidden.is_contiguous()
+        )
+
     def _mix_feature_channels(self, x, hidden, hashes):
         projected = nn.functional.linear(x, self.channel_weights.flatten(0, 1), self.channel_biases.flatten())
         projected = tensor_model_parallel_all_reduce(projected).view(x.shape[0], self.hc_mult + 1, self.hidden_size)
@@ -441,13 +452,7 @@ class FlashEngram(nn.Module):
         x = rows.masked_fill(local_hashes.unsqueeze(-1) < 0, 0)
         x = (x * (x.square().mean(-1, keepdim=True) + eps).rsqrt() * gamma).to(hidden.dtype)
         x = x.flatten(1)
-        if (
-            self.channel_weights is not None
-            and hidden.shape == (_FEATURE_VERIFY_TOKENS, _FEATURE_CHANNELS, _FEATURE_HIDDEN_SIZE)
-            and hidden.device.type == "npu"
-            and hidden.dtype == x.dtype == self.channel_weights.dtype == torch.bfloat16
-            and hidden.is_contiguous()
-        ):
+        if self._can_group_feature_projections(hidden, x, embedding_rows):
             logger.info_once("HYV4 Flash groups the four feature keys and their value in a single TP reduction.")
             return self._mix_feature_channels(x, hidden, hashes)
         gates = []
