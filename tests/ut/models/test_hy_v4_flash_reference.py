@@ -436,14 +436,31 @@ def test_copy_only_group_preserves_rank_order_and_fallback(monkeypatch):
     assert fallback.call_count == 7
 
 
-def test_ordered_scatter_requires_six_contiguous_bf16_rows():
-    from vllm_ascend.models.hy_v4_flash.ordered_verification_scatter import supports_ordered_scatter
+def test_ordered_scatter_uses_only_validated_decode_shapes(monkeypatch):
+    from types import SimpleNamespace
 
-    rows = torch.zeros(6, 3072, dtype=torch.bfloat16)
-    assert supports_ordered_scatter(rows)
-    assert not supports_ordered_scatter(rows[:1])
-    assert not supports_ordered_scatter(rows.float())
-    assert not supports_ordered_scatter(torch.empty(3072, 6, dtype=torch.bfloat16).T)
+    from vllm_ascend.models.hy_v4_flash import ordered_verification_scatter as scatter
+
+    config = SimpleNamespace(
+        compilation_config=SimpleNamespace(decode_cudagraph_capture_request_sizes=[1, 4, 8, 16]),
+        speculative_config=SimpleNamespace(num_speculative_tokens=5),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=96),
+    )
+    probed = []
+
+    def check(tp, group, local_rows):
+        probed.append(local_rows)
+        return local_rows != 3
+
+    monkeypatch.setattr(scatter, "matches_native_scatter", check)
+    shards = scatter.checked_verification_shards(config, None, None)
+    assert probed == [1, 2, 3, 6, 12]
+    assert shards == {1, 2, 6, 12}
+    for size in (5, 6, 13, 16, 45, 48, 91, 96):
+        assert scatter.supports_ordered_scatter(torch.zeros(size, 3072, dtype=torch.bfloat16), shards)
+    assert not scatter.supports_ordered_scatter(torch.zeros(24, 3072, dtype=torch.bfloat16), shards)
+    assert not scatter.supports_ordered_scatter(torch.zeros(6, 3072), shards)
+    assert not scatter.supports_ordered_scatter(torch.empty(3072, 6, dtype=torch.bfloat16).T, shards)
 
 
 def test_resident_pool_invalidation_preserves_captured_storage():

@@ -504,6 +504,7 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
         self.sequence_parallel_output = False
         self.ordered_scatter_group = None
         self.ordered_scatter_rank = 0
+        self.ordered_scatter_shards = frozenset()
         rope_parameters = config.rope_for_layer(layer_idx)
         self.rotary_emb = get_rope(
             self.rope_dim,
@@ -780,8 +781,7 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
             if (
                 self.ordered_scatter_group is not None
                 and full_decode
-                and meta.decode_seq_lens.numel() == 1
-                and supports_ordered_scatter(output)
+                and supports_ordered_scatter(output, self.ordered_scatter_shards)
             ):
                 output = rank_ordered_scatter(output, self.ordered_scatter_group, self.ordered_scatter_rank)
                 logger.info_once("HYV4 Flash reduces verification rows in the checked BF16 rank order.")

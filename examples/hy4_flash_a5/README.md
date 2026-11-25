@@ -47,7 +47,7 @@ The recipe reserves 131,584 positions for requests with 130,048 input and 1,024 
 | `hy4flash_sharded_greedy_verify` | Uses a compact TP8 reduction for unprocessed greedy verification. Non-greedy requests and requests needing log probabilities, transforms or structured output use the existing target sampler. |
 | `hy4flash_native_index_pages` | Requests 64-token KV pages for native C8 and contiguous pooled IndexPool keys. This increases each cached token from 1,000 to 1,025 bytes. Other explicitly requested page sizes keep the standard layout. |
 | `hy4flash_ccu_copy_gathers` | Uses a separate CCU group to gather BF16 token shards up to 288 KiB per rank and exchange vocabulary winners on eight A5 devices. |
-| `hy4flash_ordered_verify_scatter` | On eight A5 devices, exchanges six verification rows and sums each BF16 shard in the native rank order. Uses the original reduction if the startup comparison differs. |
+| `hy4flash_ordered_verify_scatter` | On eight A5 devices, exchanges each destination’s BF16 rows and reproduces the native reduction order. Each configured decode size uses this path after its padded geometry matches the original reduction at startup. |
 | `hy4flash_resident_index_keys` | Keeps a per-layer BF16 view of active pooled keys, refreshing changed pages and invalidating it on other cache writes. Requires native pages and disabled prefix caching and KV transfer. |
 | `hy4flash_draft_projection_sums` | Checks the native BF16 sum before switching supported single-request DFly projection widths to the measured transport. |
 | `hy4flash_overlap_decode_kv` | Computes KV normalization and C8 quantization alongside the independent query projection during native-page decode. |
