@@ -219,3 +219,23 @@ def index_rotary_frequencies(positions, inverse, sections, interleaved):
         enable_fp_fusion=False,
     )
     return phase.cos(), phase.sin()
+
+
+def shared_query_frequencies(cache, positions, inverse, sections, interleaved, theta, stream):
+    """Reuse identical runner positions on one stream during one target forward."""
+    key = (
+        positions.device,
+        positions.data_ptr(),
+        positions.shape,
+        positions.stride(),
+        positions.dtype,
+        theta,
+        tuple(sections or ()),
+        interleaved,
+        stream,
+    )
+    if key not in cache:
+        # Retain the view for the forward lifetime so a freed allocation cannot reuse its address.
+        values = index_rotary_frequencies(positions, inverse, sections, interleaved)
+        cache[key] = (positions, values)
+    return cache[key][1]

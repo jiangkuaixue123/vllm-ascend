@@ -11,7 +11,7 @@ import torch_npu
 from torch import nn
 from vllm.config.cache import CacheDType
 from vllm.distributed import get_tensor_model_parallel_world_size
-from vllm.forward_context import get_forward_context
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -63,6 +63,7 @@ from .index_pool_fp8 import (
     encode_indexpool_fp8,
     index_rotary_frequencies,
     index_scale_transitions,
+    shared_query_frequencies,
 )
 from .index_pool_select import (
     select_native_page_pool,
@@ -271,7 +272,7 @@ class FlashIndexPool(nn.Module):
             (nope, (even * cos - odd * sin).to(vectors.dtype), (odd * cos + even * sin).to(vectors.dtype)), dim=-1
         )
 
-    def _encode_rotated(self, vectors, positions, *, full_graph):
+    def _encode_rotated(self, vectors, positions, *, full_graph, query_rows=False):
         use_fused = (
             full_graph
             and self.fuse_fp8_encoding
@@ -284,14 +285,29 @@ class FlashIndexPool(nn.Module):
             and self._scale_transitions is not None
             and self.rope_dim == INDEX_ROTARY_WIDTH
             and vectors.is_contiguous()
-            and 0 < vectors.shape[0] <= SMALL_ROTARY_TOKENS
+            and (query_rows or 0 < vectors.shape[0] <= SMALL_ROTARY_TOKENS)
             and positions.shape[-1] == vectors.shape[0]
             and (
                 positions.ndim == 1
                 or (positions.ndim == 2 and positions.shape[0] == 3 and self.sections and len(self.sections) == 3)
             )
         ):
-            cosine, sine = index_rotary_frequencies(positions, self._rotary_inverse, self.sections, self.interleaved)
+            if query_rows and is_forward_context_available():
+                cache = get_forward_context().additional_kwargs.setdefault("hy4flash_index_query_frequencies", {})
+                cosine, sine = shared_query_frequencies(
+                    cache,
+                    positions,
+                    self._rotary_inverse,
+                    self.sections,
+                    self.interleaved,
+                    self.theta,
+                    torch.npu.current_stream().npu_stream,
+                )
+                logger.info_once("HYV4 Flash shares decode IndexPool query rotation frequencies across target layers.")
+            else:
+                cosine, sine = index_rotary_frequencies(
+                    positions, self._rotary_inverse, self.sections, self.interleaved
+                )
             logger.info_once("HYV4 Flash fuses small IndexPool rotations with the FP8 Hadamard transform.")
             return encode_indexpool_fp8(vectors, cosine=cosine, sine=sine, transitions=self._scale_transitions)
         rotated = self.rotate(vectors, positions)
@@ -302,7 +318,7 @@ class FlashIndexPool(nn.Module):
     def encode_queries(self, hidden, q_c, positions, *, full_graph=False):
         query = self.query_projection(q_c)[0].reshape(-1, self.num_heads, INDEX_DIM)
         weight = self.head_weight_projection(hidden)[0].float() * (self.num_heads * INDEX_DIM) ** -0.5
-        return self._encode_rotated(query, positions, full_graph=full_graph), weight
+        return self._encode_rotated(query, positions, full_graph=full_graph, query_rows=full_graph), weight
 
     def encode_keys(self, raw, positions, *, full_graph=False):
         groups = raw.shape[0] // self.ratio
