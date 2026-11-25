@@ -118,16 +118,26 @@ class FlashModelState(AscendModelState):
         engram = self._flash_model.engram_hash
         starts = input_batch.query_start_loc_np
         if not (
-            input_batch.num_reqs == input_batch.num_reqs_after_padding == 1
+            input_batch.num_reqs > 0
+            and history.shape[0] == input_batch.num_reqs
+            and hashes.shape[1] == input_batch.input_ids.numel()
             and supports_verify_hash_geometry(engram, hashes, history)
             and input_batch.input_ids.stride(0) == 1
             and starts[0] == 0
-            and 0 <= starts[1] <= hashes.shape[1]
+            and 0 <= starts[input_batch.num_reqs] <= hashes.shape[1]
+            and (input_batch.num_reqs == 1 or input_batch.query_start_loc.stride(0) == 1)
             and engram.layout.lookup_table is not None
             and all(table.host_weight is not None for table in self._engram_embeddings)
         ):
             return False
-        fill_verify_hashes(engram, input_batch.input_ids, history, int(starts[1]), hashes)
+        fill_verify_hashes(
+            engram,
+            input_batch.input_ids,
+            history,
+            int(starts[input_batch.num_reqs]),
+            hashes,
+            input_batch.query_start_loc if input_batch.num_reqs > 1 else None,
+        )
         for table, layer_hashes, output in zip(self._engram_embeddings, hashes.unbind(), rows):
             fill_host_feature_rows(table, layer_hashes, output)
         logger.info_once("HYV4 Flash reads verification rows directly from registered CPU tables.")
