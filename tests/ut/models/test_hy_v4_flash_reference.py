@@ -483,3 +483,66 @@ def test_draft_projection_sum_preserves_wide_and_non_bf16_reductions():
             out, bias = op.apply_impl(x)
             assert bias is None
             torch.testing.assert_close(out, x + increment)
+
+
+def test_shared_fp32_draft_history_requires_native_single_request_pages():
+    from types import SimpleNamespace
+
+    from vllm_ascend.hisparse.c8 import C8_ROW_BYTES
+    from vllm_ascend.models.hy_v4_flash.shared_precision_history import supports_shared_history
+
+    pages = SimpleNamespace(
+        shape=(1, 1, 64),
+        device=torch.device("meta"),
+        dtype=torch.uint8,
+        is_contiguous=lambda: True,
+        numel=lambda: 1 << 20,
+    )
+    source = SimpleNamespace(kv_cache=pages, page_planes=True, kv_storage_width=C8_ROW_BYTES)
+    table = torch.empty(1, 10, dtype=torch.int32)
+    snapshot = torch.empty(1, 2048, dtype=torch.int64)
+    positions = torch.empty(1, 6, dtype=torch.int64)
+    assert not supports_shared_history(source, table, snapshot, positions, 0)
+    pages.device = SimpleNamespace(type="npu")
+    assert supports_shared_history(source, table, snapshot, positions, 0)
+    assert not supports_shared_history(source, table, snapshot, positions.expand(2, -1), 0)
+    assert not supports_shared_history(source, table, snapshot, positions, 128)
+    source.page_planes = False
+    assert not supports_shared_history(source, table, snapshot, positions, 0)
+
+
+def test_shared_fp32_draft_history_routes_the_six_queries_to_their_own_selected_rows(monkeypatch):
+    from vllm_ascend.models.hy_v4_flash import dfly
+    from vllm_ascend.models.hy_v4_flash.shared_precision_history import SharedPrecisionHistory
+
+    query = torch.randn(6, 4, 5)
+    context = torch.randn(6, 4, 3)
+    weights = torch.randn(4, 3, 2)
+    page_table = torch.arange(8)[None, :]
+    logical = torch.arange(9, 15)[None, :]
+    recall = SharedPrecisionHistory(torch.arange(2048)[None, :], torch.tensor([True]))
+    source = SimpleNamespace(cache_rows=lambda: page_table)
+    draft = torch.zeros(6, 8, dtype=torch.uint8)
+    sink = torch.zeros(4)
+    layer = SimpleNamespace(
+        context=(64, page_table, recall, logical),
+        target_attention=lambda: source,
+        _pack_kv=lambda a, b: draft,
+        learnable_sink_param=sink,
+        scale=0.0625,
+        absorption_weights=SimpleNamespace(value=weights),
+    )
+
+    def attention(q, cache, table, private, selected, anchor, learned_sink, scale, page):
+        assert q is query and selected is recall and cache is page_table and learned_sink is sink
+        assert scale == 0.0625 and page == 64
+        torch.testing.assert_close(table, page_table[0])
+        torch.testing.assert_close(private, draft)
+        torch.testing.assert_close(anchor, logical[:, 0])
+        return context
+
+    monkeypatch.setattr(dfly, "attend_shared_fp32", attention)
+    out = torch.empty(6, 8)
+    dfly.DFlyAttention._forward_paged(layer, None, None, None, None, None, None, None, out, ready_query=query)
+    expected = torch.einsum("qhd,hdk->qhk", context, weights).reshape_as(out)
+    torch.testing.assert_close(out, expected)

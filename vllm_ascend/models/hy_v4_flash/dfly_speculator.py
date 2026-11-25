@@ -18,6 +18,7 @@ from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
 
 from .dfly import CHECKPOINT_PREFIX, MODEL_PREFIX, FlashDFlyDraft
 from .draft_projection_reduce import configure_draft_sums
+from .shared_precision_history import SharedPrecisionHistory, supports_shared_history
 
 
 def build_reuse_indices(target_rows, anchor, width, window, active):
@@ -185,13 +186,16 @@ class FlashDFlySpeculator(DraftModelSpeculator):
             for layer, index_layer, kv_layer, table in zip(
                 self.model.layers, self.index_layers, self.kv_layers, block_tables, strict=True
             ):
-                selected = build_reuse_indices(
-                    index_layer.topk_snapshot[source_rows],
-                    query_positions[:, 0],
-                    self.num_query_per_req,
-                    self.model.config.context_local_window,
-                    active,
-                )
+                snapshot = index_layer.topk_snapshot[source_rows]
+                window = self.model.config.context_local_window
+                if layer.self_attn.shared_fp32_history and supports_shared_history(
+                    kv_layer, table, snapshot, query_positions, window
+                ):
+                    selected = SharedPrecisionHistory(snapshot, active)
+                else:
+                    selected = build_reuse_indices(
+                        snapshot, query_positions[:, 0], self.num_query_per_req, window, active
+                    )
                 layer.self_attn.context = (kv_layer.kv_cache.shape[2], table, selected, query_positions)
             self._draft_tokens(ids, positions, target_hidden, active, result)
         finally:

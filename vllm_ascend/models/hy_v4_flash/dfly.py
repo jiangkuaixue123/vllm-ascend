@@ -7,6 +7,7 @@ from weakref import ref
 import torch
 from torch import nn
 from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.logger import logger
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import MergedColumnParallelLinear, ReplicatedLinear, RowParallelLinear
@@ -16,7 +17,9 @@ from vllm.models.hy_v4.nvidia.model import HYV4DecoderLayer
 from vllm.models.hy_v4.nvidia.moe import HYV4FeedForward
 from vllm.utils.torch_utils import set_default_torch_dtype
 
-from .attention import AscendHYV4FlashAttention
+from .attention import AscendHYV4FlashAttention, _head_bmm
+from .shared_precision_history import SharedPrecisionHistory
+from .shared_precision_history import attend_draft_history as attend_shared_fp32
 
 CHECKPOINT_PREFIX = "model.dfly_layers."
 MODEL_PREFIX = "dfly"
@@ -28,6 +31,11 @@ ATTENTION_BATCH_CHUNK = 8
 class DFlyAttention(AscendHYV4FlashAttention):
     def __init__(self, vllm_config, config, layer_idx, prefix):
         super().__init__(vllm_config, config, layer_idx, prefix, reuse_target=True)
+        self.shared_fp32_history = (
+            self.local_heads == 4
+            and self.use_fp8_cache
+            and vllm_config.additional_config.get("hy4flash_shared_fp32_draft_history", False)
+        )
         self.target_attention = None
         self.context = None
         self.post_proj_norm = (
@@ -57,6 +65,21 @@ class DFlyAttention(AscendHYV4FlashAttention):
         else:
             query, wv = ready_query, self.absorption_weights.value
         query_kv = self._pack_kv(kv_c, k_pe).reshape(batch, width, -1)
+        if isinstance(indices, SharedPrecisionHistory):
+            context = attend_shared_fp32(
+                query,
+                cache,
+                block_table[0],
+                query_kv[0],
+                indices,
+                query_positions[:, 0],
+                self.learnable_sink_param,
+                self.scale,
+                block_size,
+            )
+            out.copy_(_head_bmm(context, wv).reshape_as(out))
+            logger.info_once("HYV4 Flash shares one FP32 history matrix across six DFly queries.")
+            return
         for first in range(0, batch, ATTENTION_BATCH_CHUNK):
             last = min(first + ATTENTION_BATCH_CHUNK, batch)
             selected = indices[first:last]
