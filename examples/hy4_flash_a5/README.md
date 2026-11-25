@@ -35,7 +35,7 @@ The recipe reserves 131,584 positions for requests with 130,048 input and 1,024 
 | `hy4flash_native_sparse_c8_verify` | Runs C8 sparse attention on the six target verification rows of a single request. |
 | `hy4flash_fuse_ihc_pre` | Fuses iHC residual-channel gating for small decode batches. |
 | `hy4flash_share_verify_layout` | Reuses the current request's positions and window rows across target layers in a captured forward. |
-| `hy4flash_shard_indexpool_scores` | Divides long-context IndexPool scoring across eight tensor ranks and preserves the global top-k order. |
+| `hy4flash_shard_indexpool_scores` | Divides long-context IndexPool work across eight tensor ranks. Multiple native-page decode requests distribute complete row lists using the CCU copy group, preserving each request’s global top-k order. |
 | `hy4flash_fuse_indexpool_rotate_encode` | Encodes short rotated IndexPool queries and keys in one Hadamard and E4M3 rounding kernel, using scale boundaries obtained on the device. |
 | `hy4flash_pack_window_operands` | Reads overlapping C8 windows once per request and packs FP32 key and value operands for six verification queries per request. |
 | `hy4flash_pack_mla_query` | Prepares MLA projection weights during loading and packs the absorbed queries and interleaved rotary components for all token rows in a decode batch. Uses about 134.8 MiB per rank for this TP8 checkpoint. |

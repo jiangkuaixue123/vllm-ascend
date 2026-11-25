@@ -337,6 +337,39 @@ def select_native_page_pool(
     return _finish_recall(scores, visible, ratio, budget)
 
 
+def select_request_partitioned_pool(
+    query, weights, cache, tables, visible, page_size, max_groups, ratio, budget, group, rank
+):
+    """Exchange logical row lists after scoring complete requests on their owning tensor ranks."""
+    requests, queries = visible.shape
+    per_rank = triton.cdiv(requests, group.size())
+    first = rank * per_rank
+    live = max(0, min(per_rank, requests - first))
+    packet = tables.new_empty((per_rank, queries, (budget + 1) * ratio), dtype=torch.int32)
+    if live < per_rank:
+        packet[live:].zero_()
+    for local in range(live):
+        request = first + local
+        rows = slice(request * queries, (request + 1) * queries)
+        packet[local].copy_(
+            select_native_page_pool(
+                query[rows],
+                weights[rows],
+                cache,
+                tables[request],
+                visible[request],
+                page_size,
+                max_groups,
+                ratio,
+                budget,
+            )
+        )
+    # Physical KV addresses can differ between ranks. Only logical token indices leave the owner.
+    result = packet.new_empty((group.size() * per_rank, *packet.shape[1:]))
+    dist.all_gather_into_tensor(result, packet, group=group)
+    return result[:requests].long()
+
+
 def select_paged_pool(query, weights, cache, table, visible, page_size, max_groups, ratio, budget):
     """Score six verification queries against the BF16 keys in paged IndexPool."""
     scores = _score_groups(query, weights, cache, table, visible, page_size, max_groups, ratio, budget)

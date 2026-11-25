@@ -198,6 +198,8 @@ class AscendHYV4FlashModel(HYV4FlashModel):
             self.copy_group = tp.device_communicator.enable_ccu_copy_group(tp.ranks)
             for layer in self.layers:
                 layer.copy_group = self.copy_group
+                layer.self_attn.request_recall_group = self.copy_group
+                layer.self_attn.request_recall_rank = tp.rank_in_group
             if vllm_config.additional_config.get("hy4flash_ordered_verify_scatter", False):
                 checked_shards = checked_verification_shards(vllm_config, tp, self.copy_group)
                 for layer in self.layers:

@@ -67,6 +67,7 @@ from .index_pool_fp8 import (
 from .index_pool_select import (
     select_native_page_pool,
     select_paged_pool,
+    select_request_partitioned_pool,
     select_sharded_paged_pool,
     supports_sharded_recall,
 )
@@ -502,6 +503,8 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
             and vllm_config.additional_config.get("hy4flash_overlap_verify_projections", False)
         )
         self.sequence_parallel_output = False
+        self.request_recall_group = None
+        self.request_recall_rank = 0
         self.ordered_scatter_group = None
         self.ordered_scatter_rank = 0
         self.ordered_scatter_shards = frozenset()
@@ -1134,6 +1137,41 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
                 block_size, self.max_model_len // self.indexer.ratio, self.indexer.ratio, self.indexer.budget
             )
         )
+        assigned_rows = None
+        if (
+            use_paged_pool
+            and self.shard_indexpool_scores
+            and self.page_planes
+            and seq_lens.shape[0] > 1
+            and self.request_recall_group is not None
+            and cache.shape[-1] == PAGE_BYTES
+            and supports_sharded_recall(
+                block_size, self.max_model_len // self.indexer.ratio, self.indexer.ratio, self.indexer.budget
+            )
+        ):
+            # All ranks keep all local physical pages current. Scores alone are distributed.
+            for request in range(seq_lens.shape[0]):
+                update = pool_update_positions(seq_lens[request], num_queries, self.indexer.ratio)
+                self._update_decode_pool(cache, meta.block_table[request], block_size, update, positions.ndim)
+            if query_stream is not None:
+                consumer = torch.npu.current_stream()
+                consumer.wait_stream(query_stream)
+                index_query.record_stream(consumer)
+                index_weight.record_stream(consumer)
+            assigned_rows = select_request_partitioned_pool(
+                index_query,
+                index_weight,
+                cache,
+                meta.block_table,
+                logical,
+                block_size,
+                self.max_model_len // self.indexer.ratio,
+                self.indexer.ratio,
+                self.indexer.budget,
+                self.request_recall_group,
+                self.request_recall_rank,
+            )
+            logger.info_once("HYV4 Flash partitions complete IndexPool recall requests across tensor ranks.")
         refreshed_pool = False
         for request in range(seq_lens.shape[0]):
             start = request * num_queries
@@ -1145,7 +1183,7 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
                     layout.get_window_candidates(window) if layout is not None else window_candidates(visible, window)
                 )
             else:
-                if self.incremental_index_pool:
+                if self.incremental_index_pool and assigned_rows is None:
                     update = (
                         layout.pool_update(self.indexer.ratio)
                         if layout is not None
@@ -1154,6 +1192,8 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
                     self._update_decode_pool(cache, table, block_size, update, positions.ndim)
                 if reused_rows is not None:
                     selected = reused_rows[request]
+                elif assigned_rows is not None:
+                    selected = assigned_rows[request]
                 elif score_groups:
                     if query_stream is not None:
                         consumer = torch.npu.current_stream()
