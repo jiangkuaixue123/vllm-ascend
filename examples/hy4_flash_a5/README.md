@@ -58,3 +58,5 @@ The recipe reserves 131,584 positions for requests with 130,048 input and 1,024 
 The fixed-length test measures one client request at a time. Each reported TPOT divides the elapsed time between its first and last generated-token events by 1,023. The reported P50 is the median across twenty distinct requests. The accuracy run uses all thirty AIME2026 questions at concurrency sixteen. [Per-request timings and hardware results](https://github.com/InferMatrixLab/InferRSI/issues/613)
 
 The independent sliding and sparse target projections can use the auxiliary stream across a uniform decode batch. Each request retains its own cache updates and the consuming stream waits before using the results.
+
+The target sliding-window verifier groups requests with separate page tables, keeps the complete 512-token window and uses native FP32 QK, softmax and PV. The group-size limit bounds the temporary operands.

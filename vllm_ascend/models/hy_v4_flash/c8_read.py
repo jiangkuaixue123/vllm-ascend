@@ -98,6 +98,8 @@ def _read_window_operands(
     history,
     keys,
     values,
+    TABLE_STRIDE: tl.constexpr,
+    SEPARATE_VALUES: tl.constexpr,
     QUERIES: tl.constexpr,
     WINDOW: tl.constexpr,
     LATENT: tl.constexpr,
@@ -107,6 +109,9 @@ def _read_window_operands(
     ROWS: tl.constexpr,
     SCALE_TILE: tl.constexpr,
 ):
+    request = tl.program_id(2)
+    block_table += request * TABLE_STRIDE
+    history += request * (WINDOW + QUERIES - 1)
     row = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
     group = tl.program_id(1)
     lane = group * SCALE_TILE + tl.arange(0, SCALE_TILE)
@@ -130,20 +135,24 @@ def _read_window_operands(
     for query in tl.static_range(QUERIES):
         local = row - query
         keep = in_bounds & (local >= 0) & (local < WINDOW)
-        dst = query * WINDOW + local
+        dst = (request * QUERIES + query) * WINDOW + local
         tl.store(
             keys + dst[:, None] * (LATENT + ROPE) + lane[None, :], data, keep[:, None] & (lane[None, :] < LATENT + ROPE)
         )
-        if group * SCALE_TILE < LATENT:
+        if SEPARATE_VALUES and group * SCALE_TILE < LATENT:
             tl.store(values + dst[:, None] * LATENT + lane[None, :], data, keep[:, None])
 
 
-def gather_c8_window_operands(cache, block_table, block_size, history, queries, window):
+def gather_c8_window_operands(
+    cache, block_table, block_size, history, queries, window, *, row_tile=_WINDOW_ROW_TILE, separate_values=True
+):
     """Build contiguous native QK and PV operands from the union of consecutive C8 windows."""
-    keys = cache.new_empty((queries, window, _LATENT + _ROPE), dtype=torch.float32)
-    values = cache.new_empty((queries, window, _LATENT), dtype=torch.float32)
+    requests = history.shape[0] if history.ndim == 2 else 1
+    rows = requests * queries
+    keys = cache.new_empty((rows, window, _LATENT + _ROPE), dtype=torch.float32)
+    values = cache.new_empty((rows, window, _LATENT), dtype=torch.float32) if separate_values else keys[:, :, :_LATENT]
     _read_window_operands[
-        (triton.cdiv(history.numel(), _WINDOW_ROW_TILE), triton.cdiv(_LATENT + _ROPE, SFA_QSFA_TILE_SIZE))
+        (triton.cdiv(history.shape[-1], row_tile), triton.cdiv(_LATENT + _ROPE, SFA_QSFA_TILE_SIZE), requests)
     ](
         cache,
         cache.view(torch.bfloat16),
@@ -152,13 +161,15 @@ def gather_c8_window_operands(cache, block_table, block_size, history, queries, 
         history,
         keys,
         values,
+        block_table.stride(0) if block_table.ndim == 2 else 0,
+        separate_values,
         queries,
         window,
         _LATENT,
         _ROPE,
         block_size,
         cache.shape[-1],
-        _WINDOW_ROW_TILE,
+        row_tile,
         SFA_QSFA_TILE_SIZE,
         num_warps=1,
         enable_fp_fusion=False,

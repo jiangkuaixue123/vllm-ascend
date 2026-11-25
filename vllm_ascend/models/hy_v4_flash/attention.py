@@ -105,6 +105,9 @@ MAX_FUSED_OUTPUT_GATE_ELEMENTS = 96 * 2048
 # Equal-width CANN shapes verified on 950DT at TP8.
 BATCH_VERIFY_MAX_QUERIES = 6
 BATCH_VERIFY_SWA_SHAPE = (8, 512)
+# Bound the resident FP32 operands for sliding-window attention.
+WINDOW_REQUEST_CHUNK = 8
+WINDOW_OPERAND_ROW_TILE = 32
 BATCH_VERIFY_SPARSE_SHAPE = (4, 2048)
 # Queries, index heads, compression ratio, and complete groups recalled.
 PAGED_POOL_DECODE_SHAPE = (6, 16, 4, 511)
@@ -1118,6 +1121,46 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
             shared_positions = (
                 layout.get_window_history(window) if layout is not None else window_history(seq_lens, logical, window)
             )
+
+        if (
+            shared_positions is not None
+            and self.pack_window_operands
+            and snapshot is None
+            and query.dtype == torch.bfloat16
+            and cache.device.type == "npu"
+            and meta.block_table.stride(-1) == 1
+            and seq_lens.shape[0] > 1
+        ):
+            # The operands include only these requests' own chronological windows.
+            candidates = (
+                layout.get_batched_window_candidates(window)
+                if layout is not None
+                else window_candidates(logical.flatten(), window).view(*logical.shape, window)
+            )
+            for first in range(0, seq_lens.shape[0], WINDOW_REQUEST_CHUNK):
+                stop = min(first + WINDOW_REQUEST_CHUNK, seq_lens.shape[0])
+                rows = slice(first * num_queries, stop * num_queries)
+                keys, values = gather_c8_window_operands(
+                    cache,
+                    meta.block_table[first:stop],
+                    block_size,
+                    shared_positions[first:stop],
+                    num_queries,
+                    window,
+                    row_tile=WINDOW_OPERAND_ROW_TILE,
+                    separate_values=True,
+                )
+                scores = torch.bmm(query[rows].float(), keys)
+                if torch_npu.get_npu_format(scores) != ACL_FORMAT_ND:
+                    scores = torch_npu.npu_format_cast(scores, ACL_FORMAT_ND)
+                self._attend_decoded(
+                    query[rows], candidates[first:stop].flatten(0, 1), values, wv, out[rows], scores=scores
+                )
+            out[:num_tokens].masked_fill_(~live.reshape(-1, 1), 0)
+            logger.info_once(
+                "HYV4 Flash groups complete sliding-window verification requests in native FP32 contractions."
+            )
+            return
 
         score_groups = self.indexer is not None and self.max_model_len > (self.indexer.budget + 1) * self.indexer.ratio
         reused_rows, published_rows = None, None

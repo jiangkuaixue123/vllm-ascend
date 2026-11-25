@@ -76,11 +76,14 @@ class VerificationLayout:
             self.window_rows[window] = window_history(self.seq_lens, self.logical, window)
         return self.window_rows[window]
 
-    def get_window_candidates(self, window, request):
+    def get_batched_window_candidates(self, window):
         if window not in self.window_candidates:
             candidates = window_candidates(self.logical.flatten(), window)
             self.window_candidates[window] = candidates.view(*self.logical.shape, window)
-        return self.window_candidates[window][request]
+        return self.window_candidates[window]
+
+    def get_window_candidates(self, window, request):
+        return self.get_batched_window_candidates(window)[request]
 
     def pool_update(self, ratio, request):
         if ratio not in self.pool_updates:
