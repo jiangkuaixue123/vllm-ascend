@@ -32,7 +32,7 @@ The recipe reserves 131,584 positions for requests with 130,048 input and 1,024 
 
 | Option | Effect |
 | --- | --- |
-| `hy4flash_native_sparse_c8_verify` | Runs C8 sparse attention on the six target verification rows of a single request. |
+| `hy4flash_native_sparse_c8_verify` | Uses native C8 sparse target verification. With native pages, each request supplies its own page table and valid candidates are packed ahead of padding. |
 | `hy4flash_fuse_ihc_pre` | Fuses iHC residual-channel gating for small decode batches. |
 | `hy4flash_share_verify_layout` | Reuses the current request's positions and window rows across target layers in a captured forward. |
 | `hy4flash_shard_indexpool_scores` | Divides long-context IndexPool work across eight tensor ranks. Multiple native-page decode requests distribute complete row lists using the CCU copy group, preserving each request’s global top-k order. |

@@ -115,3 +115,52 @@ def physical_c8_indices(table, selected):
         num_warps=1,
     )
     return indices
+
+
+@triton.jit
+def _map_compact(
+    tables,
+    indices,
+    result,
+    counts,
+    TABLE_STRIDE: tl.constexpr,
+    QUERIES: tl.constexpr,
+    COUNT: tl.constexpr,
+    TILE: tl.constexpr,
+    PAGE: tl.constexpr,
+    PHYSICAL_ROWS: tl.constexpr,
+):
+    row = tl.program_id(0)
+    lane = tl.arange(0, TILE)
+    pos = tl.load(indices + row * COUNT + lane, lane < COUNT, -1).to(tl.int32)
+    valid = pos >= 0
+    before = tl.cumsum(valid.to(tl.int32), axis=0) - valid.to(tl.int32)
+    count = tl.sum(valid.to(tl.int32), axis=0)
+    dest = tl.where(valid, before, count + lane - before)
+    page = tl.load(tables + (row // QUERIES) * TABLE_STRIDE + pos // PAGE, valid, 0).to(tl.int32)
+    address = page * PHYSICAL_ROWS + pos % PAGE
+    # Supply one in-bounds row if the logical set is empty; the final context is zeroed.
+    entry = tl.where(valid, address, tl.where((count == 0) & (lane == 0), 0, -1))
+    tl.store(result + row * COUNT + dest, entry, lane < COUNT)
+    tl.store(counts + row, count)
+
+
+def compact_physical_c8_indices(tables, logical):
+    """Map each request’s logical indices, with valid C8 rows packed stably before padding."""
+    requests, queries, width = logical.shape
+    physical = torch.empty((requests * queries, width), device=logical.device, dtype=torch.int32)
+    counts = physical.new_empty((requests, queries))
+    _map_compact[(requests * queries,)](
+        tables,
+        logical.contiguous(),
+        physical,
+        counts,
+        tables.stride(0),
+        queries,
+        width,
+        triton.next_power_of_2(width),
+        PAGE_TOKENS,
+        C8_ROWS_PER_PAGE,
+        num_warps=1,
+    )
+    return physical, counts

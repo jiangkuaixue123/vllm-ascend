@@ -52,6 +52,7 @@ from .cache_pages import (
     PAGE_TOKENS,
     POOL_RATIO,
     TOKEN_BYTES,
+    compact_physical_c8_indices,
     gather_page_field,
     physical_c8_indices,
 )
@@ -1188,6 +1189,22 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
                 self.request_recall_rank,
             )
             logger.info_once("HYV4 Flash partitions complete IndexPool recall requests across tensor ranks.")
+        # All requests in a decode graph share a verification width and recall budget.
+        # Capture their selected logical rows after completing the ordinary cache updates.
+        native_rows = None
+        if (
+            self.indexer is not None
+            and self.native_sparse_c8_verify
+            and self.batch_verify_attention
+            and num_queries == BATCH_VERIFY_MAX_QUERIES
+            and query.dtype == torch.bfloat16
+            and (self.local_heads, (self.indexer.budget + 1) * self.indexer.ratio) == BATCH_VERIFY_SPARSE_SHAPE
+            and (score_groups or self.max_model_len == BATCH_VERIFY_SPARSE_SHAPE[1])
+            and block_size == PAGE_TOKENS
+            and cache.shape[-1] == PAGE_BYTES
+            and meta.block_table.stride(-1) == 1
+        ):
+            native_rows = []
         refreshed_pool = False
         for request in range(seq_lens.shape[0]):
             start = request * num_queries
@@ -1259,6 +1276,9 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
                 published_rows.append(selected)
             if snapshot is not None:
                 snapshot[start:stop, : selected.shape[-1]].copy_(selected)
+            if native_rows is not None:
+                native_rows.append(selected)
+                continue
             split_pv = (
                 self.batch_verify_attention
                 and num_queries > 1
@@ -1312,6 +1332,17 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
                 )
                 rows = history.unfold(0, window, 1).transpose(1, 2)
             self._attend_decoded(q, selected, rows, wv, out[start:stop], split_pv=split_pv, scores=scores)
+        if native_rows is not None:
+            selected = native_rows[0].unsqueeze(0) if len(native_rows) == 1 else torch.stack(native_rows)
+            physical, counts = compact_physical_c8_indices(meta.block_table, selected)
+            context = attend_packed_c8(
+                query, cache.view(-1, C8_ROW_BYTES), physical, self.learnable_sink_param, self.scale
+            )
+            context.masked_fill_(((counts == 0) | (logical < 0)).reshape(-1, 1, 1), 0)
+            for request in range(seq_lens.shape[0]):
+                rows = slice(request * num_queries, (request + 1) * num_queries)
+                out[rows].copy_(_head_bmm(context[rows], wv).reshape_as(out[rows]))
+            logger.info_once("HYV4 Flash compacts request-local rows for native C8 sparse decode attention.")
         if self.resident_pool is not None and not refreshed_pool:
             # This operation is captured in multi-request and one-token graphs as well.
             self.resident_pool.invalidate()
