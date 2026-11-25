@@ -1076,8 +1076,8 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
         num_tokens = query.shape[0]
         num_queries = num_tokens // seq_lens.shape[0]
         layout = None
-        if self.share_verify_layout and seq_lens.shape[0] == 1:
-            logger.info_once("HYV4 Flash shares single-request decode positions across target layers.")
+        if self.share_verify_layout:
+            logger.info_once("HYV4 Flash shares each request's decode positions across target layers.")
             layout = VerificationLayout.for_forward(get_forward_context(), meta, num_queries)
             seq_lens, live, logical = layout.seq_lens, layout.live, layout.logical
         else:
@@ -1168,7 +1168,11 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
         ):
             # All ranks keep all local physical pages current. Scores alone are distributed.
             for request in range(seq_lens.shape[0]):
-                update = pool_update_positions(seq_lens[request], num_queries, self.indexer.ratio)
+                update = (
+                    layout.pool_update(self.indexer.ratio, request)
+                    if layout is not None
+                    else pool_update_positions(seq_lens[request], num_queries, self.indexer.ratio)
+                )
                 self._update_decode_pool(cache, meta.block_table[request], block_size, update, positions.ndim)
             if query_stream is not None:
                 consumer = torch.npu.current_stream()
@@ -1213,12 +1217,14 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
             visible = logical[request]
             if self.indexer is None:
                 selected = (
-                    layout.get_window_candidates(window) if layout is not None else window_candidates(visible, window)
+                    layout.get_window_candidates(window, request)
+                    if layout is not None
+                    else window_candidates(visible, window)
                 )
             else:
                 if self.incremental_index_pool and assigned_rows is None:
                     update = (
-                        layout.pool_update(self.indexer.ratio)
+                        layout.pool_update(self.indexer.ratio, request)
                         if layout is not None
                         else pool_update_positions(seq_lens[request], num_queries, self.indexer.ratio)
                     )
@@ -1265,7 +1271,7 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
                         )
                     if not use_sharded_pool:
                         if layout is not None:
-                            dense, recall = layout.dense_prefix(selected.shape[-1], ratio, self.indexer.budget)
+                            dense, recall = layout.dense_prefix(selected.shape[-1], ratio, self.indexer.budget, request)
                         else:
                             dense = dense_candidates(visible, selected.shape[-1])
                             recall = (visible // ratio > self.indexer.budget)[:, None]

@@ -27,8 +27,8 @@ def pool_update_positions(seq_len, num_queries, ratio):
     first = (seq_len - num_queries).clamp_min(0) // ratio
     end = seq_len // ratio
     width = ((num_queries + ratio - 1) // ratio) * ratio
-    history = first * ratio + torch.arange(width, device=seq_len.device)
-    return first, end, history.masked_fill(history >= end * ratio, 0)
+    history = first[..., None] * ratio + torch.arange(width, device=seq_len.device)
+    return first, end, history.masked_fill(history >= end[..., None] * ratio, 0)
 
 
 def dense_candidates(visible, width):
@@ -38,7 +38,7 @@ def dense_candidates(visible, width):
 
 @dataclass
 class VerificationLayout:
-    """Single-request tensors derived solely from the group's mutable runner inputs."""
+    """Batched positions derived from the current forward's mutable runner inputs."""
 
     seq_lens: torch.Tensor
     live: torch.Tensor
@@ -56,7 +56,8 @@ class VerificationLayout:
         layouts = context.additional_kwargs.setdefault("hy4flash_verification_layouts", {})
         key = (id(meta), num_queries)
         if key not in layouts:
-            layouts[key] = cls(*decode_positions(meta.decode_seq_lens, meta.slot_mapping[:num_queries], num_queries))
+            num_tokens = meta.decode_seq_lens.numel() * num_queries
+            layouts[key] = cls(*decode_positions(meta.decode_seq_lens, meta.slot_mapping[:num_tokens], num_queries))
         return layouts[key]
 
     def get_window_history(self, window):
@@ -64,19 +65,23 @@ class VerificationLayout:
             self.window_rows[window] = window_history(self.seq_lens, self.logical, window)
         return self.window_rows[window]
 
-    def get_window_candidates(self, window):
+    def get_window_candidates(self, window, request):
         if window not in self.window_candidates:
-            self.window_candidates[window] = window_candidates(self.logical[0], window)
-        return self.window_candidates[window]
+            candidates = window_candidates(self.logical.flatten(), window)
+            self.window_candidates[window] = candidates.view(*self.logical.shape, window)
+        return self.window_candidates[window][request]
 
-    def pool_update(self, ratio):
+    def pool_update(self, ratio, request):
         if ratio not in self.pool_updates:
-            self.pool_updates[ratio] = pool_update_positions(self.seq_lens[0], self.logical.shape[1], ratio)
-        return self.pool_updates[ratio]
+            self.pool_updates[ratio] = pool_update_positions(self.seq_lens, self.logical.shape[1], ratio)
+        first, end, history = self.pool_updates[ratio]
+        return first[request], end[request], history[request]
 
-    def dense_prefix(self, width, ratio, budget):
+    def dense_prefix(self, width, ratio, budget, request):
         key = (width, ratio, budget)
         if key not in self.dense_prefixes:
-            visible = self.logical[0]
-            self.dense_prefixes[key] = dense_candidates(visible, width), (visible // ratio > budget)[:, None]
-        return self.dense_prefixes[key]
+            dense = dense_candidates(self.logical.flatten(), width).view(*self.logical.shape, width)
+            recall = (self.logical // ratio > budget).unsqueeze(-1)
+            self.dense_prefixes[key] = dense, recall
+        dense, recall = self.dense_prefixes[key]
+        return dense[request], recall[request]
