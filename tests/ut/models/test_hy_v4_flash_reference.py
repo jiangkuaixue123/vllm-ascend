@@ -419,21 +419,21 @@ def test_copy_only_group_preserves_rank_order_and_fallback(monkeypatch):
     def collect(output, local, group):
         gathers.append(group)
         for rank in range(8):
-            output[rank].copy_(local[0] + rank)
+            output.narrow(0, rank * local.shape[0], local.shape[0]).copy_(local + rank)
 
     monkeypatch.setattr(model.dist, "all_gather_into_tensor", collect)
     fallback = Mock(side_effect=lambda x: x)
     monkeypatch.setattr(model, "sp_all_gather", fallback)
-    for shape in ((1, 12), (1, 4, 12)):
+    for shape in ((1, 12), (1, 4, 12), (3, 3072), (6, 4, 3072), (12, 4, 3072)):
         x = torch.arange(torch.Size(shape).numel(), dtype=torch.bfloat16).reshape(shape)
         torch.testing.assert_close(model.gather_verify_rows(x, group), torch.cat([x + rank for rank in range(8)]))
         assert model.gather_verify_rows(x, None) is x
-    wide = torch.zeros(2, 4, dtype=torch.bfloat16)
+    wide = torch.zeros(13, 4, 3072, dtype=torch.bfloat16)
     assert model.gather_verify_rows(wide, group) is wide
     other = wide[:1].float()
     assert model.gather_verify_rows(other, group) is other
-    assert gathers == [group, group]
-    assert fallback.call_count == 4
+    assert gathers == [group] * 5
+    assert fallback.call_count == 7
 
 
 def test_ordered_scatter_requires_six_contiguous_bf16_rows():

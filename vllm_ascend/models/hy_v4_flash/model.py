@@ -22,6 +22,8 @@ from .moe import AscendFlashMoE
 from .ordered_verification_scatter import matches_native_scatter
 
 FLASHCOMM_950_PEER_BYTES = 768 * 1024
+# Largest per-rank token payload measured on the dedicated A5 copy communicator.
+_MAX_SMALL_CCU_GATHER_BYTES = 288 * 1024
 
 
 def validate_runtime(vllm_config: VllmConfig) -> None:
@@ -88,10 +90,13 @@ def validate_runtime(vllm_config: VllmConfig) -> None:
 
 
 def gather_verify_rows(hidden: torch.Tensor, copy_group: dist.ProcessGroup | None) -> torch.Tensor:
-    # A worker holds a single token shard in the six-query verification graph.
-    if copy_group is None or hidden.shape[0] != 1 or hidden.dtype != torch.bfloat16:
+    if (
+        copy_group is None
+        or hidden.dtype != torch.bfloat16
+        or not 0 < hidden.numel() * hidden.element_size() <= _MAX_SMALL_CCU_GATHER_BYTES
+    ):
         return sp_all_gather(hidden)
-    result = hidden.new_empty((copy_group.size(), *hidden.shape[1:]))
+    result = hidden.new_empty((copy_group.size() * hidden.shape[0], *hidden.shape[1:]))
     dist.all_gather_into_tensor(result, hidden.contiguous(), group=copy_group)
     logger.info_once("HYV4 Flash gathers verification token shards with CCU.")
     return result
