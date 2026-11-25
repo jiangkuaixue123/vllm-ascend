@@ -16,35 +16,41 @@ from vllm.triton_utils import tl, triton
 from vllm_ascend.ops.vocab_parallel_embedding import VocabParallelMode
 
 _TP_SIZE = 8
-_VERIFY_ROWS = 6
+_DEFAULT_VERIFY_ROWS = 6
 _BROADCAST_ROWS = 1024
 
 
 @triton.jit
 def _pack_winner(score, index, packet, OFFSET: tl.constexpr):
-    value = tl.load(score)
-    tl.store(packet, value.to(tl.int32, bitcast=True))
-    tl.store(packet + 1, tl.load(index).to(tl.int32) + OFFSET)
+    row = tl.program_id(0)
+    value = tl.load(score + row)
+    tl.store(packet + row * 2, value.to(tl.int32, bitcast=True))
+    tl.store(packet + row * 2 + 1, tl.load(index + row).to(tl.int32) + OFFSET)
 
 
 @triton.jit
-def _select_winner(packets, output, RANKS: tl.constexpr):
+def _select_winner(packets, output, ROWS: tl.constexpr, RANKS: tl.constexpr):
+    row = tl.program_id(0)
     rank = tl.arange(0, RANKS)
-    values = tl.load(packets + rank * 2).to(tl.float32, bitcast=True)
-    ids = tl.load(packets + rank * 2 + 1)
+    offset = (rank * ROWS + row) * 2
+    values = tl.load(packets + offset).to(tl.float32, bitcast=True)
+    ids = tl.load(packets + offset + 1)
     nan = values != values
     has_nan = tl.max(nan.to(tl.int32), 0) != 0
     maximum = tl.max(tl.where(nan, -float("inf"), values), 0)
     # Full-vocabulary argmax chooses the first NaN or the first maximal score.
     keep = tl.where(has_nan, nan, values == maximum)
-    tl.store(output, tl.min(tl.where(keep, ids, 2147483647), 0).to(tl.int64))
+    tl.store(output + row, tl.min(tl.where(keep, ids, 2147483647), 0).to(tl.int64))
 
 
 class LocalVocabulary(nn.Module):
     """Replicate ordinary input embeddings and keep a rank-local FP32 projection."""
 
-    def __init__(self, embedding, head, sharded_verification=False, copy_group=None):
+    def __init__(
+        self, embedding, head, sharded_verification=False, copy_group=None, *, max_decode_tokens=_DEFAULT_VERIFY_ROWS
+    ):
         super().__init__()
+        self.max_decode_tokens = max_decode_tokens
         self.embedding = ref(embedding)
         self.head = ref(head)
         self.sharded_verification = sharded_verification
@@ -89,7 +95,7 @@ class LocalVocabulary(nn.Module):
         logger.info_once("HYV4 Flash prepared the replicated token embeddings and local FP32 vocabulary shard.")
 
     def can_embed(self, ids):
-        return self.table is not None and ids.ndim == 1 and ids.numel() in (1, _VERIFY_ROWS)
+        return self.table is not None and ids.ndim == 1 and 0 < ids.numel() <= self.max_decode_tokens
 
     def embed(self, ids):
         # Negative async slots use token zero. Discard values above the real vocabulary as in sharded lookup.
@@ -115,13 +121,14 @@ class LocalVocabulary(nn.Module):
     def greedy(self, hidden):
         scores = self.project(hidden)
         value, index = scores.max(dim=-1)
-        packet = scores.new_empty(2, dtype=torch.int32)
-        gathered = packet.new_empty(_TP_SIZE * 2)
-        _pack_winner[(1,)](value, index, packet, self.start, num_warps=1)
+        rows = hidden.shape[0]
+        packet = scores.new_empty(rows * 2, dtype=torch.int32)
+        gathered = packet.new_empty(_TP_SIZE * packet.numel())
+        _pack_winner[(rows,)](value, index, packet, self.start, num_warps=1)
         group = get_tp_group().device_group if self.copy_group is None else self.copy_group
         dist.all_gather_into_tensor(gathered, packet, group=group)
         if self.copy_group is not None:
             logger.info_once("HYV4 Flash gathers draft vocabulary winners with CCU.")
-        winner = index.new_empty(1)
-        _select_winner[(1,)](gathered, winner, _TP_SIZE, num_warps=1)
+        winner = torch.empty_like(index)
+        _select_winner[(rows,)](gathered, winner, rows, _TP_SIZE, num_warps=1)
         return winner

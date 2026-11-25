@@ -228,6 +228,10 @@ class AscendHYV4FlashForCausalLM(HYV4FlashForCausalLM):
             self.model.local_vocabulary = LocalVocabulary(
                 self.model.embed_tokens,
                 self.lm_head,
+                max_decode_tokens=min(
+                    vllm_config.scheduler_config.max_num_batched_tokens,
+                    vllm_config.scheduler_config.max_num_seqs * vllm_config.uniform_decode_query_len,
+                ),
                 copy_group=self.model.copy_group,
                 sharded_verification=vllm_config.additional_config.get("hy4flash_sharded_greedy_verify", False)
                 and vllm_config.lora_config is None,
