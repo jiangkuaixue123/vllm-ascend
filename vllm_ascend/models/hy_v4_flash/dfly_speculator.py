@@ -88,7 +88,7 @@ class FlashDFlySpeculator(DraftModelSpeculator):
             and self.vllm_config.additional_config.get("hy4flash_draft_projection_sums", False)
         ):
             with set_current_vllm_config(config):
-                configure_draft_sums(draft, copy_group)
+                configure_draft_sums(draft, copy_group, self.vllm_config, self.num_query_per_req)
         target_layers = self.target.model.layers
         self.index_layers = tuple(target_layers[i].self_attn for i in draft.config.target_index_layer)
         self.kv_layers = tuple(target_layers[i].self_attn for i in draft.config.target_kv_layers)

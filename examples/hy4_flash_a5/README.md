@@ -49,7 +49,7 @@ The recipe reserves 131,584 positions for requests with 130,048 input and 1,024 
 | `hy4flash_ccu_copy_gathers` | Uses a separate CCU group to gather BF16 token shards up to 288 KiB per rank and exchange vocabulary winners on eight A5 devices. |
 | `hy4flash_ordered_verify_scatter` | On eight A5 devices, exchanges each destination’s BF16 rows and reproduces the native reduction order. Each configured decode size uses this path after its padded geometry matches the original reduction at startup. |
 | `hy4flash_resident_index_keys` | Keeps a per-layer BF16 view of active pooled keys, refreshing changed pages and invalidating it on other cache writes. Requires native pages and disabled prefix caching and KV transfer. |
-| `hy4flash_draft_projection_sums` | Checks the native BF16 sum before switching supported single-request DFly projection widths to the measured transport. |
+| `hy4flash_draft_projection_sums` | Uses a checked BF16 reduction for eligible DFly block and correction projection sizes from the configured decode graphs. Each size falls back to native TP when its arithmetic differs. |
 | `hy4flash_overlap_decode_kv` | Computes KV normalization and C8 quantization alongside the independent query projection during native-page decode. |
 | `hy4flash_overlap_verify_projections` | Overlaps independent target output-gate and index-query projections with singleton verification attention and cache updates. |
 | `hy4flash_shared_fp32_draft_history` | Shares each request’s dequantized DFly history across its six queries, in bounded batches, while retaining the original per-query FP32 attention reductions and trained five-token proposals. |

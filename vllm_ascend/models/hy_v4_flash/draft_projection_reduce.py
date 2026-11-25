@@ -35,8 +35,9 @@ def ordered_sum(source, group, routes, tile):
 
 
 _WIDTH = 3072
-_VERIFY = 6
-_PLANS = {1: (256, (0, 1, 2, 3, 4, 5, 6, 7)), 6: (256, (0, 1, 2, 3, 4, 5, 6, 7))}
+_SUM_TILE = 256
+_RANK_ORDER = tuple(range(8))
+_MAX_ORDERED_ROWS = 192
 
 
 class DraftSum:
@@ -51,8 +52,8 @@ class DraftSum:
 
 def check_plan(rows, group, tp):
     rank = tp.rank_in_group
-    tile, order = _PLANS[rows]
-    route = torch.tensor(order, device=tp.device, dtype=torch.int32)
+    tile = _SUM_TILE
+    route = torch.tensor(_RANK_ORDER, device=tp.device, dtype=torch.int32)
     route = route.expand(rows * _WIDTH // tile, -1).contiguous()
     reducer = DraftSum(group, route, tile)
     # Compare against the same vLLM communicator used by the ordinary projection.
@@ -68,18 +69,26 @@ def check_plan(rows, group, tp):
 
 
 class DraftRowParallelOp(CustomRowParallelOp):
-    def __init__(self, layer, rows, reducer):
+    def __init__(self, layer, reducers):
         super().__init__(layer)
-        self.rows = rows
-        self.reducer = reducer
+        self.reducers = reducers
         self.update_attrs()
 
     def apply_impl(self, operand):
         # The installer accepts only unbiassed, pre-sharded row projections.
         partial = self.quant_method.apply(self.layer, operand, None)
-        if partial.shape == (self.rows, _WIDTH) and partial.dtype == torch.bfloat16 and partial.is_contiguous():
-            logger.info_once("HYV4 Flash uses checked BF16 draft projection reductions for %d rows.", self.rows)
-            return self.reducer.reduce(partial), None
+        if (
+            partial.ndim == 2
+            and partial.shape[1] == _WIDTH
+            and partial.dtype == torch.bfloat16
+            and partial.is_contiguous()
+        ):
+            reducer = self.reducers.get(partial.shape[0])
+            if reducer is not None:
+                logger.info_once(
+                    "HYV4 Flash uses checked BF16 draft projection reductions for %d rows.", partial.shape[0]
+                )
+                return reducer.reduce(partial), None
         return self.comm_group.all_reduce(partial), None
 
 
@@ -94,16 +103,23 @@ def ordinary_projection(layer):
     )
 
 
-def configure_draft_sums(draft, group):
+def configure_draft_sums(draft, group, config, query_width):
     tp = get_tp_group()
-    for rows in _PLANS:
+    limit = min(config.scheduler_config.max_num_batched_tokens, _MAX_ORDERED_ROWS)
+    batches = {1, *(config.compilation_config.decode_cudagraph_capture_request_sizes or ())}
+    correction_rows = {batch for batch in batches if 0 < batch <= limit}
+    verifier_rows = {batch * query_width for batch in batches if 0 < batch * query_width <= limit}
+    # A native reduction can change its arithmetic order at a message-size boundary.
+    # Validate each distinct geometry once and share its reduction plan across layers.
+    plans = {}
+    for rows in sorted(correction_rows | verifier_rows):
         reducer = check_plan(rows, group, tp)
-        if reducer is None:
-            continue
-        if rows == _VERIFY:
-            layers = [p for layer in draft.layers for p in (layer.self_attn.o_proj, layer.mlp.down_proj)]
-        else:
-            layers = [draft.hidden_correction.down_proj]
-        for layer in layers:
-            if ordinary_projection(layer):
-                layer.custom_op = DraftRowParallelOp(layer, rows, reducer)
+        if reducer is not None:
+            plans[rows] = reducer
+    projections = [p for layer in draft.layers for p in (layer.self_attn.o_proj, layer.mlp.down_proj)]
+    for sizes, layers in ((correction_rows, [draft.hidden_correction.down_proj]), (verifier_rows, projections)):
+        reducers = {rows: plans[rows] for rows in sizes if rows in plans}
+        if reducers:
+            for layer in layers:
+                if ordinary_projection(layer):
+                    layer.custom_op = DraftRowParallelOp(layer, reducers)

@@ -485,14 +485,14 @@ def test_draft_projection_sum_preserves_wide_and_non_bf16_reductions():
     transport = Mock()
     transport.all_reduce.side_effect = lambda x: x + 2
     op = object.__new__(DraftRowParallelOp)
-    op.rows = 6
     op.layer = None
     op.quant_method = SimpleNamespace(apply=lambda layer, x, bias: x)
-    op.reducer = SimpleNamespace(reduce=lambda x: x + 1)
+    op.reducers = {n: SimpleNamespace(reduce=lambda x: x + 1) for n in (6, 24)}
     with patch.object(DraftRowParallelOp, "comm_group", new_callable=PropertyMock, return_value=transport):
         for shape, dtype, increment in [
             ((6, 3072), torch.bfloat16, 1),
             ((12, 3072), torch.bfloat16, 2),
+            ((24, 3072), torch.bfloat16, 1),
             ((6, 3072), torch.float32, 2),
             ((6, 128), torch.bfloat16, 2),
         ]:
