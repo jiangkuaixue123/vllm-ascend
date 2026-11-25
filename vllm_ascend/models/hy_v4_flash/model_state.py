@@ -13,6 +13,7 @@ from vllm_ascend.ops.triton.engram_lookback import _gather_lookback_kernel
 from vllm_ascend.worker.v2.model_states.default import AscendModelState
 
 from .aclgraph import FlashAclGraphManager
+from .grouped_host_features import fill_grouped_feature_rows, supports_grouped_feature_rows
 from .verify_hashes import fill_host_feature_rows, fill_verify_hashes, supports_verify_hash_geometry
 
 _SINGLE_VERIFY_TOKENS = 6
@@ -138,8 +139,12 @@ class FlashModelState(AscendModelState):
             hashes,
             input_batch.query_start_loc if input_batch.num_reqs > 1 else None,
         )
-        for table, layer_hashes, output in zip(self._engram_embeddings, hashes.unbind(), rows):
-            fill_host_feature_rows(table, layer_hashes, output)
+        if supports_grouped_feature_rows(self._engram_embeddings, hashes, rows):
+            fill_grouped_feature_rows(self._engram_embeddings, hashes, rows)
+            logger.info_once("HYV4 Flash reads the four registered Engram tables in one launch.")
+        else:
+            for table, layer_hashes, output in zip(self._engram_embeddings, hashes.unbind(), rows):
+                fill_host_feature_rows(table, layer_hashes, output)
         logger.info_once("HYV4 Flash reads verification rows directly from registered CPU tables.")
         return True
 
