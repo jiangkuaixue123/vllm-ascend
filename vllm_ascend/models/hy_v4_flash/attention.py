@@ -592,7 +592,7 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
         return (
             self.absorption_weights is not None
             and self.absorption_weights.key is not None
-            and q_rope.shape[0] == BATCH_VERIFY_MAX_QUERIES
+            and 0 < q_rope.shape[0] == k_rope.shape[0]
             and q_rope.device.type == "npu"
             and q_rope.dtype == k_rope.dtype == rotary.cos_sin_cache.dtype == torch.bfloat16
             and q_rope.stride(-1) == k_rope.stride(-1) == 1
