@@ -56,3 +56,5 @@ The recipe reserves 131,584 positions for requests with 130,048 input and 1,024 
 | `hy4flash_shared_fp32_draft_history` | Shares each request’s dequantized DFly history across its six queries, in bounded batches, while retaining the original per-query FP32 attention reductions and trained five-token proposals. |
 
 The fixed-length test measures one client request at a time. Each reported TPOT divides the elapsed time between its first and last generated-token events by 1,023. The reported P50 is the median across twenty distinct requests. The accuracy run uses all thirty AIME2026 questions at concurrency sixteen. [Per-request timings and hardware results](https://github.com/InferMatrixLab/InferRSI/issues/613)
+
+The independent sliding and sparse target projections can use the auxiliary stream across a uniform decode batch. Each request retains its own cache updates and the consuming stream waits before using the results.

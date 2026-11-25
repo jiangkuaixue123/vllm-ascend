@@ -767,22 +767,17 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
         meta = get_flash_attention_metadata() if self.fuse_attn_output_gate or self.overlap_attn_output_gate else None
         full_decode = meta is not None and meta.decode_seq_lens is not None
         fuse_gate = self.fuse_attn_output_gate and full_decode and self._can_fuse_output_gate(out)
-        single_sharded_verify = (
+        sharded_verify = (
             self.overlap_verify_projections
             and self.sequence_parallel_output
             and full_decode
-            and meta.decode_seq_lens.shape[0] == 1
-            and hidden_states.shape[0] == BATCH_VERIFY_MAX_QUERIES
+            and hidden_states.shape[0] == meta.decode_seq_lens.shape[0] * BATCH_VERIFY_MAX_QUERIES
         )
         overlap_gate = (
-            self.overlap_attn_output_gate
-            and full_decode
-            and (not self.sequence_parallel_output or single_sharded_verify)
+            self.overlap_attn_output_gate and full_decode and (not self.sequence_parallel_output or sharded_verify)
         )
-        if single_sharded_verify:
-            logger.info_once(
-                "HYV4 Flash schedules independent sequence-parallel verification projections on an auxiliary stream."
-            )
+        if sharded_verify:
+            logger.info_once("HYV4 Flash schedules uniform decode projections on an auxiliary stream.")
         if overlap_gate:
             logger.info_once("HYV4 Flash overlaps the output gate projection with paged decode attention.")
             main_stream = torch.npu.current_stream()
@@ -1149,7 +1144,6 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
             if (
                 self.overlap_verify_projections
                 and self.sequence_parallel_output
-                and seq_lens.shape[0] == 1
                 and num_queries == BATCH_VERIFY_MAX_QUERIES
             ):
                 query_stream = attention_calculation_stream()
