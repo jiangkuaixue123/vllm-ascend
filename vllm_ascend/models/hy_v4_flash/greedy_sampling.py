@@ -54,9 +54,13 @@ def sample(runner, hidden, batch, vocabulary):
     )
     local_scores = vocabulary.project(hidden[batch.logits_indices])
     group = get_tp_group()
+    copy_group = vocabulary.copy_group
+    use_copy = copy_group is not None and local_scores.shape[0] <= vocabulary.max_decode_tokens
+    if use_copy:
+        logger.info_once("HYV4 Flash exchanges batched target vocabulary winners with CCU.")
     sampled, counts = choose(
         local_scores,
-        vocabulary.copy_group if batch.num_reqs == 1 and vocabulary.copy_group is not None else group.device_group,
+        copy_group if use_copy else group.device_group,
         vocabulary.start,
         group.world_size,
         batch.cu_num_logits,
