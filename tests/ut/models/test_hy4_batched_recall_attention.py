@@ -60,7 +60,12 @@ def test_partitioned_recall_publishes_rows_after_updating_each_local_cache(monke
     monkeypatch.setattr(module, "recall_rows_for_forward", lambda *a: (None, pending))
     monkeypatch.setattr(module, "select_request_partitioned_pool", select)
     monkeypatch.setattr(module, "compact_physical_c8_indices", compact)
-    monkeypatch.setattr(module, "attend_packed_c8", lambda *a: torch.ones_like(q))
+
+    def attend(*args, decode_rows):
+        positions, counts = decode_rows
+        return torch.ones_like(q).masked_fill(((positions < 0) | (counts == 0)).reshape(-1, 1, 1), 0)
+
+    monkeypatch.setattr(module, "attend_packed_c8", attend)
     layer._forward_decode_graph(meta, cache, PAGE_TOKENS, out, out, torch.arange(q.shape[0]), q, identity, out)
     assert calls == list(range(requests))
     torch.testing.assert_close(torch.stack(pending), expected)

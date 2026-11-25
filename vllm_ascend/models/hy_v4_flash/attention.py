@@ -1429,12 +1429,15 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
             selected = native_rows[0].unsqueeze(0) if len(native_rows) == 1 else torch.stack(native_rows)
             physical, counts = compact_physical_c8_indices(meta.block_table, selected)
             context = attend_packed_c8(
-                query, cache.view(-1, C8_ROW_BYTES), physical, self.learnable_sink_param, self.scale
+                query,
+                cache.view(-1, C8_ROW_BYTES),
+                physical,
+                self.learnable_sink_param,
+                self.scale,
+                decode_rows=(logical, counts),
             )
-            context.masked_fill_(((counts == 0) | (logical < 0)).reshape(-1, 1, 1), 0)
-            for request in range(seq_lens.shape[0]):
-                rows = slice(request * num_queries, (request + 1) * num_queries)
-                out[rows].copy_(_head_bmm(context[rows], wv).reshape_as(out[rows]))
+            out[:num_tokens].copy_(_head_bmm(context, wv).reshape_as(out[:num_tokens]))
+            logger.info_once("HYV4 Flash projects the complete native C8 decode batch with its trained attention sink.")
             logger.info_once("HYV4 Flash compacts request-local rows for native C8 sparse decode attention.")
         if self.resident_pool is not None and not refreshed_pool:
             # This operation is captured in multi-request and one-token graphs as well.

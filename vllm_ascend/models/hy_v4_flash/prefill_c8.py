@@ -3,6 +3,7 @@
 """Prefill attention using the existing Ascend C8 sparse attention operator."""
 
 import torch
+from vllm.triton_utils import tl, triton
 
 from vllm_ascend.attention.utils import SFA_QSFA_TILE_SIZE
 from vllm_ascend.hisparse.c8 import C8_ROW_BYTES
@@ -28,7 +29,38 @@ def apply_attention_sink(context, maximum, total, sink):
     return (context.float() * retained_mass.unsqueeze(-1)).to(context.dtype)
 
 
-def attend_packed_c8(query, packed_kv, selected, sink, scale):
+@triton.jit
+def _apply_live_mass(context, mass, logical, counts, result, HEADS: tl.constexpr, DIM: tl.constexpr):
+    row = tl.program_id(0)
+    head = tl.program_id(1)
+    statistic = row * HEADS + head
+    channels = statistic * DIM + tl.arange(0, DIM)
+    active = (tl.load(logical + row) >= 0) & (tl.load(counts + row) > 0)
+    value = tl.load(context + channels).to(tl.float32)
+    retained_mass = tl.load(mass + statistic)
+    tl.store(result + channels, tl.where(active, value * retained_mass, 0.0))
+
+
+def apply_live_attention_sink(context, maximum, total, sink, logical, counts):
+    """Retain native FP32 log and sigmoid rounding and zero every inactive query."""
+    mass = (maximum + total.log() - sink).sigmoid()
+    rows, heads, width = context.shape
+    output = torch.empty_like(context, memory_format=torch.contiguous_format)
+    _apply_live_mass[(rows, heads)](
+        context.contiguous(),
+        mass.contiguous(),
+        logical.contiguous(),
+        counts.contiguous(),
+        output,
+        heads,
+        width,
+        num_warps=1,
+        enable_fp_fusion=False,
+    )
+    return output
+
+
+def attend_packed_c8(query, packed_kv, selected, sink, scale, *, decode_rows=None):
     """Use logical candidate rows in a contiguous request-local C8 view."""
     kv = packed_kv.view(1, -1, 1, C8_ROW_BYTES).view(torch.float8_e4m3fn)
     context, maximum, total = torch.ops._C_ascend.npu_kv_quant_sparse_flash_attention_vllm(
@@ -48,4 +80,7 @@ def attend_packed_c8(query, packed_kv, selected, sink, scale):
         rope_head_dim=C8_ROPE_DIM,
         return_softmax_lse=True,
     )
+    if decode_rows is not None:
+        logical, counts = decode_rows
+        return apply_live_attention_sink(context[0], maximum[0, 0], total[0, 0], sink, logical, counts)
     return apply_attention_sink(context[0], maximum[0, 0], total[0, 0], sink)

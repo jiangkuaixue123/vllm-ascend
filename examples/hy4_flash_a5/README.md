@@ -60,3 +60,5 @@ The fixed-length test measures one client request at a time. Each reported TPOT 
 The independent sliding and sparse target projections can use the auxiliary stream across a uniform decode batch. Each request retains its own cache updates and the consuming stream waits before using the results.
 
 The target sliding-window verifier groups requests with separate page tables, keeps the complete 512-token window and uses native FP32 QK, softmax and PV. The group-size limit bounds the temporary operands.
+
+Native C8 target verification uses one value projection across the current requests. The trained attention sink retains its native FP32 log and sigmoid operations. Each request retains its own empty and padded query rows.

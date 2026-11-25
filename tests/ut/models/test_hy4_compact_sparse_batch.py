@@ -43,14 +43,24 @@ def test_native_decode_keeps_request_rows_and_masks_padding(monkeypatch, batch):
         calls.append(1)
         return table.repeat_interleave(queries, 0), counts
 
-    def native(query, cache, rows, sink, scale):
+    def native(query, cache, rows, sink, scale, *, decode_rows):
         assert query is q
-        return (rows + 1).to(q.dtype).view(-1, 1, 1).expand_as(q).clone()
+        logical, counts = decode_rows
+        value = (rows + 1).to(q.dtype).view(-1, 1, 1).expand_as(q).clone()
+        return value.masked_fill(((logical < 0) | (counts == 0)).view(-1, 1, 1), 0)
 
     monkeypatch.setattr(module, "compact_physical_c8_indices", map_rows)
+    project = module._head_bmm
+    projection_rows = []
+
+    def record_projection(value, weights):
+        projection_rows.append(value.shape[0])
+        return project(value, weights)
+
+    monkeypatch.setattr(module, "_head_bmm", record_projection)
     monkeypatch.setattr(module, "attend_packed_c8", native)
     layer._forward_decode_graph(meta, cache, PAGE_TOKENS, None, None, None, q, weights, out)
     expected = (tables + 1).repeat(1, queries).masked_fill(slots < 0, 0)
     expected[:, 0] = 0
     torch.testing.assert_close(out, expected.to(out.dtype).reshape(-1, 1).expand_as(out))
-    assert calls == [1]
+    assert calls == [1] and projection_rows == [batch * queries]
