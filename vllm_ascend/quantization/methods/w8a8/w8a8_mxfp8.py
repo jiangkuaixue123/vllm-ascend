@@ -378,6 +378,9 @@ class AscendW8A8MXFP8DynamicFusedMoEMethod(AscendMoEScheme):
         model_config = getattr(vllm_config, "model_config", None)
         text_config = getattr(model_config, "hf_text_config", None)
         self.fused_clamped_silu = getattr(text_config, "model_type", None) == "hy_v4_flash"
+        self.use_activation_extent = self.fused_clamped_silu and vllm_config.additional_config.get(
+            "hy4flash_mx_activation_extent", False
+        )
 
     def supports_fused_activation(self, activation: MoEActivation) -> bool:
         # Only MiniMax's A5 CEIL-scale MXFP8 path has been validated with the
@@ -742,10 +745,22 @@ class AscendW8A8MXFP8DynamicFusedMoEMethod(AscendMoEScheme):
                     glu_alpha=1.0 if clamped_silu else mlp_compute_input.swiglu_alpha,
                     glu_bias=0.0 if clamped_silu else mlp_compute_input.swiglu_beta,
                 )
+            group_list = mlp_compute_input.group_list
+            if (
+                clamped_silu
+                and self.use_activation_extent
+                and mlp_compute_input.group_list_type == 0
+                and group_list.numel()
+            ):
+                # Without per-expert activation scales, every routed row uses the same
+                # quantizer. Its device-side row limit is the last cumulative group end.
+                group_index = group_list[-1:]
+                logger.info_once("HYV4 Flash uses the routed row extent for clamped MXFP8 activation.")
+            else:
+                group_index = cumsum_group_list(group_list, mlp_compute_input.group_list_type, 1)
             hidden_states, out_scale = torch_npu.npu_swiglu_mx_quant(
                 hidden_states,
-                # vLLM list type 1 and operator group_mode 0 both mean token counts.
-                group_index=cumsum_group_list(mlp_compute_input.group_list, mlp_compute_input.group_list_type, 1),
+                group_index=group_index,
                 group_mode=0,
                 activate_left=True,
                 dst_type=self.act_quant_type,

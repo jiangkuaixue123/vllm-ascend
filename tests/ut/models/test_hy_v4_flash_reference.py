@@ -566,3 +566,43 @@ def test_shared_fp32_draft_history_routes_the_six_queries_to_their_own_selected_
     dfly.DFlyAttention._forward_paged(layer, None, None, None, None, None, None, None, out, ready_query=query)
     expected = torch.einsum("qhd,hdk->qhk", context, weights).reshape_as(out)
     torch.testing.assert_close(out, expected)
+
+
+def test_hy4_activation_extent_preserves_rows_and_other_group_encodings(monkeypatch):
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+
+    from vllm_ascend.quantization.methods.w8a8 import w8a8_mxfp8 as mx
+
+    descriptors = []
+
+    def activate(x, *, group_index, **kwargs):
+        assert kwargs["group_mode"] == 0 and kwargs["swiglu_mode"] == 2 and kwargs["clamp_limit"] == 10.0
+        descriptors.append(group_index)
+        return x, torch.ones((x.shape[0], 24, 2), dtype=torch.uint8)
+
+    monkeypatch.setattr(mx.torch_npu, "npu_swiglu_mx_quant", activate)
+    counts = torch.arange(64, dtype=torch.int64) // 3
+    method = SimpleNamespace(
+        fused_clamped_silu=True,
+        use_activation_extent=True,
+        apply_gmm1=lambda inp: inp.hidden_states,
+        act_quant_type=torch.float8_e4m3fn,
+        _dynamic_mx_quant_scale_alg=0,
+    )
+
+    def run(rows, enabled, list_type):
+        method.use_activation_extent = enabled
+        request = SimpleNamespace(
+            activation=MoEActivation.SILU,
+            swiglu_limit=10.0,
+            group_list=counts,
+            group_list_type=list_type,
+            hidden_states=torch.empty(rows, 3072, dtype=torch.bfloat16),
+        )
+        mx.AscendW8A8MXFP8DynamicFusedMoEMethod.apply_gmm1_act_quant(method, request)
+        return descriptors[-1]
+
+    for rows in (64, 128, 384, 768, 1536):
+        torch.testing.assert_close(run(rows, True, 0), counts[-1:])
+    torch.testing.assert_close(run(128, False, 0), torch.cat((counts[:1], counts.diff())))
+    torch.testing.assert_close(run(128, True, 1), counts)
