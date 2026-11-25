@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """HYV4 Flash Engram with request-local n-grams and TP-sharded row storage."""
 
+from typing import NamedTuple
+
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -30,6 +32,29 @@ _FEATURE_CHANNELS = 4
 _FEATURE_HIDDEN_SIZE = 3072
 _FEATURE_VERIFY_TOKENS = 6
 _FEATURE_NORM_EPS = torch.finfo(torch.float32).eps
+
+
+_LAYERS_PER_FEATURE_REDUCTION = 4
+
+
+class ProjectedFeatureRows(NamedTuple):
+    channels: torch.Tensor
+
+
+def join_feature_projections(layers, hashes, rows):
+    """Project each layer's own lookup rows before reducing compatible payloads together."""
+    projected_rows = []
+    for layer, layer_hashes, features in zip(layers, hashes.unbind(), rows, strict=True):
+        inputs = layer.normalize_lookup_rows(layer_hashes, features, layer.channel_weights.dtype)
+        projected_rows.append(
+            nn.functional.linear(inputs, layer.channel_weights.flatten(0, 1), layer.channel_biases.flatten())
+        )
+    outputs = []
+    for first in range(0, len(layers), _LAYERS_PER_FEATURE_REDUCTION):
+        chunk = torch.stack(projected_rows[first : first + _LAYERS_PER_FEATURE_REDUCTION])
+        reduced = tensor_model_parallel_all_reduce(chunk)
+        outputs.extend(ProjectedFeatureRows(tensor) for tensor in reduced.unbind())
+    return tuple(outputs)
 
 
 class FlashEngramLayout:
@@ -424,7 +449,10 @@ class FlashEngram(nn.Module):
 
     def _mix_feature_channels(self, x, hidden, hashes):
         projected = nn.functional.linear(x, self.channel_weights.flatten(0, 1), self.channel_biases.flatten())
-        projected = tensor_model_parallel_all_reduce(projected).view(x.shape[0], self.hc_mult + 1, self.hidden_size)
+        return self._mix_projected_channels(tensor_model_parallel_all_reduce(projected), hidden, hashes)
+
+    def _mix_projected_channels(self, projected, hidden, hashes):
+        projected = projected.view(hidden.shape[0], self.hc_mult + 1, self.hidden_size)
         products = normalized_channel_products(projected, hidden, self.key_gammas, self.query_gammas)
         dots = products.sum(-1) * self.hidden_size**-0.5
         gates = (dots.abs().clamp_min(1e-6).sqrt() * dots.sign()).sigmoid()
@@ -443,15 +471,21 @@ class FlashEngram(nn.Module):
     def _load_bias(self, parameter, value):
         default_weight_loader(parameter, value if self.rank == 0 else torch.zeros_like(value))
 
-    def forward(self, hidden, hashes, embedding_rows=None):
-        rows = self.multi_head_embedding(hashes) if embedding_rows is None else embedding_rows
+    def normalize_lookup_rows(self, hashes, rows, dtype):
         eps = torch.finfo(torch.float32).eps
         gamma = torch.stack([norm.weight for norm in self.lookup_per_head_norms]).float()
         local = self.multi_head_embedding
         local_hashes = hashes[:, local.head_start : local.head_end]
         x = rows.masked_fill(local_hashes.unsqueeze(-1) < 0, 0)
-        x = (x * (x.square().mean(-1, keepdim=True) + eps).rsqrt() * gamma).to(hidden.dtype)
-        x = x.flatten(1)
+        return (x * (x.square().mean(-1, keepdim=True) + eps).rsqrt() * gamma).to(dtype).flatten(1)
+
+    def forward(self, hidden, hashes, embedding_rows=None):
+        if isinstance(embedding_rows, ProjectedFeatureRows):
+            return self._mix_projected_channels(embedding_rows.channels, hidden, hashes)
+        rows = self.multi_head_embedding(hashes) if embedding_rows is None else embedding_rows
+        x = self.normalize_lookup_rows(hashes, rows, hidden.dtype)
+        eps = torch.finfo(torch.float32).eps
+        local = self.multi_head_embedding
         if self._can_group_feature_projections(hidden, x, embedding_rows):
             logger.info_once("HYV4 Flash groups the four feature keys and their value in a single TP reduction.")
             return self._mix_feature_channels(x, hidden, hashes)

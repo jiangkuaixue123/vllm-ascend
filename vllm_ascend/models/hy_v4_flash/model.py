@@ -13,9 +13,9 @@ from vllm_ascend.device.device_config import get_ascend_device_type
 from vllm_ascend.device.hardware import AscendDeviceType
 from vllm_ascend.models.common.ops.sequence_parallel import sp_all_gather, sp_shard
 
-from .attention import AscendHYV4FlashAttention, FlashAttentionBackend
+from .attention import AscendHYV4FlashAttention, FlashAttentionBackend, get_flash_attention_metadata
 from .dfly_config import METHOD
-from .engram import FlashEngram, FlashNgramHashState
+from .engram import FlashEngram, FlashNgramHashState, join_feature_projections
 from .ihc import FlashHCHeadLayer, FlashHCLayer
 from .local_vocabulary import LocalVocabulary
 from .moe import AscendFlashMoE
@@ -24,6 +24,10 @@ from .ordered_verification_scatter import checked_verification_shards
 FLASHCOMM_950_PEER_BYTES = 768 * 1024
 # Largest per-rank token payload measured on the dedicated A5 copy communicator.
 _MAX_SMALL_CCU_GATHER_BYTES = 288 * 1024
+
+
+# Largest checked collective payload in units of projected token rows.
+MAX_GROUPED_ENGRAM_ROWS = 96
 
 
 def validate_runtime(vllm_config: VllmConfig) -> None:
@@ -209,6 +213,54 @@ class AscendHYV4FlashModel(HYV4FlashModel):
                         layer.self_attn.ordered_scatter_shards = checked_shards
         self.uses_dfly = vllm_config.speculative_config is not None
         self.local_vocabulary = None
+        self.join_feature_layers = (
+            get_ascend_device_type() == AscendDeviceType.A5
+            and vllm_config.additional_config.get("hy4flash_join_engram_projections", False)
+            and vllm_config.parallel_config.tensor_parallel_size == 8
+            and vllm_config.parallel_config.data_parallel_size
+            == vllm_config.parallel_config.pipeline_parallel_size
+            == 1
+            and vllm_config.model_config.dtype == torch.bfloat16
+            and len(self.config.engram_layer_ids or ()) == 4
+        )
+
+    def forward(
+        self,
+        input_ids,
+        positions,
+        intermediate_tensors=None,
+        inputs_embeds=None,
+        lookback_token_ids=None,
+        prepared_engram=None,
+    ):
+        metadata = get_flash_attention_metadata() if self.join_feature_layers and prepared_engram is not None else None
+        if (
+            metadata is not None
+            and metadata.decode_seq_lens is not None
+            and prepared_engram is not None
+            and input_ids is not None
+            and input_ids.ndim == 1
+            and 0 < input_ids.shape[0] <= MAX_GROUPED_ENGRAM_ROWS
+            and input_ids.device.type == "npu"
+            and (inputs_embeds is None or inputs_embeds.dtype == torch.bfloat16)
+        ):
+            hashes, rows = prepared_engram
+            layers = tuple(self.layers[layer_id - 1].engram_layer for layer_id in self.config.engram_layer_ids)
+            if (
+                hashes.shape[:2] == (len(layers), input_ids.shape[0])
+                and len(rows) == len(layers)
+                and all(
+                    layer.channel_weights is not None
+                    and layer.channel_weights.dtype == torch.bfloat16
+                    and layer.multi_head_embedding.tp_size == 8
+                    for layer in layers
+                )
+            ):
+                logger.info_once("HYV4 Flash reduces checkpoint Engram projections together across decode requests.")
+                prepared_engram = (hashes, join_feature_projections(layers, hashes, rows))
+        return super().forward(
+            input_ids, positions, intermediate_tensors, inputs_embeds, lookback_token_ids, prepared_engram
+        )
 
     def embed_input_ids(self, input_ids):
         if self.local_vocabulary is not None and self.local_vocabulary.can_embed(input_ids):

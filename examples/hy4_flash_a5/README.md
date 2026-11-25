@@ -66,3 +66,5 @@ Native C8 target verification uses one value projection across the current reque
 Paired sparse target layers reuse their compacted physical C8 addresses within a decode forward when they share the same logical recall rows and the same rank-local block table. Each layer continues to read its own KV values.
 
 For batched IndexPool recall an owning tensor rank can reuse its existing dense key plane for its first request. Remapped pages and pages written anywhere in the current batch are refreshed before scoring. Additional requests use their own physical page tables.
+
+The optional `hy4flash_join_engram_projections` groups independent trained lookup projections across decoder layers for small decode payloads. The model continues to mix each layer’s current hidden state when it reaches that layer.
