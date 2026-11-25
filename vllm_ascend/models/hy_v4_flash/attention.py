@@ -1183,7 +1183,6 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
             elif (
                 self.pack_window_operands
                 and shared_positions is not None
-                and seq_lens.shape[0] == 1
                 and q.dtype == torch.bfloat16
                 and table.is_contiguous()
             ):
