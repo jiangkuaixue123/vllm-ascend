@@ -73,7 +73,7 @@ from .index_pool_select import (
     select_sharded_paged_pool,
     supports_sharded_recall,
 )
-from .layer_recall import paired_recall_layer, recall_rows_for_forward
+from .layer_recall import SharedRecallRows, paired_recall_layer, recall_rows_for_forward
 from .mla_prolog import CANNBotBf16MlaProlog
 from .native_pool_updates import plan_pool_refresh, refresh_pool_keys
 from .ordered_verification_scatter import rank_ordered_scatter, supports_ordered_scatter
@@ -115,6 +115,11 @@ PAGED_POOL_DECODE_SHAPE = (6, 16, 4, 511)
 MAX_BATCHED_POOL_UPDATES = 32
 # Store three int64 MRoPE coordinates in the BF16 sidecar by bit reinterpretation.
 POSITION_LANES = 3 * torch.int64.itemsize // torch.bfloat16.itemsize
+
+
+def _map_native_recall(table, rows):
+    selected = rows[0].unsqueeze(0) if len(rows) == 1 else torch.stack(rows)
+    return compact_physical_c8_indices(table, selected)
 
 
 def _head_bmm(tokens: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
@@ -1426,8 +1431,12 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
                 rows = history.unfold(0, window, 1).transpose(1, 2)
             self._attend_decoded(q, selected, rows, wv, out[start:stop], split_pv=split_pv, scores=scores)
         if native_rows is not None:
-            selected = native_rows[0].unsqueeze(0) if len(native_rows) == 1 else torch.stack(native_rows)
-            physical, counts = compact_physical_c8_indices(meta.block_table, selected)
+            shared = reused_rows if reused_rows is not None else published_rows
+            if isinstance(shared, SharedRecallRows):
+                physical, counts = shared.physical_for(meta.block_table, _map_native_recall)
+                logger.info_once("HYV4 Flash keys paired sparse addresses by their rank-local block table.")
+            else:
+                physical, counts = _map_native_recall(meta.block_table, native_rows)
             context = attend_packed_c8(
                 query,
                 cache.view(-1, C8_ROW_BYTES),
