@@ -1999,6 +1999,7 @@ def init_ascend_config(vllm_config: VllmConfig) -> AscendConfig:
         "hy4flash_draft_projection_sums",
         "hy4flash_overlap_verify_projections",
         "hy4flash_shared_fp32_draft_history",
+        "hy4flash_overlap_decode_kv",
         "hy4flash_fuse_attn_output_gate",
         "hy4flash_fuse_c8_qk",
         "hy4flash_fuse_c8_write",

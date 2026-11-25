@@ -347,6 +347,9 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
         self.share_verify_layout = (
             use_a5_c8 and not reuse_target and vllm_config.additional_config.get("hy4flash_share_verify_layout", False)
         )
+        self.overlap_decode_kv = (
+            use_a5_c8 and not reuse_target and vllm_config.additional_config.get("hy4flash_overlap_decode_kv", False)
+        )
         self.native_sparse_c8_verify = (
             use_a5_c8
             and not reuse_target
@@ -633,7 +636,24 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
         logits = self.linear_gate(hidden_states)[0]
         return logits if fuse_gate else logits.sigmoid()
 
+    def _prepare_decode_kv(self, hidden_states, projected):
+        main = torch.npu.current_stream()
+        stream = attention_calculation_stream()
+        stream.wait_stream(main)
+        with torch.npu.stream(stream):
+            hidden_states.record_stream(stream)
+            if projected is None:
+                kv = self.kv_a_proj_with_mqa(hidden_states)[0]
+            else:
+                projected.record_stream(stream)
+                kv = projected
+            latent, rope = kv.split((self.latent_dim, self.rope_dim), -1)
+            latent = self.kv_a_layernorm(latent)
+            packed = self._quantize_c8(latent, gpu_scale=self.use_gpu_c8_scale)
+        return latent, rope, packed, stream
+
     def forward(self, positions, hidden_states):
+        packed_kv = None
         absorbed = (
             self.use_cannbot_prolog
             and hidden_states.shape[0] > 0
@@ -659,14 +679,34 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
             q_nope, q_pe = q.split((self.latent_dim, self.rope_dim), dim=-1)
             kv_c, k_pe = kv.split((self.latent_dim, self.rope_dim), dim=-1)
         else:
+            overlap_kv = (
+                self.overlap_decode_kv
+                and self.page_planes
+                and hidden_states.shape[0] > 0
+                and self._is_decode_verification()
+            )
+            if overlap_kv:
+                kv_c, k_pe, packed_kv, kv_stream = self._prepare_decode_kv(hidden_states, None)
             q, q_c = self._project_query(hidden_states)
             q = q.reshape(-1, self.local_heads, self.nope_dim + self.rope_dim)
-            kv_c, k_pe = self.kv_a_proj_with_mqa(hidden_states)[0].split((self.latent_dim, self.rope_dim), -1)
-            kv_c = self.kv_a_layernorm(kv_c)
+            if not overlap_kv:
+                kv = self.kv_a_proj_with_mqa(hidden_states)[0]
+                kv_c, k_pe = kv.split((self.latent_dim, self.rope_dim), -1)
+                kv_c = self.kv_a_layernorm(kv_c)
             q_nope, q_pe = q.split((self.nope_dim, self.rope_dim), dim=-1)
         ready_query = None
-        if self._can_pack_query(positions, q_pe, k_pe):
+        pack_query = self._can_pack_query(positions, q_pe, k_pe)
+        if pack_query:
             latent = q_nope if absorbed else _head_bmm(q_nope, self.absorption_weights.key)
+        if packed_kv is not None:
+            main_stream = torch.npu.current_stream()
+            main_stream.wait_stream(kv_stream)
+            for tensor in (kv_c, k_pe, *packed_kv):
+                tensor.record_stream(main_stream)
+            logger.info_once(
+                "HYV4 Flash overlaps decode KV normalization and C8 quantization with the query projection."
+            )
+        if pack_query:
             rotary = self.rotary_emb
             ready_query, k_pe = pack_rotary_query(
                 q_pe, k_pe, latent, positions, rotary.cos_sin_cache, rotary.mrope_section
@@ -705,7 +745,17 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
                 gate = self._project_output_gate(hidden_states, fuse_gate)
 
         self._forward_paged(
-            hidden_states, q_c, q_nope, q_pe, kv_c, k_pe, positions, out, absorbed=absorbed, ready_query=ready_query
+            hidden_states,
+            q_c,
+            q_nope,
+            q_pe,
+            kv_c,
+            k_pe,
+            positions,
+            out,
+            absorbed=absorbed,
+            ready_query=ready_query,
+            **({"packed_kv": packed_kv} if packed_kv is not None else {}),
         )
         if overlap_gate:
             main_stream.wait_stream(gate_stream)
@@ -740,7 +790,7 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
         return self.post_proj_norm(output) if self.post_proj_norm is not None else output
 
     def _forward_paged(
-        self, hidden, q_c, q_nope, q_pe, kv_c, k_pe, positions, out, *, absorbed=False, ready_query=None
+        self, hidden, q_c, q_nope, q_pe, kv_c, k_pe, positions, out, *, absorbed=False, ready_query=None, packed_kv=None
     ):
         metadata = get_forward_context().attn_metadata
         if not isinstance(metadata, dict) or self.layer_name not in metadata:
@@ -757,7 +807,9 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
         if snapshot is not None:
             snapshot[:num_tokens].fill_(-1)
         full_graph = meta.decode_seq_lens is not None
-        keys = self._write_cache_rows(cache, meta, hidden, kv_c, k_pe, positions, num_tokens, full_graph=full_graph)
+        keys = self._write_cache_rows(
+            cache, meta, hidden, kv_c, k_pe, positions, num_tokens, full_graph=full_graph, packed_kv=packed_kv
+        )
         if ready_query is None:
             query, wv = self._absorb_query(q_nope[:num_tokens], q_pe[:num_tokens], absorbed=absorbed)
         else:
@@ -772,7 +824,7 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
             self._update_index_pool(cache, block_size, meta, keys, positions)
         self._attend_eager(meta, cache, block_size, hidden, q_c, positions, query, wv, out)
 
-    def _write_cache_rows(self, cache, meta, hidden, kv_c, k_pe, positions, num_tokens, *, full_graph):
+    def _write_cache_rows(self, cache, meta, hidden, kv_c, k_pe, positions, num_tokens, *, full_graph, packed_kv=None):
         slots = meta.slot_mapping[:num_tokens]
         keys = (
             self.indexer.token_key_norm(self.indexer.token_key_projection(hidden[:num_tokens])[0]).bfloat16()
@@ -785,7 +837,10 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
             and (self.page_planes or num_tokens <= MAX_FUSED_C8_WRITE_TOKENS)
             and cache.shape[-1] % torch.int32.itemsize == 0
         ):
-            payload, scales = self._quantize_c8(kv_c[:num_tokens], gpu_scale=self.use_gpu_c8_scale)
+            if packed_kv is None:
+                payload, scales = self._quantize_c8(kv_c[:num_tokens], gpu_scale=self.use_gpu_c8_scale)
+            else:
+                payload, scales = packed_kv[0][:num_tokens], packed_kv[1][:num_tokens]
             write_c8_rows(cache, slots, payload, k_pe[:num_tokens], scales, keys, positions[..., :num_tokens])
         else:
             kv = self._pack_kv(kv_c[:num_tokens], k_pe[:num_tokens])

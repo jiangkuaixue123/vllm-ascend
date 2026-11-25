@@ -50,6 +50,7 @@ The recipe reserves 131,584 positions for requests with 130,048 input and 1,024 
 | `hy4flash_ordered_verify_scatter` | On eight A5 devices, exchanges six verification rows and sums each BF16 shard in the native rank order. Uses the original reduction if the startup comparison differs. |
 | `hy4flash_resident_index_keys` | Keeps a per-layer BF16 view of active pooled keys, refreshing changed pages and invalidating it on other cache writes. Requires native pages and disabled prefix caching and KV transfer. |
 | `hy4flash_draft_projection_sums` | Checks the native BF16 sum before switching supported single-request DFly projection widths to the measured transport. |
+| `hy4flash_overlap_decode_kv` | Computes KV normalization and C8 quantization alongside the independent query projection during native-page decode. |
 | `hy4flash_overlap_verify_projections` | Overlaps independent target output-gate and index-query projections with singleton verification attention and cache updates. |
 | `hy4flash_shared_fp32_draft_history` | Shares each request’s dequantized DFly history across its six queries, in bounded batches, while retaining the original per-query FP32 attention reductions and trained five-token proposals. |
 
