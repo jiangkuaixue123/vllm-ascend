@@ -24,6 +24,7 @@
     "hy4flash_ccu_copy_gathers": true,
     "hy4flash_ordered_verify_scatter": true,
     "hy4flash_resident_index_keys": true,
-    "hy4flash_draft_projection_sums": true
+    "hy4flash_draft_projection_sums": true,
+    "hy4flash_overlap_verify_projections": true
   }
 }

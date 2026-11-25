@@ -493,6 +493,11 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
         self.o_proj = RowParallelLinear(
             heads * self.v_dim, hidden, bias=False, quant_config=quant, prefix=f"{prefix}.o_proj"
         )
+        self.overlap_verify_projections = (
+            use_a5_c8
+            and not reuse_target
+            and vllm_config.additional_config.get("hy4flash_overlap_verify_projections", False)
+        )
         self.sequence_parallel_output = False
         self.ordered_scatter_group = None
         self.ordered_scatter_rank = 0
@@ -674,7 +679,22 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
         meta = get_flash_attention_metadata() if self.fuse_attn_output_gate or self.overlap_attn_output_gate else None
         full_decode = meta is not None and meta.decode_seq_lens is not None
         fuse_gate = self.fuse_attn_output_gate and full_decode and self._can_fuse_output_gate(out)
-        overlap_gate = self.overlap_attn_output_gate and full_decode and not self.sequence_parallel_output
+        single_sharded_verify = (
+            self.overlap_verify_projections
+            and self.sequence_parallel_output
+            and full_decode
+            and meta.decode_seq_lens.shape[0] == 1
+            and hidden_states.shape[0] == BATCH_VERIFY_MAX_QUERIES
+        )
+        overlap_gate = (
+            self.overlap_attn_output_gate
+            and full_decode
+            and (not self.sequence_parallel_output or single_sharded_verify)
+        )
+        if single_sharded_verify:
+            logger.info_once(
+                "HYV4 Flash schedules independent sequence-parallel verification projections on an auxiliary stream."
+            )
         if overlap_gate:
             logger.info_once("HYV4 Flash overlaps the output gate projection with paged decode attention.")
             main_stream = torch.npu.current_stream()
@@ -1021,9 +1041,25 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
                 )
         use_paged_pool = False
         if score_groups and reused_rows is None:
-            index_query, index_weight = self.indexer.encode_queries(
-                hidden[:num_tokens], q_c[:num_tokens], positions[..., :num_tokens], full_graph=True
-            )
+            # These replicated query projections depend only on the runner inputs.
+            # The cache update reads and writes other tensors on the capture stream.
+            query_stream = None
+            if (
+                self.overlap_verify_projections
+                and self.sequence_parallel_output
+                and seq_lens.shape[0] == 1
+                and num_queries == BATCH_VERIFY_MAX_QUERIES
+            ):
+                query_stream = attention_calculation_stream()
+                query_stream.wait_stream(torch.npu.current_stream())
+            with npu_stream_switch(query_stream, enabled=query_stream is not None):
+                if query_stream is not None:
+                    hidden.record_stream(query_stream)
+                    q_c.record_stream(query_stream)
+                    positions.record_stream(query_stream)
+                index_query, index_weight = self.indexer.encode_queries(
+                    hidden[:num_tokens], q_c[:num_tokens], positions[..., :num_tokens], full_graph=True
+                )
             use_paged_pool = (
                 self.fuse_indexpool_select
                 and self.incremental_index_pool
@@ -1064,6 +1100,11 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
                 if reused_rows is not None:
                     selected = reused_rows[request]
                 elif score_groups:
+                    if query_stream is not None:
+                        consumer = torch.npu.current_stream()
+                        consumer.wait_stream(query_stream)
+                        index_query.record_stream(consumer)
+                        index_weight.record_stream(consumer)
                     ratio = self.indexer.ratio
                     if use_paged_pool:
                         logger.info_once("HYV4 Flash uses paged IndexPool scoring for six verification queries.")
