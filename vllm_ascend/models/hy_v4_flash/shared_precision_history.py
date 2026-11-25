@@ -41,6 +41,9 @@ def _read_draft_history(
     keys,
     values,
     candidates,
+    TABLE_STRIDE: tl.constexpr,
+    ANCHOR_STRIDE: tl.constexpr,
+    ACTIVE_STRIDE: tl.constexpr,
     WIDTH: tl.constexpr,
     HISTORY: tl.constexpr,
     ROW_BYTES: tl.constexpr,
@@ -54,12 +57,21 @@ def _read_draft_history(
 ):
     row = tl.program_id(0) * TILE_ROWS + tl.arange(0, TILE_ROWS)
     group = tl.program_id(1)
+    request = tl.program_id(2)
     col = group * LANES + tl.arange(0, LANES)
     count = HISTORY + WIDTH
+    table += request * TABLE_STRIDE
+    target += request * HISTORY
+    draft += request * WIDTH * DRAFT_BYTES
+    draft_rope += request * WIDTH * (DRAFT_BYTES // 2)
+    draft_scale += request * WIDTH * (DRAFT_BYTES // 4)
+    keys += request * count * HEAD_DIM
+    values += request * count * LATENT
+    candidates += request * WIDTH * count
     is_history = row < HISTORY
-    start = tl.load(anchor)
+    start = tl.load(anchor + request * ANCHOR_STRIDE)
     position = tl.load(target + row, is_history, -1)
-    enabled = tl.load(active) != 0
+    enabled = tl.load(active + request * ACTIVE_STRIDE) != 0
     live = is_history & (position >= 0) & (position < start) & enabled
     page = tl.load(table + position // PAGE, live, 0).to(tl.int64)
     byte_offset = c8_byte_offset(page, position, PAGE, ROW_BYTES)
@@ -88,14 +100,14 @@ def _read_draft_history(
 
 
 def prepare_draft_operands(cache, table, draft, history, anchor, page_size):
-    """Gather and dequantize a single recall snapshot plus its causal draft block."""
-    count = history.target_rows.numel()
-    width = draft.shape[0]
-    keys = cache.new_empty((count + width, _HEAD_DIM), dtype=torch.float32)
-    values = cache.new_empty((count + width, _LATENT_DIM), dtype=torch.float32)
-    selected = cache.new_empty((width, count + width), dtype=torch.int32)
+    """Gather the individual recall snapshots and private draft blocks in a bounded batch."""
+    batch, count = history.target_rows.shape
+    width = draft.shape[1]
+    keys = cache.new_empty((batch, count + width, _HEAD_DIM), dtype=torch.float32)
+    values = cache.new_empty((batch, count + width, _LATENT_DIM), dtype=torch.float32)
+    selected = cache.new_empty((batch, width, count + width), dtype=torch.int32)
     groups = triton.cdiv(_HEAD_DIM, SFA_QSFA_TILE_SIZE)
-    _read_draft_history[(triton.cdiv(count + width, _TILE_ROWS), groups)](
+    _read_draft_history[(triton.cdiv(count + width, _TILE_ROWS), groups, batch)](
         cache,
         cache.view(torch.bfloat16),
         cache.view(torch.float32),
@@ -109,6 +121,9 @@ def prepare_draft_operands(cache, table, draft, history, anchor, page_size):
         keys,
         values,
         selected,
+        table.stride(0),
+        anchor.stride(0),
+        history.active.stride(0),
         width,
         count,
         cache.shape[-1],
@@ -127,10 +142,10 @@ def prepare_draft_operands(cache, table, draft, history, anchor, page_size):
 
 def attend_draft_history(query, cache, table, draft, history, anchor, sink, scale, page_size):
     keys, values, selected = prepare_draft_operands(cache, table, draft, history, anchor, page_size)
-    queries = query.shape[0]
-    expanded = keys.unsqueeze(0).expand(queries, -1, -1).contiguous()
-    probabilities = mla_attention_probs(query, expanded, selected, sink, scale)
-    values = values.unsqueeze(0).expand(queries, -1, -1)
+    width = draft.shape[1]
+    expanded = keys[:, None].expand(-1, width, -1, -1).flatten(0, 1).contiguous()
+    probabilities = mla_attention_probs(query, expanded, selected.flatten(0, 1), sink, scale)
+    values = values[:, None].expand(-1, width, -1, -1).flatten(0, 1)
     return torch.bmm(probabilities, values).to(query.dtype)
 
 
@@ -145,8 +160,10 @@ def supports_shared_history(source, table, snapshot, positions, window):
         and pages.shape[2] == PAGE_TOKENS
         and pages.numel() >= PAGE_BYTES
         and source.kv_storage_width == C8_ROW_BYTES
+        and table.ndim == 2
         and table.stride(-1) == 1
-        and positions.shape == (1, DRAFT_VERIFY_WIDTH)
-        and snapshot.shape == (1, DRAFT_HISTORY_ROWS)
+        and table.shape[0] > 0
+        and positions.shape == (table.shape[0], DRAFT_VERIFY_WIDTH)
+        and snapshot.shape == (table.shape[0], DRAFT_HISTORY_ROWS)
         and snapshot.is_contiguous()
     )

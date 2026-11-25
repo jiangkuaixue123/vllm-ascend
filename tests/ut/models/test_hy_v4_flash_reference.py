@@ -485,7 +485,7 @@ def test_draft_projection_sum_preserves_wide_and_non_bf16_reductions():
             torch.testing.assert_close(out, x + increment)
 
 
-def test_shared_fp32_draft_history_requires_native_single_request_pages():
+def test_shared_fp32_draft_history_requires_matching_request_shapes_and_native_pages():
     from types import SimpleNamespace
 
     from vllm_ascend.hisparse.c8 import C8_ROW_BYTES
@@ -534,10 +534,13 @@ def test_shared_fp32_draft_history_routes_the_six_queries_to_their_own_selected_
     )
 
     def attention(q, cache, table, private, selected, anchor, learned_sink, scale, page):
-        assert q is query and selected is recall and cache is page_table and learned_sink is sink
+        assert cache is page_table and learned_sink is sink
+        torch.testing.assert_close(q, query)
+        torch.testing.assert_close(selected.target_rows, recall.target_rows)
+        torch.testing.assert_close(selected.active, recall.active)
         assert scale == 0.0625 and page == 64
-        torch.testing.assert_close(table, page_table[0])
-        torch.testing.assert_close(private, draft)
+        torch.testing.assert_close(table, page_table)
+        torch.testing.assert_close(private, draft.unsqueeze(0))
         torch.testing.assert_close(anchor, logical[:, 0])
         return context
 

@@ -65,23 +65,25 @@ class DFlyAttention(AscendHYV4FlashAttention):
         else:
             query, wv = ready_query, self.absorption_weights.value
         query_kv = self._pack_kv(kv_c, k_pe).reshape(batch, width, -1)
-        if isinstance(indices, SharedPrecisionHistory):
-            context = attend_shared_fp32(
-                query,
-                cache,
-                block_table[0],
-                query_kv[0],
-                indices,
-                query_positions[:, 0],
-                self.learnable_sink_param,
-                self.scale,
-                block_size,
-            )
-            out.copy_(_head_bmm(context, wv).reshape_as(out))
-            logger.info_once("HYV4 Flash shares one FP32 history matrix across six DFly queries.")
-            return
         for first in range(0, batch, ATTENTION_BATCH_CHUNK):
             last = min(first + ATTENTION_BATCH_CHUNK, batch)
+            tokens = slice(first * width, last * width)
+            if isinstance(indices, SharedPrecisionHistory):
+                history = SharedPrecisionHistory(indices.target_rows[first:last], indices.active[first:last])
+                context = attend_shared_fp32(
+                    query[tokens],
+                    cache,
+                    block_table[first:last],
+                    query_kv[first:last],
+                    history,
+                    query_positions[first:last, 0],
+                    self.learnable_sink_param,
+                    self.scale,
+                    block_size,
+                )
+                out[tokens].copy_(_head_bmm(context, wv).reshape_as(out[tokens]))
+                logger.info_once("HYV4 Flash shares request-local FP32 history across DFly queries.")
+                continue
             selected = indices[first:last]
             start = query_positions[first:last, :1, None]
             is_query = selected >= start
@@ -96,7 +98,6 @@ class DFlyAttention(AscendHYV4FlashAttention):
             local = torch.arange(first, last, device=indices.device)[:, None, None] * width + offsets
             draft_rows = query_kv.flatten(0, 1).index_select(0, local.flatten()).reshape_as(rows)
             rows = torch.where(is_query[..., None], draft_rows, rows)
-            tokens = slice(first * width, last * width)
             self._attend(query[tokens], selected.flatten(0, 1), rows.flatten(0, 1), wv, out[tokens])
 
 
