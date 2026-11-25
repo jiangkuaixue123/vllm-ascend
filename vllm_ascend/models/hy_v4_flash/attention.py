@@ -1245,6 +1245,7 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
             refresh_pool_keys(self.indexer, cache, slots, positions.ndim)
             logger.info_once("HYV4 Flash refreshes request-local native IndexPool keys together across decode batches.")
         assigned_rows = None
+        refreshed_pool = False
         if (
             use_paged_pool
             and self.shard_indexpool_scores
@@ -1270,6 +1271,11 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
                 consumer.wait_stream(query_stream)
                 index_query.record_stream(consumer)
                 index_weight.record_stream(consumer)
+            resident = self.resident_pool if compact_refresh else None
+            refreshed_pool = resident is not None
+            resident_args = {"resident": resident, "updated_slots": slots[1]} if refreshed_pool else {}
+            if refreshed_pool:
+                logger.info_once("HYV4 Flash refreshes rank-owned sparse key pages from all request writes.")
             assigned_rows = select_request_partitioned_pool(
                 index_query,
                 index_weight,
@@ -1282,6 +1288,7 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
                 self.indexer.budget,
                 self.request_recall_group,
                 self.request_recall_rank,
+                **resident_args,
             )
             logger.info_once("HYV4 Flash partitions complete IndexPool recall requests across tensor ranks.")
         # All requests in a decode graph share a verification width and recall budget.
@@ -1300,7 +1307,6 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
             and meta.block_table.stride(-1) == 1
         ):
             native_rows = []
-        refreshed_pool = False
         for request in range(seq_lens.shape[0]):
             start = request * num_queries
             stop = start + num_queries

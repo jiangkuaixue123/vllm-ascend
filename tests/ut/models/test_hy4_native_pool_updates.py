@@ -53,16 +53,19 @@ def test_joined_refresh_precedes_distributed_recall(monkeypatch):
     def plan(seq, table, qwidth):
         assert table is tables and qwidth == width
         torch.testing.assert_close(seq, lengths)
-        return "planned"
+        return "raw_slots", "written_groups"
 
     def refresh(index, live_cache, slots, coords):
-        assert index is layer.indexer and live_cache is cache and slots == "planned" and coords == 1
+        assert (
+            index is layer.indexer and live_cache is cache and slots == ("raw_slots", "written_groups") and coords == 1
+        )
         calls.append("refreshed")
 
     monkeypatch.setattr(module, "plan_pool_refresh", plan)
     monkeypatch.setattr(module, "refresh_pool_keys", refresh)
 
-    def select(*args):
+    def select(*args, resident, updated_slots):
+        assert resident is layer.resident_pool and updated_slots == "written_groups"
         assert calls == ["refreshed"] and args[0] is index_query and args[2] is cache
         assert args[3] is tables and args[-2] is layer.request_recall_group and args[-1] == 3
         torch.testing.assert_close(args[4], logical)

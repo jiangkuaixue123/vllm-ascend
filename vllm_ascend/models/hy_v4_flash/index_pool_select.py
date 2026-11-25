@@ -319,6 +319,11 @@ def select_native_page_pool(
         )
     else:
         keys = resident.read(cache, pages, *updated)
+    return _score_native_keys(query, weights, visible, keys, max_groups, ratio, budget)
+
+
+def _score_native_keys(query, weights, visible, keys, max_groups, ratio, budget):
+    queries, heads, head_dim = query.shape
     keys = keys[:max_groups]
     matrix = torch.mm(query.bfloat16().view(queries * heads, head_dim), keys.t(), out_dtype=torch.float32)
     scores = torch.empty((queries, max_groups), device=query.device, dtype=torch.float32)
@@ -338,7 +343,20 @@ def select_native_page_pool(
 
 
 def select_request_partitioned_pool(
-    query, weights, cache, tables, visible, page_size, max_groups, ratio, budget, group, rank
+    query,
+    weights,
+    cache,
+    tables,
+    visible,
+    page_size,
+    max_groups,
+    ratio,
+    budget,
+    group,
+    rank,
+    *,
+    resident=None,
+    updated_slots=None,
 ):
     """Exchange logical row lists after scoring complete requests on their owning tensor ranks."""
     requests, queries = visible.shape
@@ -346,13 +364,18 @@ def select_request_partitioned_pool(
     first = rank * per_rank
     live = max(0, min(per_rank, requests - first))
     packet = tables.new_empty((per_rank, queries, (budget + 1) * ratio), dtype=torch.int32)
+    if not live and resident is not None:
+        resident.invalidate()
     if live < per_rank:
         packet[live:].zero_()
     for local in range(live):
         request = first + local
         rows = slice(request * queries, (request + 1) * queries)
-        packet[local].copy_(
-            select_native_page_pool(
+        if local == 0 and resident is not None:
+            keys = resident.read_batch(cache, tables[request], visible[request], updated_slots, budget)
+            selected = _score_native_keys(query[rows], weights[rows], visible[request], keys, max_groups, ratio, budget)
+        else:
+            selected = select_native_page_pool(
                 query[rows],
                 weights[rows],
                 cache,
@@ -363,7 +386,7 @@ def select_request_partitioned_pool(
                 ratio,
                 budget,
             )
-        )
+        packet[local].copy_(selected)
     # Physical KV addresses can differ between ranks. Only logical token indices leave the owner.
     result = packet.new_empty((group.size() * per_rank, *packet.shape[1:]))
     dist.all_gather_into_tensor(result, packet, group=group)

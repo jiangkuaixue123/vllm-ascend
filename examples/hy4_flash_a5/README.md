@@ -64,3 +64,5 @@ The target sliding-window verifier groups requests with separate page tables, ke
 Native C8 target verification uses one value projection across the current requests. The trained attention sink retains its native FP32 log and sigmoid operations. Each request retains its own empty and padded query rows.
 
 Paired sparse target layers reuse their compacted physical C8 addresses within a decode forward when they share the same logical recall rows and the same rank-local block table. Each layer continues to read its own KV values.
+
+For batched IndexPool recall an owning tensor rank can reuse its existing dense key plane for its first request. Remapped pages and pages written anywhere in the current batch are refreshed before scoring. Additional requests use their own physical page tables.
