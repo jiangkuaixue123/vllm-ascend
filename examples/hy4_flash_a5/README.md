@@ -57,6 +57,7 @@ The recipe reserves 131,584 positions for requests with 130,048 input and 1,024 
 | `hy4flash_extra_decode_graph_request_sizes` | Extends explicitly configured `decode_cudagraph_capture_request_sizes` for the Hy4 `kv_consumer` with the listed positive per-rank request counts. |
 | `hy4flash_overlap_verify_projections` | Overlaps independent target output-gate and index-query projections with singleton verification attention and cache updates. |
 | `hy4flash_shared_fp32_draft_history` | Shares each request’s dequantized DFly history across its six queries, in bounded batches, while retaining the original per-query FP32 attention reductions and trained five-token proposals. |
+| `hy4flash_native_draft_c8` | Runs TP1 DFly attention with native C8 KV on A5. Stages each request’s recalled history and draft rows once and keeps the trained sink and causal mask. |
 | `hy4flash_mx_activation_extent` | Uses the final cumulative expert count as the valid row count for clamped MXFP8 SwiGLU. Applies across decode batch sizes and preserves both grouped matrix descriptors. |
 
 The fixed-length test measures one client request at a time. Each reported TPOT divides the elapsed time between its first and last generated-token events by 1,023. The reported P50 is the median across twenty distinct requests. The accuracy run uses all thirty AIME2026 questions at concurrency sixteen. [Per-request timings and hardware results](https://github.com/InferMatrixLab/InferRSI/issues/613)

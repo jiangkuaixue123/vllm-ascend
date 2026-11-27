@@ -145,7 +145,7 @@ def _map_compact(
     tl.store(counts + row, count)
 
 
-def compact_physical_c8_indices(tables, logical):
+def compact_physical_c8_indices(tables, logical, *, page_tokens=PAGE_TOKENS, physical_rows=C8_ROWS_PER_PAGE):
     """Map each request’s logical indices, with valid C8 rows packed stably before padding."""
     requests, queries, width = logical.shape
     physical = torch.empty((requests * queries, width), device=logical.device, dtype=torch.int32)
@@ -159,8 +159,8 @@ def compact_physical_c8_indices(tables, logical):
         queries,
         width,
         triton.next_power_of_2(width),
-        PAGE_TOKENS,
-        C8_ROWS_PER_PAGE,
+        page_tokens,
+        physical_rows,
         num_warps=1,
     )
     return physical, counts

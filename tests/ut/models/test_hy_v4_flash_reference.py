@@ -542,6 +542,7 @@ def test_shared_fp32_draft_history_routes_the_six_queries_to_their_own_selected_
     draft = torch.zeros(6, 8, dtype=torch.uint8)
     sink = torch.zeros(4)
     layer = SimpleNamespace(
+        native_c8_history=False,
         context=(64, page_table, recall, logical),
         target_attention=lambda: source,
         _pack_kv=lambda a, b: draft,

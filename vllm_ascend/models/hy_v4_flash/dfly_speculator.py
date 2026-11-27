@@ -188,7 +188,8 @@ class FlashDFlySpeculator(DraftModelSpeculator):
             ):
                 snapshot = index_layer.topk_snapshot[source_rows]
                 window = self.model.config.context_local_window
-                if layer.self_attn.shared_fp32_history and supports_shared_history(
+                attention = layer.self_attn
+                if (attention.native_c8_history or attention.shared_fp32_history) and supports_shared_history(
                     kv_layer, table, snapshot, query_positions, window
                 ):
                     selected = SharedPrecisionHistory(snapshot, active)
@@ -196,7 +197,7 @@ class FlashDFlySpeculator(DraftModelSpeculator):
                     selected = build_reuse_indices(
                         snapshot, query_positions[:, 0], self.num_query_per_req, window, active
                     )
-                layer.self_attn.context = (kv_layer.kv_cache.shape[2], table, selected, query_positions)
+                attention.context = (kv_layer.kv_cache.shape[2], table, selected, query_positions)
             self._draft_tokens(ids, positions, target_hidden, active, result)
         finally:
             for layer in self.model.layers:

@@ -15,9 +15,14 @@ from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
 from vllm.models.hy_v4.nvidia.model import HYV4DecoderLayer
 from vllm.models.hy_v4.nvidia.moe import HYV4FeedForward
+from vllm.triton_utils import HAS_TRITON
 from vllm.utils.torch_utils import set_default_torch_dtype
 
+from vllm_ascend.device.device_config import get_ascend_device_type
+from vllm_ascend.device.hardware import AscendDeviceType
+
 from .attention import AscendHYV4FlashAttention, _head_bmm
+from .native_draft_history import attend_native_draft_history
 from .shared_precision_history import SharedPrecisionHistory
 from .shared_precision_history import attend_draft_history as attend_shared_fp32
 
@@ -26,6 +31,7 @@ MODEL_PREFIX = "dfly"
 FP8 = torch.float8_e4m3fn
 # Bound the temporary gathered KV and FP32 value tensors for wide draft graphs.
 ATTENTION_BATCH_CHUNK = 8
+TP1_DRAFT_HEADS = 32
 
 
 class DFlyAttention(AscendHYV4FlashAttention):
@@ -35,6 +41,14 @@ class DFlyAttention(AscendHYV4FlashAttention):
             self.local_heads == 4
             and self.use_fp8_cache
             and vllm_config.additional_config.get("hy4flash_shared_fp32_draft_history", False)
+        )
+        self.native_c8_history = (
+            HAS_TRITON
+            and self.local_heads == TP1_DRAFT_HEADS
+            and self.use_fp8_cache
+            and vllm_config.additional_config.get("hy4flash_native_draft_c8", False)
+            and get_ascend_device_type() is AscendDeviceType.A5
+            and hasattr(torch.ops._C_ascend, "npu_kv_quant_sparse_flash_attention_vllm")
         )
         self.target_attention = None
         self.context = None
@@ -70,19 +84,32 @@ class DFlyAttention(AscendHYV4FlashAttention):
             tokens = slice(first * width, last * width)
             if isinstance(indices, SharedPrecisionHistory):
                 history = SharedPrecisionHistory(indices.target_rows[first:last], indices.active[first:last])
-                context = attend_shared_fp32(
-                    query[tokens],
-                    cache,
-                    block_table[first:last],
-                    query_kv[first:last],
-                    history,
-                    query_positions[first:last, 0],
-                    self.learnable_sink_param,
-                    self.scale,
-                    block_size,
-                )
+                if self.native_c8_history:
+                    context = attend_native_draft_history(
+                        query[tokens],
+                        cache,
+                        block_table[first:last],
+                        query_kv[first:last],
+                        history,
+                        query_positions[first:last],
+                        self.learnable_sink_param,
+                        self.scale,
+                    )
+                    logger.info_once("HYV4 Flash uses native C8 attention for request-local TP1 DFly history.")
+                else:
+                    context = attend_shared_fp32(
+                        query[tokens],
+                        cache,
+                        block_table[first:last],
+                        query_kv[first:last],
+                        history,
+                        query_positions[first:last, 0],
+                        self.learnable_sink_param,
+                        self.scale,
+                        block_size,
+                    )
+                    logger.info_once("HYV4 Flash shares request-local FP32 history across DFly queries.")
                 out[tokens].copy_(_head_bmm(context, wv).reshape_as(out[tokens]))
-                logger.info_once("HYV4 Flash shares request-local FP32 history across DFly queries.")
                 continue
             selected = indices[first:last]
             start = query_positions[first:last, :1, None]
