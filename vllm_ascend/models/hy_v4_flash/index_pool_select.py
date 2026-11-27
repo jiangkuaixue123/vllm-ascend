@@ -72,7 +72,14 @@ def _score_paged_pool(
     GROUP_TILE: tl.constexpr,
     QUERIES: tl.constexpr,
     QUERY_TILE: tl.constexpr,
+    TABLE_STRIDE: tl.constexpr,
 ):
+    request = tl.program_id(1)
+    query += request * QUERIES * HEADS * WIDTH
+    head_weight += request * QUERIES * HEADS
+    block_table += request * TABLE_STRIDE
+    visible += request * QUERIES
+    scores += request * QUERIES * MAX_GROUPS
     start = tl.program_id(0) * GROUP_TILE
     group = start + tl.arange(0, GROUP_TILE)
     qid = tl.arange(0, QUERY_TILE)
@@ -99,14 +106,15 @@ def _score_paged_pool(
         )
 
 
-def _score_groups(query, weights, cache, table, visible, page_size, max_groups, ratio, budget):
+def _score_groups(query, weights, cache, tables, visible, page_size, max_groups, ratio, budget):
     cache = cache.view(torch.bfloat16)
-    scores = torch.empty((_QUERIES, max_groups), dtype=torch.float32, device=query.device)
-    _score_paged_pool[(triton.cdiv(max_groups, _GROUP_TILE),)](
+    requests = tables.shape[0]
+    scores = torch.empty((requests * _QUERIES, max_groups), dtype=torch.float32, device=query.device)
+    _score_paged_pool[(triton.cdiv(max_groups, _GROUP_TILE), requests)](
         query,
         weights,
         cache,
-        table,
+        tables,
         visible,
         scores,
         max_groups,
@@ -119,6 +127,7 @@ def _score_groups(query, weights, cache, table, visible, page_size, max_groups, 
         _GROUP_TILE,
         _QUERIES,
         triton.next_power_of_2(_QUERIES),
+        tables.stride(0),
         num_warps=1,
         enable_fp_fusion=False,
         multibuffer=False,
@@ -182,8 +191,10 @@ def _finish_recall(scores, visible, ratio, budget):
     max_groups = scores.shape[-1]
     values, group_ids = scores.topk(budget, dim=-1)
     group_tile = budget + 1
-    rows = torch.empty((_QUERIES, group_tile * ratio), dtype=torch.int64, device=scores.device)
-    _expand_groups[(_QUERIES,)](values, group_ids, visible, rows, budget, ratio, group_tile, max_groups, num_warps=1)
+    rows = torch.empty((scores.shape[0], group_tile * ratio), dtype=torch.int64, device=scores.device)
+    _expand_groups[(rows.shape[0],)](
+        values, group_ids, visible, rows, budget, ratio, group_tile, max_groups, num_warps=1
+    )
     return rows
 
 
@@ -194,7 +205,7 @@ def select_sharded_paged_pool(query, weights, cache, table, visible, page_size, 
     first = tp.rank_in_group * shard
     local_table = table[first * ratio // page_size :]
     local_visible = torch.where(visible // ratio > budget, visible - first * ratio, -1)
-    local = _score_groups(query, weights, cache, local_table, local_visible, page_size, shard, ratio, 0)
+    local = _score_groups(query, weights, cache, local_table.unsqueeze(0), local_visible, page_size, shard, ratio, 0)
     gathered = local.new_empty((tp.world_size * _QUERIES, shard))
     dist.all_gather_into_tensor(gathered, local, group=tp.device_group)
     scores = local.new_empty((_QUERIES, max_groups))
@@ -395,7 +406,7 @@ def select_request_partitioned_pool(
 
 def select_paged_pool(query, weights, cache, table, visible, page_size, max_groups, ratio, budget):
     """Score six verification queries against the BF16 keys in paged IndexPool."""
-    scores = _score_groups(query, weights, cache, table, visible, page_size, max_groups, ratio, budget)
+    scores = _score_groups(query, weights, cache, table.unsqueeze(0), visible, page_size, max_groups, ratio, budget)
     cutoff = visible // ratio
     offsets = torch.arange(ratio, device=visible.device)
     values, selected = scores.topk(budget, dim=-1)
@@ -404,3 +415,11 @@ def select_paged_pool(query, weights, cache, table, visible, page_size, max_grou
     history = history.masked_fill(selected >= cutoff[:, None, None], -1).flatten(1)
     tail = cutoff[:, None] * ratio + offsets
     return torch.cat((history, tail.masked_fill(tail > visible[:, None], -1)), dim=-1)
+
+
+def select_batched_paged_pool(query, weights, cache, tables, visible, page_size, max_groups, ratio, budget):
+    """Score each request's own cache pages in a single six-query launch."""
+    positions = visible.contiguous().view(-1)
+    scores = _score_groups(query, weights, cache, tables, positions, page_size, max_groups, ratio, budget)
+    rows = _finish_recall(scores, positions, ratio, budget)
+    return rows.view(*visible.shape, -1)

@@ -68,6 +68,7 @@ from .index_pool_fp8 import (
     shared_query_frequencies,
 )
 from .index_pool_select import (
+    select_batched_paged_pool,
     select_native_page_pool,
     select_paged_pool,
     select_request_partitioned_pool,
@@ -429,6 +430,11 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
         )
         self.fuse_indexpool_select = (
             use_a5_c8 and not reuse_target and vllm_config.additional_config.get("hy4flash_fuse_indexpool_select", True)
+        )
+        self.batch_indexpool_scores = (
+            self.fuse_indexpool_select
+            and vllm_config.parallel_config.tensor_parallel_size == 1
+            and vllm_config.additional_config.get("hy4flash_batch_indexpool_scores", False)
         )
         self.shard_indexpool_scores = (
             self.fuse_indexpool_select
@@ -1241,7 +1247,7 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
                     "HYV4 Flash reuses logical sparse recall from the preceding target layer (%s).",
                     "single request" if seq_lens.shape[0] == 1 else "multiple requests",
                 )
-        use_paged_pool = False
+        paged_pool_geometry = False
         if score_groups and reused_rows is None:
             # These replicated query projections depend only on the runner inputs.
             # The cache update reads and writes other tensors on the capture stream.
@@ -1261,10 +1267,9 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
                 index_query, index_weight = self.indexer.encode_queries(
                     hidden[:num_tokens], q_c[:num_tokens], positions[..., :num_tokens], full_graph=True
                 )
-            use_paged_pool = (
+            paged_pool_geometry = (
                 self.fuse_indexpool_select
                 and self.incremental_index_pool
-                and self.local_heads == BATCH_VERIFY_SPARSE_SHAPE[0]
                 and (num_queries, self.indexer.num_heads, self.indexer.ratio, self.indexer.budget)
                 == PAGED_POOL_DECODE_SHAPE
                 and cache.device.type == "npu"
@@ -1272,6 +1277,7 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
                 and index_query.is_contiguous()
                 and index_weight.is_contiguous()
             )
+        use_paged_pool = paged_pool_geometry and self.local_heads == BATCH_VERIFY_SPARSE_SHAPE[0]
         use_sharded_pool = (
             use_paged_pool
             and self.shard_indexpool_scores
@@ -1303,7 +1309,25 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
             logger.info_once("HYV4 Flash refreshes request-local native IndexPool keys together across decode batches.")
         assigned_rows = None
         refreshed_pool = False
-        if (
+        if paged_pool_geometry and compact_refresh and self.batch_indexpool_scores and seq_lens.shape[0] > 1:
+            if query_stream is not None:
+                consumer = torch.npu.current_stream()
+                consumer.wait_stream(query_stream)
+                index_query.record_stream(consumer)
+                index_weight.record_stream(consumer)
+            assigned_rows = select_batched_paged_pool(
+                index_query,
+                index_weight,
+                cache,
+                meta.block_table[: seq_lens.shape[0]],
+                logical,
+                block_size,
+                self.max_model_len // self.indexer.ratio,
+                self.indexer.ratio,
+                self.indexer.budget,
+            )
+            logger.info_once("HYV4 Flash scores request-local IndexPool pages together at TP1.")
+        elif (
             use_paged_pool
             and self.shard_indexpool_scores
             and self.page_planes
