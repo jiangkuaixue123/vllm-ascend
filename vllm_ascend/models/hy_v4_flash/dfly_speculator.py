@@ -22,6 +22,7 @@ from vllm_ascend.ops.vocab_parallel_embedding import AscendLogitsProcessor
 
 from .dfly import CHECKPOINT_PREFIX, MODEL_PREFIX, FlashDFlyDraft
 from .draft_projection_reduce import configure_draft_sums
+from .draft_vocabulary import MXFP4DraftVocabulary
 from .shared_precision_history import SharedPrecisionHistory, supports_shared_history
 
 
@@ -54,6 +55,7 @@ class FlashDFlySpeculator(DraftModelSpeculator):
         self.num_query_per_req = self.num_speculative_steps + 1
         self.offsets = torch.arange(self.num_query_per_req, device=device)
         self.cudagraph_manager = None
+        self.draft_vocabulary: MXFP4DraftVocabulary | None = None
 
     def load_draft_model(self, target_model, target_attn_layer_names):
         config = copy(self.vllm_config)
@@ -86,6 +88,7 @@ class FlashDFlySpeculator(DraftModelSpeculator):
             process_weights_after_loading(draft, self.draft_model_config, self.device)
         self.target = getattr(target_model, "language_model", target_model)
         self._configure_fp32_output_head(draft)
+        self.draft_vocabulary = self._prepare_draft_vocabulary(draft)
         copy_group = getattr(self.target.model, "copy_group", None)
         if (
             copy_group is not None
@@ -127,6 +130,21 @@ class FlashDFlySpeculator(DraftModelSpeculator):
             for processor in (self.target.logits_processor, draft.logits_processor):
                 if isinstance(processor, AscendLogitsProcessor):
                     processor.use_native_bf16_fp32_output = True
+
+    def _prepare_draft_vocabulary(self, draft):
+        config = self.vllm_config
+        if (
+            config.additional_config.get("hy4flash_mxfp4_dfly_vocabulary", False)
+            and config.kv_transfer_config is not None
+            and config.kv_transfer_config.kv_role == "kv_consumer"
+            and config.parallel_config.tensor_parallel_size == 1
+            and config.lora_config is None
+            and not config.model_config.enable_sleep_mode
+            and get_ascend_device_type() is AscendDeviceType.A5
+            and MXFP4DraftVocabulary.supports(self.target.lm_head, draft.logits_processor)
+        ):
+            return MXFP4DraftVocabulary(self.target.lm_head.weight)
+        return None
 
     def set_attn(self, model_state, kv_cache_config, block_tables, target_input_buffers, target_attn_groups):
         self.model_state = model_state
@@ -235,7 +253,10 @@ class FlashDFlySpeculator(DraftModelSpeculator):
         previous = ids[:, 0].contiguous()
         for step in range(self.num_speculative_steps):
             corrected = self.model.hidden_correction(hidden[:, step + 1], self.target.embed_input_ids(previous))
-            if local_greedy:
+            if self.draft_vocabulary is not None and corrected.dtype == torch.bfloat16:
+                logger.info_once("HYV4 Flash selects DFly proposals with an MXFP4 shortlist and BF16 rerank.")
+                previous = self.draft_vocabulary.greedy(corrected)
+            elif local_greedy:
                 previous = vocabulary.greedy(corrected)
             else:
                 previous = self.model.logits_processor(self.target.lm_head, corrected).argmax(dim=-1)

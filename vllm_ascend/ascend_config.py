@@ -1991,6 +1991,7 @@ def init_ascend_config(vllm_config: VllmConfig) -> AscendConfig:
         "hy4flash_cannbot_mla_prolog",
         "hy4flash_local_vocabulary",
         "hy4flash_native_bf16_fp32_head",
+        "hy4flash_mxfp4_dfly_vocabulary",
         "hy4flash_share_neighbor_recall",
         "hy4flash_sharded_greedy_verify",
         "hy4flash_native_index_pages",

@@ -25,6 +25,7 @@ from vllm_ascend.models.hy_v4_flash.aclgraph import FlashAclGraphManager
 from vllm_ascend.models.hy_v4_flash.attention import AscendHYV4FlashAttention, FlashMetadataBuilder
 from vllm_ascend.models.hy_v4_flash.cache_pages import PAGE_BYTES, PAGE_TOKENS
 from vllm_ascend.models.hy_v4_flash.dfly_speculator import build_reuse_indices
+from vllm_ascend.models.hy_v4_flash.draft_vocabulary import _rerank
 from vllm_ascend.models.hy_v4_flash.layer_recall import paired_recall_layer, recall_rows_for_forward
 from vllm_ascend.models.hy_v4_flash.prefill_c8 import apply_attention_sink, prefill_window_indices
 from vllm_ascend.ops.vocab_parallel_embedding import AscendLogitsProcessor
@@ -54,6 +55,14 @@ def test_dfly_enables_fp32_output_on_registered_ascend_processors(monkeypatch, r
     assert draft_model.logits_processor is draft
     assert target.use_native_bf16_fp32_output is expected
     assert draft.use_native_bf16_fp32_output is expected
+
+
+def test_dfly_vocabulary_rerank_uses_bf16_rows_and_the_lowest_token_on_ties():
+    weight = torch.tensor([[7, 0], [2, 2], [2, 2], [-10, 0]], dtype=torch.bfloat16)
+    hidden = torch.tensor([[0, 1], [1, 0], [float("nan"), 1]], dtype=torch.bfloat16)
+    shortlist = torch.tensor([[2, 0, 1], [3, 2, 0], [3, 2, 1]])
+
+    torch.testing.assert_close(_rerank(hidden, weight, shortlist), torch.tensor([1, 0, 1]))
 
 
 def test_gpu_c8_scale_packs_per_tile_fp8_and_preserves_rope():
