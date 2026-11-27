@@ -32,7 +32,7 @@ from vllm_ascend.ops.fused_moe.dataclass.fused_experts import MoEWeights, build_
 from vllm_ascend.ops.fused_moe.dataclass.moe_mlp import MoEMlpComputeInput
 from vllm_ascend.ops.fused_moe.moe_utils import cumsum_group_list, maybe_normalize_mxfp_scale_layout
 from vllm_ascend.ops.fused_moe.routed_experts import AscendRoutedExperts  # noqa: F401
-from vllm_ascend.quantization.nz import mxfp8_nz
+from vllm_ascend.quantization.nz import fp4_packed_nz, mxfp8_nz
 from vllm_ascend.quantization.utils import DynamicMXQuantScaleAlg, get_dynamic_mx_quant_scale_alg
 from vllm_ascend.utils import (
     FP8_METHOD,
@@ -374,6 +374,7 @@ class AscendW8A8MXFP8DynamicFusedMoEMethod(AscendMoEScheme):
         ascend_config = get_ascend_config()
         self.dynamic_eplb = False if vllm_config.use_v2_model_runner else ascend_config.eplb_config.dynamic_eplb
         self.use_expert_weight_list = self.dynamic_eplb or vllm_config.parallel_config.enable_eplb
+        self.packed_down_projection = False
         self._dynamic_mx_quant_scale_alg = get_dynamic_mx_quant_scale_alg(vllm_config)
         model_config = getattr(vllm_config, "model_config", None)
         text_config = getattr(model_config, "hf_text_config", None)
@@ -535,7 +536,7 @@ class AscendW8A8MXFP8DynamicFusedMoEMethod(AscendMoEScheme):
 
         use_mega_moe = use_cann_megamoe(get_current_vllm_config())
         if not use_mega_moe and not self.use_expert_weight_list:
-            self._process_batched_weights(layer)
+            self._process_batched_weights(layer, packed_down_projection=self.packed_down_projection)
             layer._mxfp8_transformed = True
             return
 
@@ -583,7 +584,7 @@ class AscendW8A8MXFP8DynamicFusedMoEMethod(AscendMoEScheme):
         torch.npu.empty_cache()
 
     @staticmethod
-    def _process_batched_weights(layer: torch.nn.Module) -> None:
+    def _process_batched_weights(layer: torch.nn.Module, *, packed_down_projection: bool = False) -> None:
         """Keep the non-EPLB GMM path on graph-stable batched tensors."""
         if not hasattr(layer, "_mxfp8_moe_buffers"):
             layer._mxfp8_moe_buffers = {}
@@ -592,7 +593,13 @@ class AscendW8A8MXFP8DynamicFusedMoEMethod(AscendMoEScheme):
             scale = getattr(layer, f"{weight_name}_scale")
             groups, channels, scale_size = scale.shape
             target_scale = scale.data.reshape(groups, channels, scale_size // 2, 2)
-            if weight_name not in layer._mxfp8_moe_buffers:
+            if packed_down_projection and weight_name == "w2_weight":
+                # Mixed FP8-by-FP4 GMM uses the strided antiquant scale and packed K.
+                layer._mxfp8_moe_buffers[weight_name] = (
+                    fp4_packed_nz().cast(weight.data).transpose(1, 2),
+                    target_scale.transpose(1, 2),
+                )
+            elif weight_name not in layer._mxfp8_moe_buffers:
                 layer._mxfp8_moe_buffers[weight_name] = maybe_trans_nz_with_scale(
                     weight.data,
                     target_scale,
@@ -830,10 +837,19 @@ class AscendW8A8MXFP8DynamicFusedMoEMethod(AscendMoEScheme):
             if input_dtype in [torch.bfloat16, torch.float16]
             else (torch.bfloat16 if use_bf16 else torch.float16)
         )
+        weight_scale = self._get_weights(layer, "w2_weight_scale")
+        weight_kwargs = (
+            {
+                "antiquant_scale": weight_scale,
+                "x_dtype": torch.float8_e4m3fn,
+                "weight_dtype": torch_npu.float4_e2m1fn_x2,
+            }
+            if self.packed_down_projection
+            else {"scale": weight_scale, "scale_dtype": torch_npu.float8_e8m0fnu}
+        )
         return torch_npu.npu_grouped_matmul(
             x=[hidden_states],
             weight=self._get_weights(layer, "w2_weight"),
-            scale=self._get_weights(layer, "w2_weight_scale"),
             bias=None,
             per_token_scale=[act_out_scale],
             split_item=2,
@@ -841,10 +857,8 @@ class AscendW8A8MXFP8DynamicFusedMoEMethod(AscendMoEScheme):
             group_type=0,
             group_list=mlp_compute_input.group_list,
             output_dtype=output_dtype,
-            scale_dtype=torch_npu.float8_e8m0fnu,
             per_token_scale_dtype=torch_npu.float8_e8m0fnu,
-            x_dtype=None,
-            weight_dtype=None,
+            **weight_kwargs,
         )[0]
 
 

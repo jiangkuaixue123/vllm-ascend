@@ -47,6 +47,7 @@ from vllm.logger import logger
 from vllm.model_executor.utils import replace_parameter
 from vllm.utils.math_utils import cdiv
 
+from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.device.hardware_profile import WeightFormat, get_current_hardware_profile
 from vllm_ascend.quantization.utils import get_dynamic_mx_quant_scale_alg
 from vllm_ascend.utils import FP8_METHOD, maybe_trans_nz
@@ -128,8 +129,10 @@ def _require_fp8_weight_matmul() -> None:
     )
 
 
-def _mx_quantize(resolved: torch.Tensor, scale_alg: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """Re-quantize a dense matrix to MXFP8, returning the weight and uint8 scale.
+def _mx_quantize(
+    resolved: torch.Tensor, scale_alg: int, dst_type: torch.dtype | int = BLOCK_FP8_WEIGHT_DTYPE
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Re-quantize a dense matrix to microscaled FP8 or FP4.
 
     ``npu_dynamic_mx_quant`` emits the scale with its group axis already split into
     ``[..., num_groups // 2, 2]`` pairs, whereas both MXFP8 schemes consume the loader
@@ -138,7 +141,7 @@ def _mx_quantize(resolved: torch.Tensor, scale_alg: int) -> tuple[torch.Tensor, 
     """
     quantized, scale = torch_npu.npu_dynamic_mx_quant(
         resolved,
-        dst_type=BLOCK_FP8_WEIGHT_DTYPE,
+        dst_type=dst_type,
         scale_alg=scale_alg,
     )
     return quantized, scale.flatten(-2)
@@ -344,12 +347,23 @@ class AscendFp8BlockFusedMoEMethod(AscendMoEScheme):
         # a group size, which is how the upstream loader learns to narrow
         # `*_weight_scale_inv` per expert shard.
         self.group_size = self.block_k
-        self.model_dtype = get_current_vllm_config().model_config.dtype
+        config = get_current_vllm_config()
+        self.model_dtype = config.model_config.dtype
         self.moe_config = moe_config
         self.mxfp8_method = AscendW8A8MXFP8DynamicFusedMoEMethod()
-        # MoE MXFP8 has group_size only. Snapshot the Linear helper here so
-        # requantize does not call get_current_vllm_config() at load time.
-        self._mx_scale_alg = get_dynamic_mx_quant_scale_alg(get_current_vllm_config())
+        self._mx_scale_alg = get_dynamic_mx_quant_scale_alg(config)
+        transfer = config.kv_transfer_config
+        self.pack_down_projection = (
+            config.additional_config.get("hy4flash_mxfp4_down_projection", False)
+            and getattr(config.model_config.hf_text_config, "model_type", None) == "hy_v4_flash"
+            and transfer is not None
+            and transfer.kv_role == "kv_consumer"
+            and config.parallel_config.tensor_parallel_size == 1
+            and config.lora_config is None
+            and not self.mxfp8_method.use_expert_weight_list
+            and not get_ascend_config().enable_fused_mc2
+            and get_current_hardware_profile().supports_weight_format(WeightFormat.MXFP4)
+        )
         self.use_mxfp8 = True
         self._bf16_method: Any = None
 
@@ -419,10 +433,18 @@ class AscendFp8BlockFusedMoEMethod(AscendMoEScheme):
                 self.model_dtype,
             )
 
+        packed_down = (
+            self.use_mxfp8
+            and self.pack_down_projection
+            and layer.w2_weight.shape[-1] % (2 * self.mxfp8_method.group_size) == 0
+        )
+        self.mxfp8_method.packed_down_projection = packed_down
         for weight_name in weight_names:
             scale_name = f"{weight_name}_scale_inv"
             if self.use_mxfp8:
-                mx_scale = self._requantize_experts_inplace(layer, weight_name, scale_name)
+                mx_scale = self._requantize_experts(
+                    layer, weight_name, scale_name, packed_fp4=packed_down and weight_name == "w2_weight"
+                )
                 layer.register_parameter(f"{weight_name}_scale", torch.nn.Parameter(mx_scale, requires_grad=False))
             else:
                 replace_parameter(layer, weight_name, self._resolve_experts(layer, weight_name, scale_name))
@@ -445,17 +467,19 @@ class AscendFp8BlockFusedMoEMethod(AscendMoEScheme):
             )
         return resolved
 
-    def _requantize_experts_inplace(self, layer: torch.nn.Module, weight_name: str, scale_name: str) -> torch.Tensor:
-        """Rewrite every expert of one MoE weight from block-wise FP8 to MXFP8.
-
-        The FP8 weight buffer is reused, so peak memory is one expert of staging
-        rather than a dense copy of the whole expert stack.
-        """
+    def _requantize_experts(
+        self, layer: torch.nn.Module, weight_name: str, scale_name: str, *, packed_fp4: bool
+    ) -> torch.Tensor:
+        """Requantize and stage one expert at a time."""
         scale_alg = self._mx_scale_alg
         weight = getattr(layer, weight_name).data
         scale_inv = getattr(layer, scale_name).data
-        num_experts, _, in_features = weight.shape
+        num_experts, out_features, in_features = weight.shape
         group_size = self.mxfp8_method.group_size
+        dst_type = torch_npu.float4_e2m1fn_x2 if packed_fp4 else BLOCK_FP8_WEIGHT_DTYPE
+        destination = (
+            weight.new_empty((num_experts, out_features, in_features // 2), dtype=torch.uint8) if packed_fp4 else weight
+        )
         mx_scale = torch.empty(
             (num_experts, weight.shape[1], in_features // group_size),
             dtype=torch.uint8,
@@ -465,9 +489,12 @@ class AscendFp8BlockFusedMoEMethod(AscendMoEScheme):
             resolved = resolve_block_scales(
                 weight[expert], scale_inv[expert], self.block_n, self.block_k, self.model_dtype
             )
-            quantized, expert_scale = _mx_quantize(resolved, scale_alg)
-            weight[expert].copy_(quantized)
+            quantized, expert_scale = _mx_quantize(resolved, scale_alg, dst_type)
+            destination[expert].copy_(quantized.view(torch.uint8) if packed_fp4 else quantized)
             mx_scale[expert].copy_(expert_scale.view(torch.uint8).reshape(mx_scale[expert].shape))
+        if packed_fp4:
+            replace_parameter(layer, weight_name, destination)
+            logger.info_once("HYV4 Flash Decode packs routed down-projection weights as MXFP4.")
         return mx_scale
 
     def get_eplb_weight_views(self, layer: torch.nn.Module) -> list[torch.Tensor]:

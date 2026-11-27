@@ -38,6 +38,7 @@
     "hy4flash_overlap_decode_kv": true,
     "hy4flash_compact_index_updates": true,
     "hy4flash_join_engram_projections": true,
-    "hy4flash_mx_activation_extent": true
+    "hy4flash_mx_activation_extent": true,
+    "hy4flash_mxfp4_down_projection": true
   }
 }

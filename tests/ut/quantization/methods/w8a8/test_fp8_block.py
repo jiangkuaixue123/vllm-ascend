@@ -407,6 +407,33 @@ class TestAscendFp8BlockFusedMoEMethod(TestBase):
         self.assertFalse(hasattr(layer, "w13_weight_scale_inv"))
         scheme.mxfp8_method.process_weights_after_loading.assert_called_once_with(layer)
 
+    def test_packs_only_the_routed_down_projection_in_mxfp4(self):
+        scheme = self.build_scheme()
+        scheme.pack_down_projection = True
+        layer = self._make_moe_layer(intermediate=64)
+        experts, out_features, reduction_size = layer.w2_weight.shape
+
+        def fake_mx_quant(tensor, *, dst_type, **kwargs):
+            rows, columns = tensor.shape
+            if dst_type == torch.float8_e4m3fn:
+                weight = torch.zeros(rows, columns).to(torch.float8_e4m3fn)
+            else:
+                weight = torch.full((rows, columns // 2), 7, dtype=torch.uint8)
+            scales = torch.zeros(rows, columns // (2 * MX_GROUP_SIZE), 2, dtype=torch.uint8)
+            return weight, scales
+
+        with patch(f"{MODULE}.torch_npu") as mock_npu:
+            mock_npu.npu_dynamic_mx_quant.side_effect = fake_mx_quant
+            scheme.process_weights_after_loading(layer)
+
+        self.assertTrue(scheme.mxfp8_method.packed_down_projection)
+        self.assertEqual(layer.w13_weight.dtype, torch.float8_e4m3fn)
+        self.assertEqual(layer.w2_weight.dtype, torch.uint8)
+        self.assertEqual(layer.w2_weight.shape, (experts, out_features, reduction_size // 2))
+        self.assertTrue(torch.all(layer.w2_weight == 7))
+        self.assertEqual(layer.w2_weight_scale.shape, (experts, out_features, reduction_size // MX_GROUP_SIZE))
+        self.assertFalse(hasattr(layer, "w2_weight_scale_inv"))
+
     def test_apply_delegates_to_the_active_method(self):
         scheme = self.build_scheme()
         scheme.use_mxfp8 = False
