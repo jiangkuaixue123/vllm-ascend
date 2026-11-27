@@ -16,6 +16,7 @@ from .attention import get_flash_attention_metadata
 
 _IHC_PRE_SHAPE = (4, 3072)
 _IHC_PRE_DECODE_MAX_ROWS = 16
+_IHC_PRE_TP1_DECODE_MAX_ROWS = 64
 _IHC_PRE_BLOCK = 1024
 # Eight FP32 gate sums and an RMS sum per split, padded to 64 bytes.
 _IHC_PRE_PARTIAL_STRIDE = 16
@@ -94,11 +95,20 @@ class FlashHCPreLayer(HYV4HCPreLayer):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        config = get_current_vllm_config()
         self.fuse_decode_pre = (
             HAS_TRITON
-            and get_current_vllm_config().additional_config.get("hy4flash_fuse_ihc_pre", False)
+            and config.additional_config.get("hy4flash_fuse_ihc_pre", False)
             and get_ascend_device_type() is AscendDeviceType.A5
         )
+        transfer = config.kv_transfer_config
+        use_wide_decode_pre = (
+            config.additional_config.get("hy4flash_fuse_tp1_ihc_pre", False)
+            and config.parallel_config.tensor_parallel_size == 1
+            and transfer is not None
+            and transfer.kv_role == "kv_consumer"
+        )
+        self.fused_decode_max_rows = _IHC_PRE_TP1_DECODE_MAX_ROWS if use_wide_decode_pre else _IHC_PRE_DECODE_MAX_ROWS
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if not (
@@ -108,7 +118,7 @@ class FlashHCPreLayer(HYV4HCPreLayer):
             and self.hpc_op is None
             and x.is_contiguous()
             and x.shape[1:] == _IHC_PRE_SHAPE
-            and 0 < x.shape[0] <= _IHC_PRE_DECODE_MAX_ROWS
+            and 0 < x.shape[0] <= self.fused_decode_max_rows
             and self.hc_fn.weight.dtype == self.hc_base.dtype == self.hc_scale.dtype == torch.float32
             and self.hc_fn.weight.shape == (2 * self.hc_mult, self.hc_mult * self.hidden_dim)
             and self.hc_fn.weight.is_contiguous()
@@ -117,8 +127,8 @@ class FlashHCPreLayer(HYV4HCPreLayer):
         ):
             return super().forward(x)
 
-        logger.info_once("HYV4 Flash uses fused iHC pre-processing for small NPU batches.")
         rows, channels, hidden = x.shape
+        logger.info_once("HYV4 Flash uses fused iHC pre-processing for %d NPU token rows.", rows)
         flat_width = channels * hidden
         splits = triton.cdiv(flat_width, _IHC_PRE_BLOCK)
         partial = x.new_empty((rows, splits, _IHC_PRE_PARTIAL_STRIDE), dtype=torch.float32)
