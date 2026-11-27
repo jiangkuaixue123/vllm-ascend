@@ -49,6 +49,7 @@ def make_thread(**overrides: object) -> MooncakePullRecvingThread:
     thread.vllm_config = SimpleNamespace(parallel_config=SimpleNamespace(cp_kv_cache_interleave_size=16))
     thread.tp_rank = 0
     thread.tp_size = 1
+    thread.dp_rank = 0
     thread.pcp_rank = 0
     thread.pcp_size = 1
     thread.dcp_rank = 0
@@ -1017,6 +1018,28 @@ def test_transfer_bucket_routes_each_request_to_one_complete_pcp_replica() -> No
 
     assert set(buckets) == {(0, 0), (1, 0)}
     assert request_ids == {(0, 0): {"decode-a"}, (1, 0): {"decode-b"}}
+
+
+@pytest.mark.parametrize("dp_rank", range(4))
+def test_replicated_pulls_start_at_the_decode_dp_rank(dp_rank: int) -> None:
+    thread = make_thread(dp_rank=dp_rank)
+    producer_ranks = [0, 1, 2, 3]
+    _, request_ids = thread._build_transfer_block_buckets(
+        make_pp_metadata(
+            tp_base_addrs={rank: [[5000 + rank * 1000]] for rank in producer_ranks},
+        ),
+        [(0, 0)],
+        {(0, 0): [producer_ranks]},
+        1,
+        1,
+        {
+            "decode-a": make_req_meta(remote_request_id="prefill-a"),
+            "decode-b": make_req_meta(remote_request_id="prefill-b"),
+        },
+        {},
+    )
+
+    assert request_ids == {(0, dp_rank): {"decode-a"}, (0, (dp_rank + 1) % 4): {"decode-b"}}
 
 
 def test_attention_address_generation_handles_partial_head_overlap() -> None:

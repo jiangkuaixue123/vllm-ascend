@@ -624,7 +624,9 @@ class MooncakePullRecvingThread(threading.Thread, MooncakeTransferAddressMixin):
         # (remote_pcp_rank, remote_tp_rank) -> requests with at least one
         # transfer entry in the bucket.
         request_ids_by_remote_rank: dict[tuple[int, int], set[str]] = {}
-        for selection_index, (request_id, request_metadata) in enumerate(requests.items()):
+        # Independent Decode DP ranks often submit one request at a time.
+        # Give each rank a different starting producer replica in these batches.
+        for selection_index, (request_id, request_metadata) in enumerate(requests.items(), start=self.dp_rank):
             request_block_ids_by_spec = transfer_block_ids_by_spec.setdefault(request_id, {})
             for local_layer_index, remote_layer_index in layer_pairs:
                 spec_index = self.spec_indices[local_layer_index]
