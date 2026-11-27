@@ -16,6 +16,10 @@ from vllm.utils.torch_utils import set_default_torch_dtype
 from vllm.v1.worker.gpu.cudagraph_utils import CudaGraphManager
 from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
 
+from vllm_ascend.device.device_config import get_ascend_device_type
+from vllm_ascend.device.hardware import AscendDeviceType
+from vllm_ascend.ops.vocab_parallel_embedding import AscendLogitsProcessor
+
 from .dfly import CHECKPOINT_PREFIX, MODEL_PREFIX, FlashDFlyDraft
 from .draft_projection_reduce import configure_draft_sums
 from .shared_precision_history import SharedPrecisionHistory, supports_shared_history
@@ -81,6 +85,7 @@ class FlashDFlySpeculator(DraftModelSpeculator):
             loader.load_weights(draft, self.draft_model_config)
             process_weights_after_loading(draft, self.draft_model_config, self.device)
         self.target = getattr(target_model, "language_model", target_model)
+        self._configure_fp32_output_head(draft)
         copy_group = getattr(self.target.model, "copy_group", None)
         if (
             copy_group is not None
@@ -107,6 +112,21 @@ class FlashDFlySpeculator(DraftModelSpeculator):
             self.num_speculative_steps,
         )
         return draft
+
+    def _configure_fp32_output_head(self, draft):
+        config = self.vllm_config
+        transfer = config.kv_transfer_config
+        if (
+            config.additional_config.get("hy4flash_native_bf16_fp32_head", False)
+            and config.parallel_config.tensor_parallel_size == 1
+            and config.lora_config is None
+            and transfer is not None
+            and transfer.kv_role == "kv_consumer"
+            and get_ascend_device_type() is AscendDeviceType.A5
+        ):
+            for processor in (self.target.logits_processor, draft.logits_processor):
+                if isinstance(processor, AscendLogitsProcessor):
+                    processor.use_native_bf16_fp32_output = True
 
     def set_attn(self, model_state, kv_cache_config, block_tables, target_input_buffers, target_attn_groups):
         self.model_state = model_state

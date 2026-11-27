@@ -4,6 +4,7 @@
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 from vllm.config import CUDAGraphMode
 from vllm.models.hy_v4_flash.configs import SLIDING_ATTENTION, SPARSE_ATTENTION, HYV4FlashConfig, HYV4FlashVLConfig
@@ -17,14 +18,42 @@ from vllm.models.hy_v4_flash.reference import (
 )
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 
+from vllm_ascend.device.hardware import AscendDeviceType
 from vllm_ascend.hisparse.c8 import C8_ROW_BYTES, dequantize_c8_rows, pack_c8_components
-from vllm_ascend.models.hy_v4_flash import greedy_sampling
+from vllm_ascend.models.hy_v4_flash import dfly_speculator, greedy_sampling
 from vllm_ascend.models.hy_v4_flash.aclgraph import FlashAclGraphManager
 from vllm_ascend.models.hy_v4_flash.attention import AscendHYV4FlashAttention, FlashMetadataBuilder
 from vllm_ascend.models.hy_v4_flash.cache_pages import PAGE_BYTES, PAGE_TOKENS
 from vllm_ascend.models.hy_v4_flash.dfly_speculator import build_reuse_indices
 from vllm_ascend.models.hy_v4_flash.layer_recall import paired_recall_layer, recall_rows_for_forward
 from vllm_ascend.models.hy_v4_flash.prefill_c8 import apply_attention_sink, prefill_window_indices
+from vllm_ascend.ops.vocab_parallel_embedding import AscendLogitsProcessor
+
+
+@pytest.mark.parametrize(("role", "expected"), [("kv_consumer", True), ("kv_producer", False)])
+def test_dfly_enables_fp32_output_on_registered_ascend_processors(monkeypatch, role, expected):
+    monkeypatch.setattr(dfly_speculator, "get_ascend_device_type", lambda: AscendDeviceType.A5)
+    target, draft = (object.__new__(AscendLogitsProcessor) for _ in range(2))
+    for processor in (target, draft):
+        torch.nn.Module.__init__(processor)
+        processor.head_dtype = torch.float32
+
+    speculator = dfly_speculator.FlashDFlySpeculator.__new__(dfly_speculator.FlashDFlySpeculator)
+    speculator.vllm_config = SimpleNamespace(
+        additional_config={"hy4flash_native_bf16_fp32_head": True},
+        parallel_config=SimpleNamespace(tensor_parallel_size=1),
+        kv_transfer_config=SimpleNamespace(kv_role=role),
+        lora_config=None,
+    )
+    speculator.target = SimpleNamespace(logits_processor=target)
+    draft_model = SimpleNamespace(logits_processor=draft)
+
+    speculator._configure_fp32_output_head(draft_model)
+
+    assert speculator.target.logits_processor is target
+    assert draft_model.logits_processor is draft
+    assert target.use_native_bf16_fp32_output is expected
+    assert draft.use_native_bf16_fp32_output is expected
 
 
 def test_gpu_c8_scale_packs_per_tile_fp8_and_preserves_rope():

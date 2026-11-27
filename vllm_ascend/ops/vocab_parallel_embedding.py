@@ -27,6 +27,8 @@ from vllm.config import get_current_vllm_config
 from vllm.distributed import divide
 from vllm.distributed.parallel_state import get_pcp_group, get_tp_group
 from vllm.forward_context import is_forward_context_available
+from vllm.logger import logger
+from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
@@ -506,12 +508,29 @@ class AscendLogitsProcessor(LogitsProcessor):
     Added the feature of lmheadTP in pure dp scenario
     """
 
+    use_native_bf16_fp32_output = False
+
     def _apply_head(
         self,
         lm_head: AscendParallelLMHead,
         hidden_states: torch.Tensor,
         embedding_bias: torch.Tensor | None,
     ) -> torch.Tensor:
+        if (
+            self.use_native_bf16_fp32_output
+            and self.head_dtype == torch.float32
+            and hidden_states.ndim == 2
+            and hidden_states.device.type == "npu"
+            and hidden_states.dtype == lm_head.weight.dtype == torch.bfloat16
+            and lm_head.tp_size == 1
+            and isinstance(lm_head.quant_method, (UnquantizedLinearMethod, UnquantizedEmbeddingMethod))
+            and embedding_bias is None
+        ):
+            logger.info_once(
+                "HYV4 Flash projects BF16 TP1 vocabulary operands directly to FP32 logits for %d rows.",
+                hidden_states.shape[0],
+            )
+            return torch.mm(hidden_states, lm_head.weight.t(), out_dtype=torch.float32)
         return super()._apply_head(lm_head, hidden_states, embedding_bias)
 
     def _get_logits(
