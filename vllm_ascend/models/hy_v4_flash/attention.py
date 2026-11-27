@@ -436,6 +436,13 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
             and vllm_config.parallel_config.tensor_parallel_size == 1
             and vllm_config.additional_config.get("hy4flash_batch_indexpool_scores", False)
         )
+        transfer = vllm_config.kv_transfer_config
+        self.wide_indexpool_tile = (
+            self.batch_indexpool_scores
+            and vllm_config.additional_config.get("hy4flash_wide_indexpool_tile", False)
+            and transfer is not None
+            and transfer.kv_role == "kv_consumer"
+        )
         self.shard_indexpool_scores = (
             self.fuse_indexpool_select
             and vllm_config.additional_config.get("hy4flash_shard_indexpool_scores", False)
@@ -1325,8 +1332,12 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
                 self.max_model_len // self.indexer.ratio,
                 self.indexer.ratio,
                 self.indexer.budget,
+                wide_tile=self.wide_indexpool_tile,
             )
-            logger.info_once("HYV4 Flash scores request-local IndexPool pages together at TP1.")
+            logger.info_once(
+                "HYV4 Flash scores request-local IndexPool pages together at TP1 (wide tile=%s).",
+                self.wide_indexpool_tile,
+            )
         elif (
             use_paged_pool
             and self.shard_indexpool_scores

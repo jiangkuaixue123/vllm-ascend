@@ -14,6 +14,7 @@ from .index_pool_cache import pool_key_addresses
 
 _QUERIES = 6
 _GROUP_TILE = 128
+_TP1_WIDE_GROUP_TILE = 256
 _SCORE_COPY_TILE = 512
 _MAX_EXACT_FP32_GROUP = 1 << 24
 
@@ -72,6 +73,7 @@ def _score_paged_pool(
     GROUP_TILE: tl.constexpr,
     QUERIES: tl.constexpr,
     QUERY_TILE: tl.constexpr,
+    QUERY_BLOCK: tl.constexpr,
     TABLE_STRIDE: tl.constexpr,
 ):
     request = tl.program_id(1)
@@ -91,13 +93,42 @@ def _score_paged_pool(
         live = (group < max_visible) & (group < MAX_GROUPS)
         address = pool_key_addresses(block_table, group, lane, live, ROW_WIDTH, PAGE_SIZE, RATIO, WIDTH // RATIO)
         key = tl.load(cache + address, live[:, None], 0)
-        # Sharing one key tile and using 4+2 queries keeps a 128-group tile in UB.
-        _score_query_block(
-            query, head_weight, visible, scores, key, group, 0, 4, MAX_GROUPS, WIDTH, HEADS, RATIO, BUDGET, GROUP_TILE
-        )
-        _score_query_block(
-            query, head_weight, visible, scores, key, group, 4, 2, MAX_GROUPS, WIDTH, HEADS, RATIO, BUDGET, GROUP_TILE
-        )
+        # Keep the query-head score tile within UB while reusing the same keys.
+        full_queries: tl.constexpr = QUERIES - QUERIES % QUERY_BLOCK
+        for first_query in tl.static_range(0, full_queries, QUERY_BLOCK):
+            _score_query_block(
+                query,
+                head_weight,
+                visible,
+                scores,
+                key,
+                group,
+                first_query,
+                QUERY_BLOCK,
+                MAX_GROUPS,
+                WIDTH,
+                HEADS,
+                RATIO,
+                BUDGET,
+                GROUP_TILE,
+            )
+        if QUERIES % QUERY_BLOCK:
+            _score_query_block(
+                query,
+                head_weight,
+                visible,
+                scores,
+                key,
+                group,
+                full_queries,
+                QUERIES % QUERY_BLOCK,
+                MAX_GROUPS,
+                WIDTH,
+                HEADS,
+                RATIO,
+                BUDGET,
+                GROUP_TILE,
+            )
     else:
         tl.store(
             scores + qid[:, None] * MAX_GROUPS + group[None, :],
@@ -106,11 +137,12 @@ def _score_paged_pool(
         )
 
 
-def _score_groups(query, weights, cache, tables, visible, page_size, max_groups, ratio, budget):
+def _score_groups(query, weights, cache, tables, visible, page_size, max_groups, ratio, budget, *, wide_tile=False):
+    group_tile, query_block = (_TP1_WIDE_GROUP_TILE, 2) if wide_tile else (_GROUP_TILE, 4)
     cache = cache.view(torch.bfloat16)
     requests = tables.shape[0]
     scores = torch.empty((requests * _QUERIES, max_groups), dtype=torch.float32, device=query.device)
-    _score_paged_pool[(triton.cdiv(max_groups, _GROUP_TILE), requests)](
+    _score_paged_pool[(triton.cdiv(max_groups, group_tile), requests)](
         query,
         weights,
         cache,
@@ -124,9 +156,10 @@ def _score_groups(query, weights, cache, tables, visible, page_size, max_groups,
         page_size,
         ratio,
         budget,
-        _GROUP_TILE,
+        group_tile,
         _QUERIES,
         triton.next_power_of_2(_QUERIES),
+        query_block,
         tables.stride(0),
         num_warps=1,
         enable_fp_fusion=False,
@@ -417,9 +450,13 @@ def select_paged_pool(query, weights, cache, table, visible, page_size, max_grou
     return torch.cat((history, tail.masked_fill(tail > visible[:, None], -1)), dim=-1)
 
 
-def select_batched_paged_pool(query, weights, cache, tables, visible, page_size, max_groups, ratio, budget):
+def select_batched_paged_pool(
+    query, weights, cache, tables, visible, page_size, max_groups, ratio, budget, *, wide_tile=False
+):
     """Score each request's own cache pages in a single six-query launch."""
     positions = visible.contiguous().view(-1)
-    scores = _score_groups(query, weights, cache, tables, positions, page_size, max_groups, ratio, budget)
+    scores = _score_groups(
+        query, weights, cache, tables, positions, page_size, max_groups, ratio, budget, wide_tile=wide_tile
+    )
     rows = _finish_recall(scores, positions, ratio, budget)
     return rows.view(*visible.shape, -1)

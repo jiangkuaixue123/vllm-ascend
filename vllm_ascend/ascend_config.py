@@ -2024,6 +2024,7 @@ def init_ascend_config(vllm_config: VllmConfig) -> AscendConfig:
         "hy4flash_pack_mla_query",
         "hy4flash_shard_indexpool_scores",
         "hy4flash_batch_indexpool_scores",
+        "hy4flash_wide_indexpool_tile",
         "hy4flash_overlap_attn_output_gate",
         "hy4flash_precise_decode",
         "hy4flash_share_swa_c8_reads",
