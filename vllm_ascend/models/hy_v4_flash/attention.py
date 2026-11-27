@@ -109,6 +109,7 @@ BATCH_VERIFY_SWA_SHAPE = (8, 512)
 WINDOW_REQUEST_CHUNK = 8
 WINDOW_OPERAND_ROW_TILE = 32
 BATCH_VERIFY_SPARSE_SHAPE = (4, 2048)
+NATIVE_SPARSE_VERIFY_HEADS = (4, 32)
 # Queries, index heads, compression ratio, and complete groups recalled.
 PAGED_POOL_DECODE_SHAPE = (6, 16, 4, 511)
 # Bound the single-vector last-writer comparison used for potentially shared pages.
@@ -1300,7 +1301,8 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
             and self.batch_verify_attention
             and num_queries == BATCH_VERIFY_MAX_QUERIES
             and query.dtype == torch.bfloat16
-            and (self.local_heads, (self.indexer.budget + 1) * self.indexer.ratio) == BATCH_VERIFY_SPARSE_SHAPE
+            and self.local_heads in NATIVE_SPARSE_VERIFY_HEADS
+            and (self.indexer.budget + 1) * self.indexer.ratio == BATCH_VERIFY_SPARSE_SHAPE[1]
             and (score_groups or self.max_model_len == BATCH_VERIFY_SPARSE_SHAPE[1])
             and block_size == PAGE_TOKENS
             and cache.shape[-1] == PAGE_BYTES

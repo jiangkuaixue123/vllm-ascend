@@ -8,11 +8,12 @@ import torch
 
 
 @pytest.mark.parametrize("batch", [1, 3, 8])
-def test_native_decode_keeps_request_rows_and_masks_padding(monkeypatch, batch):
+@pytest.mark.parametrize("heads", [4, 32])
+def test_native_decode_keeps_request_rows_and_masks_padding(monkeypatch, batch, heads):
     from vllm_ascend.models.hy_v4_flash import attention as module
     from vllm_ascend.models.hy_v4_flash.cache_pages import PAGE_BYTES, PAGE_TOKENS
 
-    queries, heads, window, dimension = 6, 4, 2048, 2
+    queries, window, dimension = 6, 2048, 2
     layer = module.AscendHYV4FlashAttention.__new__(module.AscendHYV4FlashAttention)
     torch.nn.Module.__init__(layer)
     layer.indexer = SimpleNamespace(budget=511, ratio=4)
