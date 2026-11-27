@@ -1993,6 +1993,8 @@ def init_ascend_config(vllm_config: VllmConfig) -> AscendConfig:
         "hy4flash_share_neighbor_recall",
         "hy4flash_sharded_greedy_verify",
         "hy4flash_native_index_pages",
+        "hy4flash_bounded_window_cache",
+        "hy4flash_extra_decode_graph_request_sizes",
         "hy4flash_ccu_copy_gathers",
         "hy4flash_ordered_verify_scatter",
         "hy4flash_resident_index_keys",

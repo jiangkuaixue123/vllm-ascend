@@ -33,6 +33,7 @@ from vllm.v1.attention.backend import AttentionCGSupport, AttentionMetadataBuild
 from vllm.v1.kv_cache_interface import HiddenStateCacheSpec
 
 from vllm_ascend.attention.utils import SFA_QSFA_TILE_SIZE
+from vllm_ascend.core.kv_cache_interface import declared_kwarg
 from vllm_ascend.device.device_config import get_ascend_device_type
 from vllm_ascend.device.hardware import AscendDeviceType
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
@@ -73,6 +74,7 @@ from .index_pool_select import (
     select_sharded_paged_pool,
     supports_sharded_recall,
 )
+from .kv_cache import Hy4SlidingWindowCacheSpec
 from .layer_recall import SharedRecallRows, paired_recall_layer, recall_rows_for_forward
 from .mla_prolog import CANNBotBf16MlaProlog
 from .native_pool_updates import plan_pool_refresh, refresh_pool_keys
@@ -617,12 +619,28 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
         return self.kv_cache.view(-1, PAGE_BYTES if self.page_planes else self.cache_width)
 
     def get_kv_cache_spec(self, vllm_config):
-        return HiddenStateCacheSpec(
+        page = dict(
             block_size=vllm_config.cache_config.block_size,
             num_kv_heads=1,
             head_size=self.cache_width,
             dtype=torch.uint8 if self.use_fp8_cache else torch.bfloat16,
         )
+        transfer = vllm_config.kv_transfer_config
+        if (
+            self.is_window_layer
+            and vllm_config.additional_config.get("hy4flash_bounded_window_cache", False)
+            and (transfer is None or transfer.kv_role != "kv_producer")
+        ):
+            if not self.page_planes:
+                raise ValueError("HYV4 Flash bounded window KV requires native FP8 index pages.")
+            speculative = vllm_config.speculative_config
+            lookahead = (speculative.num_speculative_tokens or 0) if speculative is not None else 0
+            return Hy4SlidingWindowCacheSpec(
+                **page,
+                sliding_window=self.window,
+                **declared_kwarg(Hy4SlidingWindowCacheSpec, "extra_retained_tokens", lookahead),
+            )
+        return HiddenStateCacheSpec(**page)
 
     def _project_query(self, hidden_states):
         q_a = self.q_a_proj(hidden_states)[0]

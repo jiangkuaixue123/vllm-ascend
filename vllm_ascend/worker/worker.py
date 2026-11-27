@@ -104,6 +104,7 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_man
 )
 from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import global_te
 from vllm_ascend.distributed.parallel_state import init_ascend_model_parallel
+from vllm_ascend.models.hy_v4_flash.kv_cache import Hy4SlidingWindowCacheSpec
 from vllm_ascend.observability.runtime_guard.hooks import runtime_guard_idle_step
 from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
 from vllm_ascend.profiler.torch_npu_profiler import TorchNPUProfilerWrapper
@@ -831,6 +832,12 @@ class NPUWorker(WorkerBase):
         has_mamba = any(isinstance(spec, MambaSpec) for spec in per_layer_specs)
         model_runner = getattr(self, "model_runner", None)
         layout = self.vllm_config.cache_config.get_resolved_kv_cache_layout()
+        if any(isinstance(spec, Hy4SlidingWindowCacheSpec) for spec in per_layer_specs):
+            if not getattr(self, "use_v2_model_runner", False):
+                raise ValueError("HYV4 Flash bounded window KV requires the V2 model runner.")
+            if not (layout.is_layer_compact and layout.is_block_compact):
+                raise ValueError("HYV4 Flash bounded window KV requires contiguous pages per layer.")
+            return available_memory
         shares_attention_pool = False
         if getattr(self, "use_v2_model_runner", False):
             # Load V2 helpers only for V2 workers; V1 retains private allocation

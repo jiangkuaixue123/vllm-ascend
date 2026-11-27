@@ -422,6 +422,27 @@ def test_setup_compile_backend_scopes_kda_splitting_to_piecewise(mode):
         assert compilation_config.splitting_ops == []
 
 
+@pytest.mark.skipif(vllm_version_is("0.33.0"), reason="Requires split request and token graph sizes")
+@pytest.mark.parametrize(
+    ("role", "extra_sizes", "expected"),
+    [
+        ("kv_consumer", [9, 8, 9], [4, 8, 9, 16]),
+        ("kv_producer", [9], [4, 8, 16]),
+        ("kv_consumer", [], [4, 8, 16]),
+    ],
+)
+def test_hy4_decode_extra_capture_sizes(role, extra_sizes, expected):
+    compilation = CompilationConfig(decode_cudagraph_capture_request_sizes=[4, 8, 16])
+    config = SimpleNamespace(
+        compilation_config=compilation,
+        model_config=SimpleNamespace(hf_text_config=SimpleNamespace(model_type="hy_v4_flash")),
+        kv_transfer_config=SimpleNamespace(kv_role=role),
+        additional_config={"hy4flash_extra_decode_graph_request_sizes": extra_sizes},
+    )
+    NPUPlatform.apply_config_platform_defaults(config)
+    assert compilation.decode_cudagraph_capture_request_sizes == expected
+
+
 class TestNPUPlatform(TestBase):
     @staticmethod
     def mock_vllm_config():

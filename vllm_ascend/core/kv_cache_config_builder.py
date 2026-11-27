@@ -40,6 +40,7 @@ from vllm_ascend.models.glm5next.cache_config import (
     get_glm5_next_pool_bytes_per_block,
 )
 from vllm_ascend.models.glm5next.kv_cache import is_glm5_next_cache_spec
+from vllm_ascend.models.hy_v4_flash.kv_cache import group_hy4_cache_specs
 from vllm_ascend.models.kimi_k3.cache_config import _get_kimi_k3_dspark_mixed_kv_cache_groups
 from vllm_ascend.models.kimi_k3.paired_sfa_cache import paired_sfa_cache_groups, paired_sfa_pool_bytes
 from vllm_ascend.models.qwen4_exp.cache_config import (
@@ -64,6 +65,10 @@ class AscendKVCacheConfigBuilder(DefaultKVCacheConfigBuilder):
         """
         if vllm_config.model_config.hf_config.model_type == "kimi_k31":
             return paired_sfa_cache_groups(vllm_config, kv_cache_spec)
+        if hy4_groups := group_hy4_cache_specs(
+            kv_cache_spec, disable_hybrid=vllm_config.scheduler_config.disable_hybrid_kv_cache_manager
+        ):
+            return hy4_groups
         if vllm_config.scheduler_config.disable_hybrid_kv_cache_manager:
             # vLLM's generic grouping promotes local-attention specs before it
             # groups, so the Ascend layouts must see the same promoted specs.

@@ -98,6 +98,7 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_man
 )
 from vllm_ascend.models.deepseek_v41.cache_config import is_deepseek_v41_cache
 from vllm_ascend.models.glm5next.cache_views import view_compressed_indexer_cache, view_kpool_tail_cache
+from vllm_ascend.models.hy_v4_flash.kv_cache import Hy4SlidingWindowCacheSpec
 from vllm_ascend.models.qwen4_exp.cache_config import (
     GDN,
     HIDDEN,
@@ -1113,16 +1114,16 @@ def can_share_full_and_sliding_kv_cache(vllm_config: VllmConfig, specs: Iterable
 def allocate_shared_attention_kv_cache(
     kv_cache_config: KVCacheConfig,
     allocate: Callable[[int], torch.Tensor],
-) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
-    """Materialize overlay descriptors as contiguous K/V views of one pool.
+    *,
+    split_kv: bool = True,
+) -> dict[str, torch.Tensor | tuple[torch.Tensor, torch.Tensor]]:
+    """Materialize contiguous layer slots for shared block IDs.
 
     Groups share block IDs from one scheduler pool, so the same ID cannot be
-    live in two groups at once. Split each layer slot into K and V halves;
-    equal, unpadded pages and equal K/V widths make this mapping identical
-    across groups while preserving the contiguous layout required by PA.
-    Upstream constructs the layer coverage, offsets and allocation bounds.
-    Check only the shared backing and contiguous strides required here:
-    upstream permits alignment padding that this K/V split cannot consume.
+    live in two groups at once. Dense attention splits each layer slot into
+    equal K and V halves. For Hy4, allocate each packed slot separately so the
+    KV connector can register its own device allocation. Upstream constructs
+    the layer coverage, offsets and allocation bounds.
     """
     descriptors = kv_cache_config.kv_cache_tensors
     specs = {
@@ -1147,6 +1148,16 @@ def allocate_shared_attention_kv_cache(
             if descriptor.layer_stride != layer_size or descriptor.block_stride != spec.page_size_bytes:
                 raise ValueError(f"Invalid shared attention KV cache descriptor for {name}.")
             regions[name] = (start, layer_size)
+    if not split_kv:
+        slots = {}
+        previous_end = 0
+        for start, layer_size in sorted(set(regions.values())):
+            end = start + layer_size
+            if start < previous_end or end > backing_size:
+                raise ValueError("Packed attention KV slots must be disjoint or share the same region.")
+            slots[(start, layer_size)] = allocate(layer_size)
+            previous_end = end
+        return {name: slots[region] for name, region in regions.items()}
     backing = allocate(backing_size)
     return {
         name: (
@@ -1193,6 +1204,12 @@ def _allocate_kv_cache(
     alignment = 2 * 1024 * 1024
     layer_kv_cache_spec = _get_layer_kv_cache_specs(kv_cache_config)
     attn_layers: dict[str, AttentionLayerBase] | None = None
+    if any(isinstance(spec, Hy4SlidingWindowCacheSpec) for spec in layer_kv_cache_spec.values()):
+        return allocate_shared_attention_kv_cache(
+            kv_cache_config,
+            lambda size: _allocate_int8_cache_tensor(size, alignment, device),
+            split_kv=False,
+        )
     # Gemma 4 full/sliding groups share one pool while retaining contiguous
     # K/V views. The worker keeps the full budget only for this V2 path.
     if not enable_sfa(vllm_config) and can_share_full_and_sliding_kv_cache(vllm_config, layer_kv_cache_spec.values()):
@@ -2001,8 +2018,8 @@ def _reshape_kv_cache_v2(
                     get_ascend_config().sparse_kv_offload_config,
                 )
                 continue
-            if is_hidden_state_cache_spec(kv_cache_spec):
-                # Single tensor for extract_hidden_states (no K/V split).
+            if is_hidden_state_cache_spec(kv_cache_spec) or isinstance(kv_cache_spec, Hy4SlidingWindowCacheSpec):
+                # Single tensor for extract_hidden_states and packed Hy4 attention.
                 # HiddenStateCacheSpec subclasses MLAAttentionSpec, so this
                 # must run before the generic MLA reshape path.
                 if not isinstance(raw_cache, torch.Tensor):

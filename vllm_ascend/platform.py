@@ -427,6 +427,25 @@ class NPUPlatform(Platform):
     def apply_config_platform_defaults(cls, vllm_config: VllmConfig) -> None:
         """Apply Ascend-specific defaults."""
 
+        extra_decode_sizes = (vllm_config.additional_config or {}).get("hy4flash_extra_decode_graph_request_sizes")
+        transfer = getattr(vllm_config, "kv_transfer_config", None)
+        if (
+            extra_decode_sizes is not None
+            and transfer is not None
+            and transfer.kv_role == "kv_consumer"
+            and getattr(getattr(vllm_config.model_config, "hf_text_config", None), "model_type", None) == "hy_v4_flash"
+        ):
+            if not isinstance(extra_decode_sizes, list) or any(
+                type(size) is not int or size <= 0 for size in extra_decode_sizes
+            ):
+                raise ValueError("hy4flash_extra_decode_graph_request_sizes requires positive integer request counts.")
+            compilation = vllm_config.compilation_config
+            decode_sizes = getattr(compilation, "decode_cudagraph_capture_request_sizes", None)
+            if extra_decode_sizes:
+                if not decode_sizes:
+                    raise ValueError("Hy4 extra Decode graph sizes require explicit split Decode capture sizes.")
+                compilation.decode_cudagraph_capture_request_sizes = sorted(set(decode_sizes).union(extra_decode_sizes))
+
         # TODO: Remove this memory-saving capture-size override and its ceiling
         # restoration once MC2 is no longer used.
         reduced_cg_cap = _get_reduced_cg_cap(vllm_config)
