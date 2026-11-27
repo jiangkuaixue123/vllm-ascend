@@ -3,17 +3,19 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 
-def test_window_batch_respects_table_stride_query_mask_and_workspace_limit(monkeypatch):
+@pytest.mark.parametrize("heads", [8, 64])
+def test_window_batch_respects_table_stride_query_mask_and_workspace_limit(monkeypatch, heads):
     from vllm.models.hy_v4_flash.reference import window_candidates
 
     from vllm_ascend.models.hy_v4_flash import attention as module
     from vllm_ascend.models.hy_v4_flash.decode_layout import decode_positions, window_history
 
     requests = module.WINDOW_REQUEST_CHUNK + 1
-    width, heads, window = 6, 8, 512
+    width, window = 6, 512
     layer = module.AscendHYV4FlashAttention.__new__(module.AscendHYV4FlashAttention)
     torch.nn.Module.__init__(layer)
     layer.indexer = layer.topk_snapshot = layer.resident_pool = None
@@ -52,7 +54,7 @@ def test_window_batch_respects_table_stride_query_mask_and_workspace_limit(monke
         dest.fill_(7)
 
     monkeypatch.setattr(module, "gather_c8_window_operands", gather)
-    monkeypatch.setattr(module.torch_npu, "get_npu_format", lambda tensor: module.ACL_FORMAT_ND)
+    monkeypatch.setattr(module.torch_npu, "get_npu_format", lambda tensor: module.ACL_FORMAT_ND, raising=False)
     layer._attend_decoded = attend
     layer._forward_decode_graph(meta, cache, 64, None, None, None, query, None, out)
     assert consumed == [module.WINDOW_REQUEST_CHUNK, 1]

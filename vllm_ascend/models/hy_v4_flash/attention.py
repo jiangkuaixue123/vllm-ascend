@@ -105,6 +105,7 @@ MAX_FUSED_OUTPUT_GATE_ELEMENTS = 96 * 2048
 # Equal-width CANN shapes verified on 950DT at TP8.
 BATCH_VERIFY_MAX_QUERIES = 6
 BATCH_VERIFY_SWA_SHAPE = (8, 512)
+BATCH_VERIFY_GRAPH_SWA_SHAPES = (BATCH_VERIFY_SWA_SHAPE, (64, 512))
 # Bound the resident FP32 operands for sliding-window attention.
 WINDOW_REQUEST_CHUNK = 8
 WINDOW_OPERAND_ROW_TILE = 32
@@ -1120,7 +1121,7 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
             self.share_swa_c8_reads
             and self.indexer is None
             and num_queries == BATCH_VERIFY_MAX_QUERIES
-            and (self.local_heads, window) == BATCH_VERIFY_SWA_SHAPE
+            and (self.local_heads, window) in BATCH_VERIFY_GRAPH_SWA_SHAPES
             and cache.shape[-1] % torch.int32.itemsize == 0
         ):
             # The union of consecutive windows has window + num_queries - 1 rows.
