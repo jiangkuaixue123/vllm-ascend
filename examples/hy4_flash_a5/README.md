@@ -52,6 +52,7 @@ The recipe reserves 131,584 positions for requests with 130,048 input and 1,024 
 | `hy4flash_resident_index_keys` | Keeps a per-layer BF16 view of active pooled keys, refreshing changed pages and invalidating it on other cache writes. Requires native pages and disabled prefix caching and KV transfer. |
 | `hy4flash_draft_projection_sums` | Uses a checked BF16 reduction for eligible DFly block and correction projection sizes from the configured decode graphs. Each size falls back to native TP when its arithmetic differs. |
 | `hy4flash_overlap_decode_kv` | Computes KV normalization and C8 quantization alongside the independent query projection during native-page decode. |
+| `hy4flash_native_window_c8_verify` | Uses native C8 attention for the 512-token windows in TP1 verification, with the trained attention sink and causal masking. Requires A5 and native FP8 KV pages. |
 | `hy4flash_overlap_verify_projections` | Overlaps independent target output-gate and index-query projections with singleton verification attention and cache updates. |
 | `hy4flash_shared_fp32_draft_history` | Shares each request’s dequantized DFly history across its six queries, in bounded batches, while retaining the original per-query FP32 attention reductions and trained five-token proposals. |
 | `hy4flash_mx_activation_extent` | Uses the final cumulative expert count as the valid row count for clamped MXFP8 SwiGLU. Applies across decode batch sizes and preserves both grouped matrix descriptors. |

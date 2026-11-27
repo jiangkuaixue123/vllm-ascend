@@ -105,7 +105,8 @@ MAX_FUSED_OUTPUT_GATE_ELEMENTS = 96 * 2048
 # Equal-width CANN shapes verified on 950DT at TP8.
 BATCH_VERIFY_MAX_QUERIES = 6
 BATCH_VERIFY_SWA_SHAPE = (8, 512)
-BATCH_VERIFY_GRAPH_SWA_SHAPES = (BATCH_VERIFY_SWA_SHAPE, (64, 512))
+TP1_VERIFY_SWA_SHAPE = (64, 512)
+BATCH_VERIFY_GRAPH_SWA_SHAPES = (BATCH_VERIFY_SWA_SHAPE, TP1_VERIFY_SWA_SHAPE)
 # Bound the resident FP32 operands for sliding-window attention.
 WINDOW_REQUEST_CHUNK = 8
 WINDOW_OPERAND_ROW_TILE = 32
@@ -407,6 +408,12 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
             use_a5_c8
             and not reuse_target
             and vllm_config.additional_config.get("hy4flash_native_sparse_c8_verify", False)
+        )
+        self.native_window_c8_verify = (
+            use_a5_c8
+            and self.is_window_layer
+            and not reuse_target
+            and vllm_config.additional_config.get("hy4flash_native_window_c8_verify", False)
         )
         self.fuse_c8_prefill = (
             use_a5_c8 and not reuse_target and vllm_config.additional_config.get("hy4flash_fuse_c8_prefill", True)
@@ -1116,6 +1123,36 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
             seq_lens, live, logical = decode_positions(seq_lens, meta.slot_mapping[:num_tokens], num_queries)
         snapshot = self.topk_snapshot
         window = min(self.window, self.max_model_len)
+        if (
+            self.indexer is None
+            and snapshot is None
+            and num_queries == BATCH_VERIFY_MAX_QUERIES
+            and (self.local_heads, window) == TP1_VERIFY_SWA_SHAPE
+            and self.native_window_c8_verify
+            and query.dtype == torch.bfloat16
+            and query.shape[-1] == C8_QUERY_DIM
+            and cache.device.type == "npu"
+            and block_size == PAGE_TOKENS
+            and cache.shape[-1] == PAGE_BYTES
+            and meta.block_table.stride(-1) == 1
+        ):
+            candidates = (
+                layout.get_batched_window_candidates(window)
+                if layout is not None
+                else window_candidates(logical.flatten(), window).view(*logical.shape, window)
+            )
+            physical, counts = compact_physical_c8_indices(meta.block_table, candidates)
+            context = attend_packed_c8(
+                query,
+                cache.view(-1, C8_ROW_BYTES),
+                physical,
+                self.learnable_sink_param,
+                self.scale,
+                decode_rows=(logical, counts),
+            )
+            out[:num_tokens].copy_(_head_bmm(context, wv).reshape_as(out[:num_tokens]))
+            logger.info_once("HYV4 Flash uses native C8 attention for TP1 sliding-window verification.")
+            return
         shared_positions = None
         if (
             self.share_swa_c8_reads

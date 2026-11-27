@@ -2014,6 +2014,7 @@ def init_ascend_config(vllm_config: VllmConfig) -> AscendConfig:
         "hy4flash_fuse_swa_q_norm",
         "hy4flash_gpu_c8_scale",
         "hy4flash_native_sparse_c8_verify",
+        "hy4flash_native_window_c8_verify",
         "hy4flash_share_verify_layout",
         "hy4flash_pack_mla_query",
         "hy4flash_shard_indexpool_scores",
