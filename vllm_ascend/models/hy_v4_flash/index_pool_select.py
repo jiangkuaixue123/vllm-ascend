@@ -9,7 +9,7 @@ from vllm.triton_utils import tl, triton
 
 from vllm_ascend.ops.triton.sparse_index_remap import _sort
 
-from .cache_pages import PAGE_BYTES, POOL_RATIO, POOL_START
+from .cache_pages import PAGE_BYTES, PAGE_TOKENS, POOL_RATIO, POOL_START
 from .index_pool_cache import pool_key_addresses
 
 _QUERIES = 6
@@ -17,6 +17,7 @@ _GROUP_TILE = 128
 _TP1_WIDE_GROUP_TILE = 256
 _SCORE_COPY_TILE = 512
 _MAX_EXACT_FP32_GROUP = 1 << 24
+_LIGHTNING_CAUSAL_MASK = 3
 
 
 @triton.jit
@@ -219,16 +220,19 @@ def _expand_groups(
     tl.store(rows + query * GROUP_TILE * RATIO + token, tl.where(live, pos, -1))
 
 
-def _finish_recall(scores, visible, ratio, budget):
-    # Global top-k receives the original shape and logical order, including ties.
-    max_groups = scores.shape[-1]
-    values, group_ids = scores.topk(budget, dim=-1)
+def _expand_recall(values, group_ids, visible, ratio, budget, max_groups):
     group_tile = budget + 1
-    rows = torch.empty((scores.shape[0], group_tile * ratio), dtype=torch.int64, device=scores.device)
+    rows = torch.empty((group_ids.shape[0], group_tile * ratio), dtype=torch.int64, device=group_ids.device)
     _expand_groups[(rows.shape[0],)](
         values, group_ids, visible, rows, budget, ratio, group_tile, max_groups, num_warps=1
     )
     return rows
+
+
+def _finish_recall(scores, visible, ratio, budget):
+    # Global top-k receives the original shape and logical order, including ties.
+    values, group_ids = scores.topk(budget, dim=-1)
+    return _expand_recall(values, group_ids, visible, ratio, budget, scores.shape[-1])
 
 
 def select_sharded_paged_pool(query, weights, cache, table, visible, page_size, max_groups, ratio, budget):
@@ -459,4 +463,68 @@ def select_batched_paged_pool(
         query, weights, cache, tables, positions, page_size, max_groups, ratio, budget, wide_tile=wide_tile
     )
     rows = _finish_recall(scores, positions, ratio, budget)
+    return rows.view(*visible.shape, -1)
+
+
+def select_lightning_paged_pool(
+    query, weights, cache, tables, visible, seq_lens, max_groups, ratio, budget, *, plans=None
+):
+    """Recall complete groups using A5's strided, compressed LightningIndexer."""
+    from cann_ops_transformer.ops.attention.lightning_indexer_v2 import (
+        lightning_indexer,
+        lightning_indexer_metadata,
+    )
+
+    requests, queries = visible.shape
+    heads, head_dim = query.shape[1:]
+    plan_key = (requests, queries, heads, head_dim, max_groups, ratio, budget)
+    plan = plans.get(plan_key) if plans is not None else None
+    if plan is None:
+        # Exclude the final query's own token from compressed history. The
+        # causal mask subtracts each earlier query's offset before compression.
+        last = (seq_lens - 1).clamp_min(0).to(torch.int32)
+        options = {
+            "seqused_k": last // ratio,
+            "cmp_residual_k": last % ratio,
+            "layout_q": "BSND",
+            "layout_k": "PA_BBND",
+            "mask_mode": _LIGHTNING_CAUSAL_MASK,
+            "cmp_ratio": ratio,
+        }
+        metadata = lightning_indexer_metadata(
+            heads,
+            1,
+            head_dim,
+            budget,
+            batch_size=requests,
+            max_seqlen_q=queries,
+            max_seqlen_k=max_groups,
+            **options,
+        )
+        plan = options, metadata
+        if plans is not None:
+            plans[plan_key] = plan
+    options, metadata = plan
+    # The BF16 key plane is contiguous within each native page. The
+    # operator consumes its existing outer stride without repacking the cache.
+    keys = cache.view(torch.bfloat16)[:, POOL_START // torch.bfloat16.itemsize :]
+    keys = keys.view(-1, PAGE_TOKENS // ratio, 1, head_dim)
+    indices, values = lightning_indexer(
+        query.to(torch.bfloat16).view(requests, queries, heads, head_dim),
+        keys,
+        weights.view(requests, queries, heads),
+        budget,
+        block_table=tables.contiguous(),
+        metadata=metadata,
+        return_value=1,
+        **options,
+    )
+    rows = _expand_recall(
+        values.reshape(-1, budget),
+        indices.reshape(-1, budget),
+        visible.contiguous().view(-1),
+        ratio,
+        budget,
+        max_groups,
+    )
     return rows.view(*visible.shape, -1)

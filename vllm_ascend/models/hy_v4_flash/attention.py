@@ -69,6 +69,7 @@ from .index_pool_fp8 import (
 )
 from .index_pool_select import (
     select_batched_paged_pool,
+    select_lightning_paged_pool,
     select_native_page_pool,
     select_paged_pool,
     select_request_partitioned_pool,
@@ -440,6 +441,12 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
         self.wide_indexpool_tile = (
             self.batch_indexpool_scores
             and vllm_config.additional_config.get("hy4flash_wide_indexpool_tile", False)
+            and transfer is not None
+            and transfer.kv_role == "kv_consumer"
+        )
+        self.lightning_indexpool = (
+            self.batch_indexpool_scores
+            and vllm_config.additional_config.get("hy4flash_lightning_indexpool", False)
             and transfer is not None
             and transfer.kv_role == "kv_consumer"
         )
@@ -1322,22 +1329,40 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
                 consumer.wait_stream(query_stream)
                 index_query.record_stream(consumer)
                 index_weight.record_stream(consumer)
-            assigned_rows = select_batched_paged_pool(
-                index_query,
-                index_weight,
-                cache,
-                meta.block_table[: seq_lens.shape[0]],
-                logical,
-                block_size,
-                self.max_model_len // self.indexer.ratio,
-                self.indexer.ratio,
-                self.indexer.budget,
-                wide_tile=self.wide_indexpool_tile,
-            )
-            logger.info_once(
-                "HYV4 Flash scores request-local IndexPool pages together at TP1 (wide tile=%s).",
-                self.wide_indexpool_tile,
-            )
+            tables = meta.block_table[: seq_lens.shape[0]]
+            ratio, budget = self.indexer.ratio, self.indexer.budget
+            max_groups = self.max_model_len // ratio
+            if self.lightning_indexpool:
+                assigned_rows = select_lightning_paged_pool(
+                    index_query,
+                    index_weight,
+                    cache,
+                    tables,
+                    logical,
+                    seq_lens,
+                    max_groups,
+                    ratio,
+                    budget,
+                    plans=layout.lightning_pool_plans if layout is not None else None,
+                )
+                logger.info_once("HYV4 Flash selects compressed TP1 IndexPool groups with A5 LightningIndexer.")
+            else:
+                assigned_rows = select_batched_paged_pool(
+                    index_query,
+                    index_weight,
+                    cache,
+                    tables,
+                    logical,
+                    block_size,
+                    max_groups,
+                    ratio,
+                    budget,
+                    wide_tile=self.wide_indexpool_tile,
+                )
+                logger.info_once(
+                    "HYV4 Flash scores request-local IndexPool pages together at TP1 (wide tile=%s).",
+                    self.wide_indexpool_tile,
+                )
         elif (
             use_paged_pool
             and self.shard_indexpool_scores

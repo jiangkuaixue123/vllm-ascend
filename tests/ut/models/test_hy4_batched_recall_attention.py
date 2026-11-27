@@ -18,6 +18,7 @@ def test_partitioned_recall_publishes_rows_after_updating_each_local_cache(monke
     layer.share_verify_layout = layer.share_swa_c8_reads = layer.overlap_verify_projections = False
     layer.page_planes = layer.incremental_index_pool = layer.fuse_indexpool_select = layer.shard_indexpool_scores = True
     layer.native_sparse_c8_verify = layer.batch_verify_attention = True
+    layer.batch_indexpool_scores = False
     layer.max_model_len, layer.window, layer.local_heads = 131584, 2048, heads
     layer.request_recall_rank, layer.request_recall_group = 3, object()
     layer.paired_recall, layer.resident_pool = (1, True), Mock()
@@ -76,8 +77,8 @@ def test_partitioned_recall_publishes_rows_after_updating_each_local_cache(monke
     layer.resident_pool.invalidate.assert_called_once_with()
 
 
-@pytest.mark.parametrize("batched", [False, True])
-def test_tp1_paged_recall_keeps_each_requests_page_table(monkeypatch, batched):
+@pytest.mark.parametrize("mode", ["dense", "batched", "lightning"])
+def test_tp1_paged_recall_keeps_each_requests_page_table(monkeypatch, mode):
     from vllm_ascend.models.hy_v4_flash import attention as module
     from vllm_ascend.models.hy_v4_flash.cache_pages import PAGE_BYTES, PAGE_TOKENS
 
@@ -88,7 +89,10 @@ def test_tp1_paged_recall_keeps_each_requests_page_table(monkeypatch, batched):
     torch.nn.Module.__init__(layer)
     layer.share_verify_layout = layer.share_swa_c8_reads = layer.overlap_verify_projections = False
     layer.fuse_indexpool_select = layer.incremental_index_pool = layer.page_planes = True
+    batched = mode != "dense"
     layer.batch_indexpool_scores = batched
+    layer.wide_indexpool_tile = False
+    layer.lightning_indexpool = mode == "lightning"
     layer.shard_indexpool_scores = layer.native_sparse_c8_verify = layer.batch_verify_attention = False
     layer.fuse_c8_qk = layer.pack_window_operands = False
     layer.max_model_len, layer.window, layer.local_heads = 131584, 512, attention_heads
@@ -139,33 +143,49 @@ def test_tp1_paged_recall_keeps_each_requests_page_table(monkeypatch, batched):
     monkeypatch.setattr(module, "select_paged_pool", paged_select)
     monkeypatch.setattr(module, "sparse_candidates", select_dense)
 
-    def select_batch(keys, weights, storage, page_tables, visible, block_size, max_groups, actual_ratio, actual_budget):
+    def select_rows(keys, weights, storage, page_tables, visible, max_groups, actual_ratio, actual_budget):
         refresh.assert_called_once_with(layer.indexer, cache, pool_slots, 1)
         assert keys is index_query and weights is index_weight and storage is cache
         torch.testing.assert_close(page_tables, tables)
         torch.testing.assert_close(visible, logical)
         assert page_tables.stride(0) == tables.stride(0)
-        assert (block_size, max_groups, actual_ratio, actual_budget) == (
-            PAGE_TOKENS,
-            layer.max_model_len // ratio,
-            ratio,
-            budget,
-        )
+        assert (max_groups, actual_ratio, actual_budget) == (layer.max_model_len // ratio, ratio, budget)
         return torch.stack((recalled, module.dense_candidates(visible[1], candidates_per_query)))
 
+    def select_batch(
+        keys, weights, storage, page_tables, visible, block_size, max_groups, actual_ratio, actual_budget, *, wide_tile
+    ):
+        assert block_size == PAGE_TOKENS and not wide_tile
+        return select_rows(keys, weights, storage, page_tables, visible, max_groups, actual_ratio, actual_budget)
+
+    def select_lightning(
+        keys, weights, storage, page_tables, visible, seq_lens, max_groups, actual_ratio, actual_budget, *, plans
+    ):
+        torch.testing.assert_close(seq_lens, lengths)
+        assert plans is None
+        return select_rows(keys, weights, storage, page_tables, visible, max_groups, actual_ratio, actual_budget)
+
     batch_select = Mock(side_effect=select_batch)
+    lightning_select = Mock(side_effect=select_lightning)
     monkeypatch.setattr(module, "select_batched_paged_pool", batch_select)
+    monkeypatch.setattr(module, "select_lightning_paged_pool", lightning_select)
     layer._forward_decode_graph(meta, cache, PAGE_TOKENS, out, out, torch.arange(query.shape[0]), query, None, out)
 
     if batched:
         assert calls == []
-        batch_select.assert_called_once()
+        if mode == "lightning":
+            lightning_select.assert_called_once()
+            batch_select.assert_not_called()
+        else:
+            batch_select.assert_called_once()
+            lightning_select.assert_not_called()
         layer._update_decode_pool.assert_not_called()
         layer._read_decode_pool.assert_not_called()
     else:
         assert calls == [0, 1]
         assert layer._read_decode_pool.call_count == 2
         batch_select.assert_not_called()
+        lightning_select.assert_not_called()
     paged_select.assert_not_called()
     selected0, selected1 = [call.args[1] for call in layer._attend_decoded.call_args_list]
     torch.testing.assert_close(selected0, recalled)

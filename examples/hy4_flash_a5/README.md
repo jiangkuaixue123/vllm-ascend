@@ -39,6 +39,7 @@ The recipe reserves 131,584 positions for requests with 130,048 input and 1,024 
 | `hy4flash_shard_indexpool_scores` | Divides long-context IndexPool work across eight tensor ranks. Multiple native-page decode requests distribute complete row lists using the CCU copy group, preserving each request’s global top-k order. |
 | `hy4flash_batch_indexpool_scores` | Scores multiple TP1 decode requests together after their IndexPool keys are refreshed. Each request uses its own page table and recall mask. |
 | `hy4flash_wide_indexpool_tile` | Reuses 256 IndexPool groups across pairs of verification queries on a batched TP1 PD Decode consumer. |
+| `hy4flash_lightning_indexpool` | Fuses weighted scoring and top-k for batched TP1 PD Decode using the CANN LightningIndexer with compressed native pages. Totals are FP32 and the CANN operator can resolve score ties differently. Requires CANN with the LightningIndexer V2 extension. |
 | `hy4flash_compact_index_updates` | Updates request-local pooled index keys together in native-page decode graphs. The value and gate use a shared trained projection. |
 | `hy4flash_fuse_indexpool_rotate_encode` | Encodes rotated IndexPool queries for batched decode and short pooled keys with calibrated FP8 rounding. Target layers can reuse the same query positions’ sine and cosine values. |
 | `hy4flash_pack_window_operands` | Reads overlapping C8 windows once per request and packs FP32 key and value operands for six verification queries per request. |

@@ -15,6 +15,7 @@
     "hy4flash_shard_indexpool_scores": true,
     "hy4flash_batch_indexpool_scores": true,
     "hy4flash_wide_indexpool_tile": true,
+    "hy4flash_lightning_indexpool": true,
     "hy4flash_fuse_indexpool_rotate_encode": true,
     "hy4flash_pack_window_operands": true,
     "hy4flash_pack_mla_query": true,

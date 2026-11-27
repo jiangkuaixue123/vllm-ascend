@@ -50,6 +50,7 @@ class VerificationLayout:
     pool_updates: dict = field(default_factory=dict)
     visible_pool_pages: dict = field(default_factory=dict)
     native_update_slots: tuple | None = None
+    lightning_pool_plans: dict = field(default_factory=dict)
     dense_prefixes: dict = field(default_factory=dict)
 
     @classmethod
